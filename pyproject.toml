@@ -1,0 +1,155 @@
+[project]
+name = "spy-signal-platform"
+version = "0.1.0"
+description = "Personal-use intraday SPY trading signal and alerting system"
+requires-python = ">=3.12"
+dependencies = [
+    # Core
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.3,<3.0",
+    "python-dotenv>=1.0",
+    "structlog>=24.1",
+    "PyYAML>=6.0",
+
+    # Data
+    "alpaca-py>=0.28",
+    "websockets>=12.0",
+    "httpx>=0.27",
+
+    # Indicators
+    "TA-Lib>=0.4.28",
+    "talipp>=2.0",
+    "numpy>=1.26,<2.1",
+    "pandas>=2.2",
+
+    # Database
+    "aiosqlite>=0.20",
+    "duckdb>=1.0",
+
+    # API
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+
+    # Dashboard
+    "streamlit>=1.35",
+    "plotly>=5.22",
+
+    # Alerts
+    "python-telegram-bot>=22.0",
+
+    # Scheduling
+    "APScheduler>=3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "freezegun>=1.5",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+    "ipython>=8.25",
+]
+backtest = [
+    "backtesting>=0.3.3",
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ── Ruff (linter + formatter) ──────────────────────────────────────
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort (import sorting)
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific rules
+    "ANN",  # flake8-annotations (enforce type hints)
+    "ASYNC", # flake8-async
+    "S",    # flake8-bandit (security)
+    "LOG",  # flake8-logging
+]
+ignore = [
+    "ANN101",  # missing type annotation for self
+    "ANN102",  # missing type annotation for cls
+    "ANN401",  # allow Any in some cases
+    "S101",    # allow assert in tests
+    "E501",    # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN", "S101"]
+"scripts/**/*.py" = ["ANN"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+# ── Mypy (type checker) ───────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+namespace_packages = true
+
+[[tool.mypy.overrides]]
+module = [
+    "talib.*",
+    "talipp.*",
+    "backtesting.*",
+    "alpaca.*",
+    "streamlit.*",
+    "plotly.*",
+    "duckdb.*",
+]
+ignore_missing_imports = true
+
+# ── Pytest ─────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "-x",  # stop on first failure during development
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests that need network/API access",
+    "backtest: marks backtesting tests",
+]
+
+# ── Coverage ───────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["src"]
+omit = ["src/dashboard/*", "scripts/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 60
