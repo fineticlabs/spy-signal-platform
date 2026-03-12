@@ -153,3 +153,6 @@ omit = ["src/dashboard/*", "scripts/*"]
 show_missing = true
 skip_covered = true
 fail_under = 60
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
