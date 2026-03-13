@@ -1,4 +1,4 @@
-"""CLI script: download the last N days of 1-min SPY bars and store in SQLite."""
+"""CLI script: download the last N days of 1-min bars for one or more tickers."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ logger = structlog.get_logger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Backfill historical SPY 1-min bars from Alpaca into SQLite."
+        description="Backfill historical 1-min bars from Alpaca into SQLite."
     )
     parser.add_argument(
         "--days",
@@ -28,8 +28,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--symbol",
         type=str,
-        default="SPY",
-        help="Ticker symbol to backfill (default: SPY)",
+        default=None,
+        help="Single ticker symbol to backfill (overridden by --symbols if both given)",
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default=None,
+        help="Comma-separated ticker symbols to backfill (e.g. SPY,QQQ,IWM)",
     )
     parser.add_argument(
         "--db-path",
@@ -44,18 +50,33 @@ def main() -> int:
     args = parse_args()
     db_path = args.db_path or get_app_settings().db_path
 
-    print(f"Backfilling {args.days} days of {args.symbol} 1-min bars → {db_path}")
+    # --symbols beats --symbol beats default SPY
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    elif args.symbol:
+        symbols = [args.symbol.strip().upper()]
+    else:
+        symbols = ["SPY"]
 
-    with BarDatabase(db_path=db_path) as db:
-        bars = fetch_historical_bars(
-            symbol=args.symbol,
-            days=args.days,
-            timeframe=TimeFrame.ONE_MIN,
-            db=db,
-        )
-        total = db.count_bars(symbol=args.symbol, timeframe=TimeFrame.ONE_MIN)
+    print(f"Backfilling {args.days} days for {', '.join(symbols)} → {db_path}")
 
-    print(f"Done.  Fetched {len(bars):,} bars this run.  Total in DB: {total:,}")
+    for symbol in symbols:
+        print(f"\n── {symbol} ──")
+        with BarDatabase(db_path=db_path) as db:
+            bars = fetch_historical_bars(
+                symbol=symbol,
+                days=args.days,
+                timeframe=TimeFrame.ONE_MIN,
+                db=db,
+            )
+            total = db.count_bars(symbol=symbol, timeframe=TimeFrame.ONE_MIN)
+            earliest_bars = db.query_bars(symbol=symbol, timeframe=TimeFrame.ONE_MIN, limit=1)
+
+        earliest = earliest_bars[0].timestamp if earliest_bars else None
+        print(f"  Fetched {len(bars):,} bars this run.  Total in DB: {total:,}")
+        if earliest:
+            print(f"  Earliest bar in DB: {earliest.strftime('%Y-%m-%d %H:%M UTC')}")
+
     return 0
 
 

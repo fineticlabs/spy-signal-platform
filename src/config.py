@@ -71,6 +71,17 @@ class AppSettings(BaseSettings):
         default="paper", description="Trading mode: 'live', 'paper', or 'backtest'"
     )
     db_path: str = Field(default="data/spy_signals.db", description="Path to SQLite database")
+    symbols: list[str] = Field(
+        default=["SPY"],
+        description="Ticker symbols to trade (comma-separated in .env, e.g. SPY,QQQ,IWM)",
+    )
+
+    @field_validator("symbols", mode="before")
+    @classmethod
+    def parse_symbols(cls, v: str | list[str]) -> list[str]:
+        if isinstance(v, str):
+            return [s.strip().upper() for s in v.split(",") if s.strip()]
+        return [str(s).strip().upper() for s in v if str(s).strip()]
 
     @field_validator("log_level")
     @classmethod

@@ -56,7 +56,7 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
     lines: list[str] = [
         f"{direction_emoji} *{_md2(str(signal.direction))}* — {_md2(signal.strategy_name)}",
         "",
-        f"*SPY @ {_price(signal.entry_price)}*",
+        f"*{_md2(signal.symbol)} @ {_price(signal.entry_price)}*",
         f"Entry:  {_price(signal.entry_price)}",
         f"Stop:   {_price(signal.stop_price)}",
         f"Target: {_price(signal.target_price)}",

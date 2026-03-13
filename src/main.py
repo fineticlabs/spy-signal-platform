@@ -1,31 +1,30 @@
-"""Main asyncio orchestrator for the SPY Signal Platform.
+"""Main asyncio orchestrator for the Signal Platform (multi-ticker).
 
 Startup sequence
 ----------------
-1. Load config from .env
+1. Load config from .env — reads SYMBOLS for multi-ticker list
 2. Connect SQLite — ensure schema
-3. Initialise indicator registry (streaming talipp indicators)
-4. Initialise level trackers (ORB, VWAP, PDH/PDL, HOD/LOD)
-5. Initialise ORB strategy + regime detector
-6. Initialise risk manager (with cooldown tracker)
-7. Initialise alert dispatcher (Telegram)
-8. Inject live state into FastAPI
-9. Start FastAPI server (uvicorn, port 8000) as a background asyncio task
-10. Start Alpaca WebSocket stream as a background asyncio task
+3. Per-symbol: build IndicatorRegistry, LevelManager, RegimeDetector, ORBStrategy
+4. Shared: RiskManager, AlertDispatcher (Telegram)
+5. Inject live state into FastAPI
+6. Start FastAPI server (uvicorn, port 8000) as a background asyncio task
+7. Start Alpaca WebSocket stream subscribing to all symbols
 
 Main loop
 ---------
 For every bar arriving on the queue:
+  - Route to the correct per-symbol pipeline (IndicatorRegistry, LevelManager, etc.)
   - Update indicators
   - Update levels
   - Evaluate strategy → Signal | None
-  - If signal: run through RiskManager
-  - If approved: dispatch alert
+  - Tag signal with ticker symbol
+  - If signal: run through shared RiskManager
+  - If approved: dispatch alert (Telegram message shows ticker prominently)
   - Log signal + decision to SQLite
 
 Scheduled tasks
 ---------------
-- Daily reset at 9:30 ET — clear all level/indicator state, reset risk counters
+- Daily reset at 9:30 ET — clear all per-symbol level/indicator state, reset risk counters
 - End-of-day summary at 16:05 ET — dispatch daily P&L summary via Telegram
 
 Graceful shutdown
@@ -38,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import signal as _signal
+from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -67,7 +67,6 @@ from src.strategies.regime import RegimeDetector
 logger = structlog.get_logger(__name__)
 
 _ET = ZoneInfo("America/New_York")
-_SYMBOL = "SPY"
 
 # Scheduled ET wall-clock times
 _DAILY_RESET_ET = time(9, 30)
@@ -75,6 +74,20 @@ _EOD_SUMMARY_ET = time(16, 5)
 
 # How often the scheduler wakes (seconds)
 _SCHEDULER_INTERVAL = 30
+
+
+# ── per-symbol pipeline container ─────────────────────────────────────────────
+
+
+@dataclass
+class _SymbolPipeline:
+    """All per-symbol stateful components for one ticker."""
+
+    symbol: str
+    registry: IndicatorRegistry
+    levels: LevelManager
+    regime: RegimeDetector
+    strategy: ORBStrategy
 
 
 # ── pipeline wiring ────────────────────────────────────────────────────────────
@@ -92,65 +105,83 @@ def _build_registry() -> IndicatorRegistry:
     return registry
 
 
+def _build_pipelines(symbols: list[str], db: BarDatabase) -> dict[str, _SymbolPipeline]:
+    """Build one :class:`_SymbolPipeline` per ticker symbol.
+
+    Args:
+        symbols: List of uppercase ticker symbols.
+        db:      Connected :class:`BarDatabase` (needed by LevelManager).
+
+    Returns:
+        Dict mapping symbol → pipeline.
+    """
+    pipelines: dict[str, _SymbolPipeline] = {}
+    for symbol in symbols:
+        pipelines[symbol] = _SymbolPipeline(
+            symbol=symbol,
+            registry=_build_registry(),
+            levels=LevelManager(db=db, symbol=symbol),
+            regime=RegimeDetector(),
+            strategy=ORBStrategy(),
+        )
+        logger.info("pipeline_built", symbol=symbol)
+    return pipelines
+
+
 # ── bar processing ─────────────────────────────────────────────────────────────
 
 
 async def _process_bar(
     bar: Bar,
-    registry: IndicatorRegistry,
-    levels: LevelManager,
-    regime: RegimeDetector,
-    strategy: ORBStrategy,
+    pipeline: _SymbolPipeline,
     risk: RiskManager,
     dispatcher: AlertDispatcher,
     db: BarDatabase,
 ) -> None:
-    """Run a single bar through the full pipeline."""
+    """Run a single bar through the full pipeline for its symbol."""
     # 1. Indicators
-    registry.update_all(bar)
-    indicator_snapshot = registry.get_snapshot()
+    pipeline.registry.update_all(bar)
+    indicator_snapshot = pipeline.registry.get_snapshot()
 
     # 2. Levels
-    levels.update(bar)
-    level_snapshot = levels.get_levels()
+    pipeline.levels.update(bar)
+    level_snapshot = pipeline.levels.get_levels()
 
-    # Update regime from freshest indicator values (ADX on 15-min is approximated
-    # here using the 1-min ATR-proxy until a dedicated 15-min registry is wired).
-    # For MVP: caller updates VIX externally; ADX from snapshot if available.
+    # Update regime from freshest indicator values
     atr = indicator_snapshot.atr
     if atr is not None:
-        # Heuristic: use EMA slope as trending_up proxy (ema9 vs ema20)
         e9 = indicator_snapshot.ema9
         e20 = indicator_snapshot.ema20
         trending_up: bool | None = None
         if e9 is not None and e20 is not None:
             trending_up = e9 > e20
-
-        # ADX not yet computed inline — keep whatever was last set externally.
-        # trending_up is updated so regime at least tracks EMA crossover.
-        regime.update(trending_up=trending_up)
+        pipeline.regime.update(trending_up=trending_up)
 
     # 3. Strategy evaluation
-    signal = strategy.evaluate(bar, indicator_snapshot, level_snapshot, regime)
+    signal = pipeline.strategy.evaluate(bar, indicator_snapshot, level_snapshot, pipeline.regime)
 
     if signal is None:
         return
 
+    # Tag signal with the actual ticker symbol
+    signal = signal.model_copy(update={"symbol": bar.symbol})
+
     logger.info(
         "signal_generated",
+        symbol=bar.symbol,
         strategy=signal.strategy_name,
         direction=str(signal.direction),
         entry=str(signal.entry_price),
     )
 
-    # 4. Risk gate
+    # 4. Risk gate (shared across all tickers — account-level limits)
     decision = risk.approve(signal)
 
     # 5. Persist signal + decision regardless of approval
     try:
         insert_signal(db.conn, signal, decision)
     except Exception as exc:
-        logger.error("signal_persist_failed", error=str(exc))
+        logger.error("signal_persist_failed", symbol=bar.symbol, error=str(exc))
 
     # 6. Alert if approved
     if decision.approved:
@@ -158,6 +189,7 @@ async def _process_bar(
     else:
         logger.warning(
             "signal_rejected",
+            symbol=bar.symbol,
             reason=decision.reason,
             strategy=signal.strategy_name,
         )
@@ -168,22 +200,29 @@ async def _process_bar(
 
 async def _bar_loop(
     queue: asyncio.Queue[Bar],
-    registry: IndicatorRegistry,
-    levels: LevelManager,
-    regime: RegimeDetector,
-    strategy: ORBStrategy,
+    pipelines: dict[str, _SymbolPipeline],
     risk: RiskManager,
     dispatcher: AlertDispatcher,
     db: BarDatabase,
 ) -> None:
-    """Consume bars from the queue and push them through the pipeline."""
-    logger.info("bar_loop_started")
+    """Consume bars from the queue, route to the correct per-symbol pipeline."""
+    logger.info("bar_loop_started", symbols=list(pipelines.keys()))
     while True:
         bar = await queue.get()
+        pipeline = pipelines.get(bar.symbol)
+        if pipeline is None:
+            logger.warning("bar_unknown_symbol", symbol=bar.symbol)
+            queue.task_done()
+            continue
         try:
-            await _process_bar(bar, registry, levels, regime, strategy, risk, dispatcher, db)
+            await _process_bar(bar, pipeline, risk, dispatcher, db)
         except Exception as exc:
-            logger.error("bar_processing_error", error=str(exc), bar_ts=bar.timestamp.isoformat())
+            logger.error(
+                "bar_processing_error",
+                symbol=bar.symbol,
+                error=str(exc),
+                bar_ts=bar.timestamp.isoformat(),
+            )
         finally:
             queue.task_done()
 
@@ -192,8 +231,7 @@ async def _bar_loop(
 
 
 async def _scheduler(
-    registry: IndicatorRegistry,
-    levels: LevelManager,
+    pipelines: dict[str, _SymbolPipeline],
     risk_cooldown: CooldownTracker,
     dispatcher: AlertDispatcher,
     db: BarDatabase,
@@ -211,14 +249,15 @@ async def _scheduler(
         if now_et.time() >= _DAILY_RESET_ET and (
             last_reset_date is None or last_reset_date.date() < today
         ):
-            logger.info("daily_reset", date=str(today))
+            logger.info("daily_reset", date=str(today), symbols=list(pipelines.keys()))
             risk_cooldown.reset_daily()
-            # Rebuild levels (resets ORB, VWAP, HOD/LOD; keeps DB for PDL)
-            levels._orb.__init__()  # type: ignore[misc]
-            levels._vwap.__init__()  # type: ignore[misc]
-            levels._day.__init__()  # type: ignore[misc]
-            levels._premarket.__init__()  # type: ignore[misc]
-            levels._last_date = None
+            for pipeline in pipelines.values():
+                # Reset all per-symbol level state
+                pipeline.levels._orb.__init__()  # type: ignore[misc]
+                pipeline.levels._vwap.__init__()  # type: ignore[misc]
+                pipeline.levels._day.__init__()  # type: ignore[misc]
+                pipeline.levels._premarket.__init__()  # type: ignore[misc]
+                pipeline.levels._last_date = None
             last_reset_date = now_et
 
         # ── end-of-day summary ───────────────────────────────────────────────
@@ -248,6 +287,7 @@ def cast_trades(raw: list[dict[str, object]]) -> list[TradeResult]:
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=UTC)
             sig = Signal(
+                symbol=str(row.get("symbol", "?")),
                 direction=Direction(str(row["direction"])),
                 strategy_name=str(row["strategy_name"]),
                 entry_price=Decimal(str(row["entry_price"])),
@@ -301,21 +341,20 @@ async def run() -> None:
     """Build the full pipeline and run until cancelled."""
     app_settings = get_app_settings()
     risk_settings = get_risk_settings()
+    symbols = app_settings.symbols
 
     # ── database ─────────────────────────────────────────────────────────────
     db = BarDatabase(db_path=app_settings.db_path)
     db.connect()
     ensure_schema(db.conn)
 
-    # ── pipeline components ───────────────────────────────────────────────────
-    registry = _build_registry()
-    levels = LevelManager(db=db, symbol=_SYMBOL)
-    regime = RegimeDetector()
-    strategy = ORBStrategy()
+    # ── per-symbol pipelines ──────────────────────────────────────────────────
+    pipelines = _build_pipelines(symbols, db)
+
+    # ── shared components ─────────────────────────────────────────────────────
     cooldown = CooldownTracker()
     risk = RiskManager(cooldown=cooldown, settings=risk_settings)
 
-    # ── alerts ────────────────────────────────────────────────────────────────
     telegram_settings = get_telegram_settings()
     alerter = TelegramAlerter(
         bot_token=telegram_settings.bot_token,
@@ -323,27 +362,28 @@ async def run() -> None:
     )
     dispatcher = AlertDispatcher(alerter=alerter)
 
-    # ── inject live state into FastAPI ────────────────────────────────────────
+    # ── inject live state into FastAPI (first symbol's pipeline for dashboard) ─
     from src.api.routes import set_dependencies
 
+    first_pipeline = next(iter(pipelines.values()))
     set_dependencies(
         conn=db.conn,
-        registry=registry,
-        levels=levels,
-        regime=regime,
+        registry=first_pipeline.registry,
+        levels=first_pipeline.levels,
+        regime=first_pipeline.regime,
         cooldown=cooldown,
     )
 
-    # ── WebSocket ingestion queue ─────────────────────────────────────────────
+    # ── WebSocket ingestion queue — all symbols on one stream ─────────────────
     queue: asyncio.Queue[Bar] = asyncio.Queue(maxsize=1000)
-    stream = AlpacaBarStream(symbols=[_SYMBOL], queue=queue, timeframe=TimeFrame.ONE_MIN)
+    stream = AlpacaBarStream(symbols=symbols, queue=queue, timeframe=TimeFrame.ONE_MIN)
 
     loop = asyncio.get_running_loop()
     _install_signal_handlers(loop)
 
     logger.info(
         "platform_starting",
-        symbol=_SYMBOL,
+        symbols=symbols,
         mode=app_settings.trading_mode,
         db=app_settings.db_path,
     )
@@ -353,11 +393,11 @@ async def run() -> None:
             tg.create_task(_start_api(), name="api_server")
             tg.create_task(stream.start(), name="websocket_stream")
             tg.create_task(
-                _bar_loop(queue, registry, levels, regime, strategy, risk, dispatcher, db),
+                _bar_loop(queue, pipelines, risk, dispatcher, db),
                 name="bar_loop",
             )
             tg.create_task(
-                _scheduler(registry, levels, cooldown, dispatcher, db),
+                _scheduler(pipelines, cooldown, dispatcher, db),
                 name="scheduler",
             )
     except* asyncio.CancelledError:

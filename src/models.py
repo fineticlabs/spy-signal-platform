@@ -136,6 +136,7 @@ class LevelSnapshot(BaseModel):
 class Signal(BaseModel):
     """Trading signal produced by a strategy when entry conditions are met."""
 
+    symbol: str = Field(default="SPY", description="Ticker symbol that generated this signal")
     direction: Direction = Field(..., description="Trade direction: LONG or SHORT")
     strategy_name: str = Field(..., description="Name of the strategy that generated this signal")
     entry_price: Decimal = Field(..., description="Suggested entry price")

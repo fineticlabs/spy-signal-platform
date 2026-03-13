@@ -10,10 +10,20 @@ Design notes
 - Timezone: uses ZoneInfo("America/New_York") to handle EDT/EST correctly.
   A fixed -5h offset was wrong during EDT season (Mar-Nov) and caused the
   lunch chop filter and entry cutoff to fire 1 hour late.
-- Trading windows: 9:35-11:00 ET (first hour) and 14:30-15:30 ET (power hour).
-  All other times are blocked — no lunch chop parameter needed.
+- Trading window: 9:35-10:00 ET only.  ORB momentum exhausts within the first 25 min.
+  10:xx WR=27% and power-hour WR=34% across 5.6 years under all regime conditions —
+  structural time-of-day decay that no filter can fix.
 - 15-min EMA(20) trend alignment: LONG only if close > EMA, SHORT only if close < EMA.
   EMA is computed by resampling 1-min to 15-min, shifted 1 bar, forward-filled back.
+- Realized volatility filter (VIX proxy): 20-day rolling annualized std of daily SPY
+  returns.  Only trade when realized vol < 18% (~VIX 20).  Computed from prior day's
+  window (no lookahead).  Filters out bear/high-vol regimes where ORB breakouts fail.
+- Daily ADX(14) trending filter: resampled to daily OHLCV, shifted 1 day.  Only trade
+  when daily ADX > 25.  Confirms the broader market is trending not ranging.  Falls back
+  to both-allowed if ADX not yet available (first 14 trading days).
+- Consecutive-candle confirmation: requires TWO consecutive 1-min closes above ORB high
+  (longs) or below ORB low (shorts) before entry.  Filters single-candle fakeouts that
+  immediately reverse — primary failure mode in 2020-2022.
 - Dynamic targets: ORB range vs trailing 20-day p25/p75.
   range > p75 → 2.5R target; range < p25 → 1.5R target; else → 2R (default).
 - Gap classification filter (gap-and-go bias):
@@ -56,18 +66,27 @@ _RISK_MULTIPLIER = 2.0
 _VOL_WINDOW = 20
 _VOL_MULTIPLIER = 1.5  # restored: 2.0x was too strict, filtered too many setups
 
-# Trading windows (ET wall-clock times)
-_WINDOW1_START = time(9, 35)  # first hour open
-_WINDOW1_END = time(11, 0)
-_WINDOW2_START = time(14, 30)  # power hour
-_WINDOW2_END = time(15, 30)
+# Trading window — 9:35-10:00 ET only.
+# ORB momentum exhausts within the first 25 min after the range is set.
+# 10:xx WR=27% and power-hour WR=34% across all regime conditions tested —
+# structural time-of-day decay that filters cannot fix.
+_WINDOW1_START = time(9, 35)
+_WINDOW1_END = time(10, 0)
 _FORCE_FLAT = time(15, 55)
 
 _MAX_TRADES_PER_DAY = 5
-_MIN_ORB_PCT = 0.0015  # lowered from 0.3% → 0.15% of price (less restrictive)
+_MIN_ORB_PCT = 0.0015
 _EMA15M_PERIOD = 20  # EMA period on 15-min bars for trend alignment
 _ORB_RANGE_WINDOW = 20  # trailing days for ORB range percentiles
 _GAP_THRESHOLD_PCT = 0.3  # ±0.3% gap separates directional bias from neutral
+
+# Realized volatility filter (VIX proxy)
+_REALIZED_VOL_WINDOW = 20  # trading days for rolling HV
+_REALIZED_VOL_MAX = 0.18  # 18% annualized ~ VIX 20; blocks high-vol regimes
+
+# Daily ADX trending filter
+_DAILY_ADX_PERIOD = 14
+_DAILY_ADX_MIN = 25.0  # daily ADX > 25 confirms trending market
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -189,6 +208,133 @@ def _classify_gap(gap_pct: float, threshold: float) -> tuple[bool, bool]:
     return True, True
 
 
+# ── Realized volatility (VIX proxy) ──────────────────────────────────────────
+
+
+def _compute_daily_realized_vol(
+    index: pd.DatetimeIndex,
+    close_prices: Any,
+    window: int = _REALIZED_VOL_WINDOW,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Rolling annualized realized volatility broadcast to 1-min bars.
+
+    For each trading day D the value is the rolling ``window``-day std of daily
+    returns computed through day D-1 (no lookahead).  NaN until enough history.
+
+    Approximates VIX: annualized HV ~18% ≈ VIX ~20, so filtering at 18%
+    blocks the high-volatility bear-market regimes where ORB breakouts fail.
+
+    Args:
+        index:        UTC DatetimeIndex aligned with close_prices.
+        close_prices: Numpy-like array of 1-min close prices.
+        window:       Rolling window in trading days (default 20).
+
+    Returns:
+        Float64 numpy array of length ``len(index)``.
+    """
+    close_arr = np.asarray(close_prices, dtype=float)
+    et_index = _to_et_index(index)
+    n = len(index)
+
+    # Build ordered list of trading dates → bar positions
+    dates: list[Any] = []
+    date_to_positions: dict[Any, list[int]] = {}
+    for i, ts in enumerate(et_index):
+        d = ts.date()
+        if d not in date_to_positions:
+            dates.append(d)
+            date_to_positions[d] = []
+        date_to_positions[d].append(i)
+
+    # Daily close = last bar close of each ET date
+    daily_closes = [float(close_arr[date_to_positions[d][-1]]) for d in dates]
+    daily_close_series = pd.Series(daily_closes, dtype=float)
+
+    # Daily log returns, rolling std, annualize, shift 1 day (no lookahead)
+    daily_ret = daily_close_series.pct_change()
+    rolling_vol = daily_ret.rolling(window).std() * float(np.sqrt(252))
+    vol_shifted = rolling_vol.shift(1)  # use prior day's computed vol
+
+    # Broadcast shifted vol to 1-min bars
+    vol_out = np.full(n, np.nan)
+    for idx_d, d in enumerate(dates):
+        v = vol_shifted.iloc[idx_d]
+        if not np.isnan(float(v)):
+            for pos in date_to_positions[d]:
+                vol_out[pos] = float(v)
+
+    return vol_out
+
+
+# ── Daily ADX ─────────────────────────────────────────────────────────────────
+
+
+def _compute_daily_adx(
+    index: pd.DatetimeIndex,
+    high: Any,
+    low: Any,
+    close: Any,
+    period: int = _DAILY_ADX_PERIOD,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Daily ADX(14) broadcast to 1-min bars, shifted 1 day for no lookahead.
+
+    Resamples 1-min bars to daily OHLCV (high=max, low=min, close=last),
+    computes TA-Lib ADX, shifts by 1 trading day, then forward-fills each
+    day's value to all 1-min bars of that calendar date.
+
+    Args:
+        index:  UTC DatetimeIndex aligned with high/low/close.
+        high:   Numpy-like array of 1-min bar highs.
+        low:    Numpy-like array of 1-min bar lows.
+        close:  Numpy-like array of 1-min bar closes.
+        period: ADX lookback period (default 14).
+
+    Returns:
+        Float64 numpy array of length ``len(index)``.  NaN until enough
+        daily history is available.
+    """
+    high_arr = np.asarray(high, dtype=float)
+    low_arr = np.asarray(low, dtype=float)
+    close_arr = np.asarray(close, dtype=float)
+    et_index = _to_et_index(index)
+    n = len(index)
+
+    # Group 1-min bar positions by ET calendar date
+    dates: list[Any] = []
+    date_to_positions: dict[Any, list[int]] = {}
+    for i, ts in enumerate(et_index):
+        d = ts.date()
+        if d not in date_to_positions:
+            dates.append(d)
+            date_to_positions[d] = []
+        date_to_positions[d].append(i)
+
+    # Build daily OHLCV arrays
+    d_high = np.array([float(np.max(high_arr[date_to_positions[d]])) for d in dates])
+    d_low = np.array([float(np.min(low_arr[date_to_positions[d]])) for d in dates])
+    d_close = np.array([float(close_arr[date_to_positions[d][-1]]) for d in dates])
+
+    if len(dates) < period + 1:
+        return np.full(n, np.nan)
+
+    # ADX on daily bars via TA-Lib
+    adx_raw = talib.ADX(d_high, d_low, d_close, timeperiod=period)
+
+    # Shift by 1 day — bar D uses ADX known through day D-1
+    adx_series = pd.Series(adx_raw, dtype=float)
+    adx_shifted = adx_series.shift(1).to_numpy()
+
+    # Broadcast to 1-min bars
+    adx_out = np.full(n, np.nan)
+    for idx_d, d in enumerate(dates):
+        v = adx_shifted[idx_d]
+        if not np.isnan(float(v)):
+            for pos in date_to_positions[d]:
+                adx_out[pos] = float(v)
+
+    return adx_out
+
+
 # ── Backtesting.py Strategy ───────────────────────────────────────────────────
 
 
@@ -265,6 +411,14 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         gap_arr = _compute_gap_array(index, open_arr_for_gap, close_arr)
         self.gap_pct = self.I(lambda: gap_arr, name="GapPct")
 
+        # Realized vol (VIX proxy) — 20-day rolling HV, shifted 1 day, < 18% to trade
+        realized_vol_arr = _compute_daily_realized_vol(index, close_arr)
+        self.realized_vol = self.I(lambda: realized_vol_arr, name="RealizedVol")
+
+        # Daily ADX(14) — shifted 1 day, > 25 required to confirm trending regime
+        daily_adx_arr = _compute_daily_adx(index, high, low, close)
+        self.daily_adx = self.I(lambda: daily_adx_arr, name="DailyADX")
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -279,10 +433,8 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             self.position.close()
             return
 
-        # Only trade during first-hour window or power-hour window
-        in_window1 = _WINDOW1_START <= t < _WINDOW1_END
-        in_window2 = _WINDOW2_START <= t < _WINDOW2_END
-        if not (in_window1 or in_window2):
+        # Only trade 9:35-10:00 ET — first 25 min after ORB completes
+        if not (_WINDOW1_START <= t < _WINDOW1_END):
             return
 
         # Already in a position - nothing to enter
@@ -295,7 +447,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             self._last_et_date = today
             self._daily_trade_count = 0
 
-        # Skip Mondays — lowest win rate and expectancy in day-of-week analysis
+        # Skip Mondays — consistently worst WR and expectancy across all regimes
         if ts.tz_convert(_ET_TZ).dayofweek == 0:
             return
 
@@ -313,6 +465,16 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
 
         # Skip narrow ORB days - too choppy to trade breakouts
         if np.isnan(orb_range) or orb_range < self.min_orb_pct:
+            return
+
+        # Realized vol filter: skip high-volatility regimes (~VIX > 20)
+        realized_vol = self.realized_vol[-1]
+        if not np.isnan(realized_vol) and realized_vol >= _REALIZED_VOL_MAX:
+            return
+
+        # Daily ADX filter: skip ranging markets (ADX <= 25)
+        d_adx = self.daily_adx[-1]
+        if not np.isnan(d_adx) and d_adx <= _DAILY_ADX_MIN:
             return
 
         atr = self.atr[-1]
@@ -356,8 +518,17 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         else:
             dynamic_risk_mult = self.risk_mult
 
-        # LONG breakout
-        if close > orb_high and bullish_trend and gap_allows_long:
+        # Consecutive-candle confirmation: require prev bar also outside ORB
+        prev_close = float(self.data.Close[-2]) if len(self.data.Close) >= 2 else float("nan")
+
+        # LONG breakout: two consecutive closes above ORB high
+        if (
+            close > orb_high
+            and not np.isnan(prev_close)
+            and prev_close > orb_high
+            and bullish_trend
+            and gap_allows_long
+        ):
             entry = close
             stop = entry - self.atr_mult * atr
             risk = entry - stop
@@ -367,8 +538,14 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             self.buy(sl=stop, tp=target)
             self._daily_trade_count += 1
 
-        # SHORT breakdown
-        elif close < orb_low and bearish_trend and gap_allows_short:
+        # SHORT breakdown: two consecutive closes below ORB low
+        elif (
+            close < orb_low
+            and not np.isnan(prev_close)
+            and prev_close < orb_low
+            and bearish_trend
+            and gap_allows_short
+        ):
             entry = close
             stop = entry + self.atr_mult * atr
             risk = stop - entry

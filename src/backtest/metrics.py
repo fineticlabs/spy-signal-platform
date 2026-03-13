@@ -115,6 +115,9 @@ def compute_metrics(
     # Day-of-week breakdown (Mon=0 … Fri=4, in ET)
     dow_breakdown = _day_of_week_breakdown(trades)
 
+    # Per-year breakdown (ET calendar year of entry)
+    year_breakdown = _per_year_breakdown(trades)
+
     return {
         "total_trades": total,
         "n_wins": n_wins,
@@ -134,6 +137,7 @@ def compute_metrics(
         "realized_rr": round(realized_rr, 4),
         "tod_breakdown": tod_breakdown,
         "dow_breakdown": dow_breakdown,
+        "year_breakdown": year_breakdown,
     }
 
 
@@ -247,6 +251,36 @@ def _day_of_week_breakdown(trades: pd.DataFrame) -> dict[str, dict[str, float]]:
         return {}
 
 
+def _per_year_breakdown(trades: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Aggregate P&L and win-rate by ET calendar year of entry."""
+    if "EntryTime" not in trades.columns or "PnL" not in trades.columns:
+        return {}
+
+    try:
+        entry_times: pd.Series = trades["EntryTime"]
+        if entry_times.dt.tz is None:
+            entry_times = entry_times.dt.tz_localize("UTC")
+        et_year = entry_times.dt.tz_convert(_ET_TZ).dt.year
+
+        result: dict[str, dict[str, float]] = {}
+        for year in sorted(et_year.unique()):
+            mask = et_year == year
+            subset = trades.loc[mask, "PnL"]
+            wins = int((subset > 0).sum())
+            total = len(subset)
+            expectancy = float(subset.mean()) if total > 0 else 0.0
+            result[str(year)] = {
+                "trades": total,
+                "win_rate": round(wins / total, 4) if total > 0 else 0.0,
+                "total_pnl": round(float(subset.sum()), 2),
+                "expectancy": round(expectancy, 2),
+            }
+        return result
+    except Exception as exc:
+        logger.warning("year_breakdown_failed", error=str(exc))
+        return {}
+
+
 # ── display ───────────────────────────────────────────────────────────────────
 
 
@@ -294,6 +328,19 @@ def print_summary(metrics: dict[str, Any], label: str = "Backtest Results") -> N
                 f"  {day:<12}: {vals['trades']:>3} trades, "
                 f"WR={vals['win_rate']*100:.0f}%, "
                 f"PnL=${vals['total_pnl']:.2f}"
+            )
+
+    year: dict[str, Any] = metrics.get("year_breakdown", {})
+    if year:
+        print(sep)
+        print("  Per-year breakdown")
+        print(sep)
+        for yr, vals in year.items():
+            print(
+                f"  {yr}: {vals['trades']:>4} trades, "
+                f"WR={vals['win_rate']*100:.0f}%, "
+                f"PnL=${vals['total_pnl']:>9.2f}, "
+                f"${vals['expectancy']:.2f}/trade"
             )
 
     print("=" * 50)
