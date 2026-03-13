@@ -18,6 +18,18 @@ class TimeFrame(StrEnum):
     DAILY = "1Day"
 
 
+class Direction(StrEnum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+
+class Regime(StrEnum):
+    TRENDING_UP = "TRENDING_UP"
+    TRENDING_DOWN = "TRENDING_DOWN"
+    RANGING = "RANGING"
+    CHOPPY = "CHOPPY"
+
+
 class Bar(BaseModel):
     """OHLCV bar with VWAP for a single symbol and timeframe."""
 
@@ -119,3 +131,33 @@ class LevelSnapshot(BaseModel):
     # Premarket levels
     premarket_high: Decimal | None = Field(default=None, description="Premarket high")
     premarket_low: Decimal | None = Field(default=None, description="Premarket low")
+
+
+class Signal(BaseModel):
+    """Trading signal produced by a strategy when entry conditions are met."""
+
+    direction: Direction = Field(..., description="Trade direction: LONG or SHORT")
+    strategy_name: str = Field(..., description="Name of the strategy that generated this signal")
+    entry_price: Decimal = Field(..., description="Suggested entry price")
+    stop_price: Decimal = Field(..., description="Initial stop-loss price")
+    target_price: Decimal = Field(..., description="Initial profit target price")
+    risk_reward_ratio: Decimal = Field(
+        ..., description="Reward-to-risk ratio (target/stop distance)"
+    )
+    confidence_score: int = Field(
+        ..., ge=1, le=5, description="Signal confidence from 1 (low) to 5 (high)"
+    )
+    reason: str = Field(..., description="Human-readable explanation of why the signal fired")
+    timeframe: TimeFrame = Field(..., description="Bar timeframe that triggered the signal")
+    regime: Regime = Field(..., description="Market regime at signal time")
+    vix: Decimal | None = Field(default=None, description="VIX level at signal time")
+    adx: Decimal | None = Field(default=None, description="ADX value at signal time")
+    indicators_snapshot: IndicatorSnapshot | None = Field(
+        default=None, description="Full indicator state at signal time"
+    )
+    levels_snapshot: LevelSnapshot | None = Field(
+        default=None, description="Full level state at signal time"
+    )
+    timestamp: datetime = Field(..., description="Timestamp of the bar that triggered the signal")
+
+    model_config = {"frozen": True}

@@ -1,0 +1,186 @@
+"""Opening Range Breakout (ORB) strategy — 5-min window."""
+
+from __future__ import annotations
+
+from collections import deque
+from datetime import time
+from decimal import Decimal
+from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
+
+import structlog
+
+from src.models import Direction, Signal
+from src.strategies.base import Strategy
+
+if TYPE_CHECKING:
+    from src.models import Bar, IndicatorSnapshot, LevelSnapshot
+    from src.strategies.regime import RegimeDetector
+
+logger = structlog.get_logger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+_LUNCH_START = time(11, 30)
+_LUNCH_END = time(13, 30)
+_CUTOFF = time(15, 45)
+
+_VOL_WINDOW = 20
+_VOL_MULTIPLIER = Decimal("1.5")
+_ATR_MULTIPLIER = Decimal("1.5")
+_RISK_MULTIPLIER = Decimal("2.0")
+_VIX_MAX = Decimal("25")
+_ADX_MIN = Decimal("20")
+
+
+class ORBStrategy(Strategy):
+    """5-min Opening Range Breakout strategy.
+
+    Entry:
+
+    - LONG  when ``close > ORB high`` AND ``volume >= 1.5x 20-bar average``
+    - SHORT when ``close < ORB low``  AND ``volume >= 1.5x 20-bar average``
+
+    Filters:
+
+    - ORB window complete (>= 9:35 ET)
+    - VIX < 25
+    - ADX > 20
+    - Not in lunch chop (11:30-13:30 ET)
+    - Before forced-flat cutoff (15:45 ET)
+
+    Stop:   ``entry +/- 1.5 * ATR(14)``
+    Target: ``entry +/- 2 * risk_distance``
+    """
+
+    def __init__(self) -> None:
+        self._volumes: deque[int] = deque(maxlen=_VOL_WINDOW)
+
+    # ── Strategy interface ─────────────────────────────────────────────────────
+
+    @property
+    def name(self) -> str:
+        return "ORB-5min"
+
+    def required_indicators(self) -> list[str]:
+        return ["atr"]
+
+    def evaluate(
+        self,
+        bar: Bar,
+        indicators: IndicatorSnapshot,
+        levels: LevelSnapshot,
+        regime: RegimeDetector,
+    ) -> Signal | None:
+        """Return a Signal if ORB entry conditions are met, else ``None``.
+
+        Volume history is updated on every call regardless of filtering so that
+        the rolling average stays current even while conditions are not met.
+        """
+        # Capture avg BEFORE this bar contaminates the window, then record it.
+        avg_vol = self._avg_volume()
+        self._volumes.append(bar.volume)
+
+        bar_time = bar.timestamp.astimezone(_ET).time()
+
+        # --- Time filters ---
+        if bar_time >= _CUTOFF:
+            logger.debug("orb_filter_cutoff", bar_time=str(bar_time))
+            return None
+        if _LUNCH_START <= bar_time < _LUNCH_END:
+            logger.debug("orb_filter_lunch_chop", bar_time=str(bar_time))
+            return None
+
+        # --- ORB must be complete ---
+        if not levels.orb_complete:
+            logger.debug("orb_filter_incomplete")
+            return None
+
+        orb_high = levels.orb_high
+        orb_low = levels.orb_low
+        if orb_high is None or orb_low is None:
+            return None
+
+        # --- Regime filters ---
+        vix = regime.vix_level
+        adx = regime.adx_value
+        if vix is None or adx is None:
+            logger.debug("orb_filter_no_regime_data")
+            return None
+        if vix >= _VIX_MAX:
+            logger.debug("orb_filter_high_vix", vix=str(vix))
+            return None
+        if adx <= _ADX_MIN:
+            logger.debug("orb_filter_low_adx", adx=str(adx))
+            return None
+
+        # --- Volume filter ---
+        if avg_vol is None or Decimal(str(bar.volume)) < avg_vol * _VOL_MULTIPLIER:
+            logger.debug("orb_filter_volume", volume=bar.volume, avg=str(avg_vol))
+            return None
+
+        # --- ATR required for stop sizing ---
+        atr = indicators.atr
+        if atr is None:
+            logger.debug("orb_filter_no_atr")
+            return None
+
+        close = bar.close
+
+        # --- Determine direction ---
+        if close > orb_high:
+            direction = Direction.LONG
+            entry = close
+            stop = entry - _ATR_MULTIPLIER * atr
+            risk = entry - stop
+            target = entry + _RISK_MULTIPLIER * risk
+            reason = f"Close {close} broke above ORB high {orb_high} " f"with volume {bar.volume:,}"
+        elif close < orb_low:
+            direction = Direction.SHORT
+            entry = close
+            stop = entry + _ATR_MULTIPLIER * atr
+            risk = stop - entry
+            target = entry - _RISK_MULTIPLIER * risk
+            reason = f"Close {close} broke below ORB low {orb_low} " f"with volume {bar.volume:,}"
+        else:
+            return None  # price inside ORB range — no breakout
+
+        if risk <= 0:
+            return None
+
+        rr = _RISK_MULTIPLIER  # always 2.0 by construction
+
+        signal = Signal(
+            direction=direction,
+            strategy_name=self.name,
+            entry_price=entry,
+            stop_price=stop,
+            target_price=target,
+            risk_reward_ratio=rr,
+            confidence_score=3,
+            reason=reason,
+            timeframe=bar.timeframe,
+            regime=regime.current_regime,
+            vix=vix,
+            adx=adx,
+            indicators_snapshot=indicators,
+            levels_snapshot=levels,
+            timestamp=bar.timestamp,
+        )
+
+        logger.info(
+            "orb_signal",
+            direction=str(direction),
+            entry=str(entry),
+            stop=str(stop),
+            target=str(target),
+            rr=str(rr),
+        )
+        return signal
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _avg_volume(self) -> Decimal | None:
+        """Rolling average volume, or ``None`` when the window is empty."""
+        if not self._volumes:
+            return None
+        return Decimal(str(sum(self._volumes) / len(self._volumes)))
