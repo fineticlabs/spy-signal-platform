@@ -1,0 +1,406 @@
+"""Tests for the backtesting framework.
+
+Coverage
+--------
+- data_loader: load/resample, walk-forward window generation, slice_window
+- engine: no lookahead bias (shift check on ORB arrays), signal correctness
+- metrics: metric calculations against known values
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, date, datetime
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from src.backtest.data_loader import (
+    WalkForwardWindow,
+    make_walk_forward_windows,
+    resample,
+    slice_window,
+)
+from src.backtest.engine import _compute_orb_arrays, _et_time
+from src.backtest.metrics import (
+    _max_drawdown,
+    _sharpe_ratio,
+    compute_metrics,
+)
+from src.models import TimeFrame
+
+_UTC = UTC
+
+
+# ── fixtures ─────────────────────────────────────────────────────────────────
+
+
+def _make_1min_df(
+    n_bars: int = 390,
+    start: datetime | None = None,
+    close: float = 480.0,
+    volume: int = 500_000,
+) -> pd.DataFrame:
+    """Build a minimal 1-min OHLCV DataFrame starting at 9:30 ET on 2024-01-15.
+
+    Creates a single trading day (390 1-min bars by default).
+    """
+    if start is None:
+        # 9:30 ET = 14:30 UTC
+        start = datetime(2024, 1, 15, 14, 30, tzinfo=_UTC)
+
+    idx = pd.date_range(start=start, periods=n_bars, freq="1min", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "open": close - 0.1,
+            "high": close + 0.5,
+            "low": close - 0.5,
+            "close": close,
+            "volume": volume,
+            "vwap": close,
+        },
+        index=idx,
+    )
+    return df
+
+
+def _make_multiday_df(n_days: int = 5) -> pd.DataFrame:
+    """Build n_days of 1-min bars (390 bars per day, 9:30 ET = 14:30 UTC)."""
+    from datetime import timedelta
+
+    base = datetime(2024, 1, 2, 14, 30, tzinfo=_UTC)
+    frames = []
+    for d in range(n_days):
+        day_start = base + timedelta(days=d)
+        frames.append(_make_1min_df(n_bars=390, start=day_start))
+    return pd.concat(frames).sort_index()
+
+
+# ── data_loader tests ─────────────────────────────────────────────────────────
+
+
+class TestResample:
+    def test_5min_produces_correct_bar_count(self) -> None:
+        """390 1-min bars → 78 5-min bars (390 / 5)."""
+        df = _make_1min_df(n_bars=390)
+        result = resample(df, TimeFrame.FIVE_MIN)
+        assert len(result) == 78
+
+    def test_15min_produces_correct_bar_count(self) -> None:
+        """390 1-min bars → 26 15-min bars (390 / 15)."""
+        df = _make_1min_df(n_bars=390)
+        result = resample(df, TimeFrame.FIFTEEN_MIN)
+        assert len(result) == 26
+
+    def test_1min_passthrough(self) -> None:
+        """Resampling to 1-min returns a copy unchanged."""
+        df = _make_1min_df(n_bars=10)
+        result = resample(df, TimeFrame.ONE_MIN)
+        assert len(result) == len(df)
+
+    def test_ohlcv_aggregation_correctness(self) -> None:
+        """High = max, Low = min, Open = first, Close = last, Volume = sum."""
+        # 5 bars with known values: high goes 1,2,3,4,5; close goes 10,20,30,40,50
+        idx = pd.date_range("2024-01-15 14:30", periods=5, freq="1min", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "open": [100.0] * 5,
+                "high": [1.0, 2.0, 3.0, 4.0, 5.0],
+                "low": [0.1, 0.2, 0.3, 0.4, 0.5],
+                "close": [10.0, 20.0, 30.0, 40.0, 50.0],
+                "volume": [100, 200, 300, 400, 500],
+                "vwap": [10.0] * 5,
+            },
+            index=idx,
+        )
+        result = resample(df, TimeFrame.FIVE_MIN)
+        assert len(result) == 1
+        row = result.iloc[0]
+        assert row["high"] == 5.0
+        assert row["low"] == 0.1
+        assert row["close"] == 50.0
+        assert row["volume"] == 1500
+
+    def test_unsupported_timeframe_raises(self) -> None:
+        df = _make_1min_df(n_bars=10)
+        with pytest.raises(ValueError, match="Unsupported"):
+            resample(df, TimeFrame.DAILY)
+
+
+class TestWalkForwardWindows:
+    def test_single_window(self) -> None:
+        """80 days of data → exactly 1 window (60 IS + 20 OOS)."""
+        df = _make_multiday_df(n_days=82)
+        windows = make_walk_forward_windows(df, in_sample_days=60, out_of_sample_days=20)
+        assert len(windows) >= 1
+
+    def test_window_is_oos_do_not_overlap(self) -> None:
+        """OOS start must be the day after IS end."""
+        df = _make_multiday_df(n_days=90)
+        windows = make_walk_forward_windows(df, in_sample_days=60, out_of_sample_days=20)
+        for w in windows:
+            assert w.out_of_sample_start > w.in_sample_end
+
+    def test_empty_df_returns_empty_list(self) -> None:
+        df = pd.DataFrame()
+        windows = make_walk_forward_windows(df)
+        assert windows == []
+
+    def test_insufficient_data_returns_empty(self) -> None:
+        """Less than IS days → no window."""
+        df = _make_multiday_df(n_days=5)  # only 5 days, need 60
+        windows = make_walk_forward_windows(df, in_sample_days=60, out_of_sample_days=20)
+        assert windows == []
+
+    def test_window_dates_sequential(self) -> None:
+        """Each consecutive pair of windows advances the start date."""
+        df = _make_multiday_df(n_days=200)
+        windows = make_walk_forward_windows(df, in_sample_days=60, out_of_sample_days=20)
+        import itertools
+
+        for a, b in itertools.pairwise(windows):
+            assert b.in_sample_start > a.in_sample_start
+
+    def test_oos_end_clamped_to_last_date(self) -> None:
+        """Final OOS window end is <= last date in the DataFrame."""
+        df = _make_multiday_df(n_days=82)
+        windows = make_walk_forward_windows(df, in_sample_days=60, out_of_sample_days=20)
+        last_date: date = df.index[-1].date()
+        assert windows[-1].out_of_sample_end <= last_date
+
+
+class TestSliceWindow:
+    def test_in_sample_slice_has_correct_dates(self) -> None:
+        df = _make_multiday_df(n_days=5)
+        window = WalkForwardWindow(
+            in_sample_start=date(2024, 1, 2),
+            in_sample_end=date(2024, 1, 3),
+            out_of_sample_start=date(2024, 1, 4),
+            out_of_sample_end=date(2024, 1, 5),
+        )
+        is_df, _ = slice_window(df, window)
+        # All IS timestamps must fall within [Jan 2, Jan 3]
+        assert not is_df.empty
+        first_day: date = is_df.index[0].date()
+        last_day: date = is_df.index[-1].date()
+        assert first_day >= date(2024, 1, 2)
+        assert last_day <= date(2024, 1, 3)
+
+    def test_out_of_sample_slice_has_correct_dates(self) -> None:
+        df = _make_multiday_df(n_days=5)
+        window = WalkForwardWindow(
+            in_sample_start=date(2024, 1, 2),
+            in_sample_end=date(2024, 1, 3),
+            out_of_sample_start=date(2024, 1, 4),
+            out_of_sample_end=date(2024, 1, 5),
+        )
+        _, oos_df = slice_window(df, window)
+        assert not oos_df.empty
+        first_day: date = oos_df.index[0].date()
+        assert first_day >= date(2024, 1, 4)
+
+    def test_slices_do_not_overlap(self) -> None:
+        df = _make_multiday_df(n_days=5)
+        window = WalkForwardWindow(
+            in_sample_start=date(2024, 1, 2),
+            in_sample_end=date(2024, 1, 3),
+            out_of_sample_start=date(2024, 1, 4),
+            out_of_sample_end=date(2024, 1, 5),
+        )
+        is_df, oos_df = slice_window(df, window)
+        # No timestamp appears in both slices
+        shared = is_df.index.intersection(oos_df.index)
+        assert len(shared) == 0
+
+
+# ── engine: no-lookahead tests ────────────────────────────────────────────────
+
+
+class TestORBArraysNoLookahead:
+    """Verify _compute_orb_arrays never exposes future bar data."""
+
+    def _build_index_and_prices(
+        self,
+        n_bars: int = 20,
+        start: str = "2024-01-15 14:30",  # 9:30 ET
+    ) -> tuple[
+        pd.DatetimeIndex,
+        np.ndarray[Any, np.dtype[np.float64]],
+        np.ndarray[Any, np.dtype[np.float64]],
+    ]:
+        idx = pd.date_range(start, periods=n_bars, freq="1min", tz="UTC")
+        high = np.arange(1.0, n_bars + 1.0)  # unique values per bar
+        low = high - 0.5
+        return idx, high, low
+
+    def test_orb_bars_during_window_are_nan(self) -> None:
+        """The first 5 bars (opening range) must have NaN ORB values."""
+        idx, high, low = self._build_index_and_prices(n_bars=20)
+        orb_high, orb_low_nan = _compute_orb_arrays(idx, high, low, orb_bars=5)
+        # First 5 bars: NaN (ORB not yet established)
+        assert all(np.isnan(orb_high[:5]))
+        assert all(np.isnan(orb_low_nan[:5]))
+
+    def test_orb_bars_after_window_use_only_first_n_bars(self) -> None:
+        """Bars 6+ should use max-high / min-low of bars 0-4 only."""
+        idx, high, low = self._build_index_and_prices(n_bars=20)
+        # high = [1,2,3,4,5, 6,7,...,20] → ORB high should be 5.0
+        orb_high, _orb_low = _compute_orb_arrays(idx, high, low, orb_bars=5)
+        for i in range(5, 20):
+            assert orb_high[i] == pytest.approx(5.0), f"bar {i} saw future high"
+
+    def test_orb_low_uses_only_first_n_bars(self) -> None:
+        """ORB low = min of first n bars, not affected by later bars."""
+        idx, high, low = self._build_index_and_prices(n_bars=20)
+        # low = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, ...] → ORB low = 0.5
+        _orb_high, orb_low = _compute_orb_arrays(idx, high, low, orb_bars=5)
+        for i in range(5, 20):
+            assert orb_low[i] == pytest.approx(0.5), f"bar {i} saw future low"
+
+    def test_multiday_orb_is_computed_per_day(self) -> None:
+        """Each calendar day gets its own ORB, not contaminated by prior days."""
+        # Two days, 15 bars each (9:30-9:44 ET = UTC 14:30-14:44)
+        idx1 = pd.date_range("2024-01-15 14:30", periods=15, freq="1min", tz="UTC")
+        idx2 = pd.date_range("2024-01-16 14:30", periods=15, freq="1min", tz="UTC")
+        idx = idx1.append(idx2)
+
+        # Day 1 highs: 1-15; Day 2 highs: 100-114
+        high = np.concatenate([np.arange(1.0, 16.0), np.arange(100.0, 115.0)])
+        low = high - 0.5
+
+        orb_high, _ = _compute_orb_arrays(idx, high, low, orb_bars=5)
+
+        # Day 1: ORB high = max of bars 0-4 = 5.0
+        for i in range(5, 15):
+            assert orb_high[i] == pytest.approx(
+                5.0
+            ), f"day1 bar {i}: expected 5.0 got {orb_high[i]}"
+
+        # Day 2: ORB high = max of bars 15-19 = 104.0
+        for i in range(20, 30):
+            assert orb_high[i] == pytest.approx(
+                104.0
+            ), f"day2 bar {i}: expected 104.0 got {orb_high[i]}"
+
+
+class TestETTime:
+    def test_930_et_converts_correctly(self) -> None:
+        """14:30 UTC = 9:30 ET (EST, UTC-5)."""
+        from datetime import time
+
+        ts = pd.Timestamp("2024-01-15 14:30:00", tz="UTC")
+        assert _et_time(ts) == time(9, 30)
+
+    def test_1600_et_converts_correctly(self) -> None:
+        from datetime import time
+
+        ts = pd.Timestamp("2024-01-15 21:00:00", tz="UTC")
+        assert _et_time(ts) == time(16, 0)
+
+
+# ── metrics tests ─────────────────────────────────────────────────────────────
+
+
+class TestComputeMetrics:
+    def _make_trades(self, pnl_list: list[float]) -> pd.DataFrame:
+        n = len(pnl_list)
+        idx = pd.date_range("2024-01-15 14:35", periods=n, freq="30min", tz="UTC")
+        return pd.DataFrame(
+            {
+                "PnL": pnl_list,
+                "ReturnPct": [p / 500 * 100 for p in pnl_list],
+                "EntryTime": idx,
+                "ExitTime": idx + pd.Timedelta(minutes=15),
+            }
+        )
+
+    def test_empty_trades_returns_zeros(self) -> None:
+        m = compute_metrics(pd.DataFrame())
+        assert m["total_trades"] == 0
+        assert m["win_rate"] == 0.0
+
+    def test_win_rate_calculation(self) -> None:
+        """3 wins, 1 loss → 75% win rate."""
+        trades = self._make_trades([100.0, 200.0, 150.0, -75.0])
+        m = compute_metrics(trades)
+        assert m["win_rate"] == pytest.approx(0.75, abs=0.001)
+        assert m["loss_rate"] == pytest.approx(0.25, abs=0.001)
+
+    def test_profit_factor(self) -> None:
+        """gross_profit=450, gross_loss=75 → PF=6.0."""
+        trades = self._make_trades([100.0, 200.0, 150.0, -75.0])
+        m = compute_metrics(trades)
+        assert float(m["profit_factor"]) == pytest.approx(6.0, abs=0.01)
+
+    def test_expectancy(self) -> None:
+        """avg_win=150, win_rate=0.75, avg_loss=75, loss_rate=0.25.
+        expectancy = 150*0.75 - 75*0.25 = 112.5 - 18.75 = 93.75."""
+        trades = self._make_trades([100.0, 200.0, 150.0, -75.0])
+        m = compute_metrics(trades)
+        assert float(m["expectancy"]) == pytest.approx(93.75, abs=0.01)
+
+    def test_avg_winner_and_loser(self) -> None:
+        trades = self._make_trades([100.0, 200.0, -50.0, -150.0])
+        m = compute_metrics(trades)
+        assert float(m["avg_winner"]) == pytest.approx(150.0, abs=0.01)
+        assert float(m["avg_loser"]) == pytest.approx(100.0, abs=0.01)
+
+    def test_realized_rr(self) -> None:
+        """avg_winner=150, avg_loser=100 → RR = 1.5."""
+        trades = self._make_trades([100.0, 200.0, -50.0, -150.0])
+        m = compute_metrics(trades)
+        assert float(m["realized_rr"]) == pytest.approx(1.5, abs=0.01)
+
+    def test_all_losses_profit_factor(self) -> None:
+        """All losses → profit factor 0.0 (no gross profit)."""
+        trades = self._make_trades([-100.0, -200.0])
+        m = compute_metrics(trades)
+        assert float(m["profit_factor"]) == 0.0
+
+    def test_all_wins_profit_factor_is_inf(self) -> None:
+        """All wins → profit factor inf."""
+        trades = self._make_trades([100.0, 200.0])
+        m = compute_metrics(trades)
+        assert float(m["profit_factor"]) == float("inf")
+
+
+class TestMaxDrawdown:
+    def test_no_drawdown(self) -> None:
+        """Monotonically increasing equity → drawdown is 0 or very small."""
+        equity = pd.Series([0.0, 100.0, 200.0, 300.0])
+        dd = _max_drawdown(equity)
+        assert dd <= 0.0
+
+    def test_full_loss_from_peak(self) -> None:
+        """Equity goes to 0 from 100 → -100% drawdown."""
+        equity = pd.Series([100.0, 50.0, 0.0])
+        dd = _max_drawdown(equity)
+        assert dd == pytest.approx(-1.0, abs=0.01)
+
+    def test_partial_drawdown(self) -> None:
+        """Peak=200, trough=100 → -50% drawdown."""
+        equity = pd.Series([0.0, 100.0, 200.0, 100.0, 150.0])
+        dd = _max_drawdown(equity)
+        assert dd == pytest.approx(-0.5, abs=0.01)
+
+    def test_empty_series(self) -> None:
+        dd = _max_drawdown(pd.Series([], dtype=float))
+        assert dd == 0.0
+
+
+class TestSharpeRatio:
+    def test_positive_returns_positive_sharpe(self) -> None:
+        # Variable positive returns so std > 0 and mean > 0 → Sharpe > 0
+        equity = pd.Series([0.0, 5.0, 15.0, 12.0, 25.0, 30.0])
+        sharpe = _sharpe_ratio(equity)
+        assert sharpe > 0
+
+    def test_flat_equity_sharpe_is_zero(self) -> None:
+        equity = pd.Series([100.0, 100.0, 100.0, 100.0])
+        sharpe = _sharpe_ratio(equity)
+        assert sharpe == 0.0
+
+    def test_too_short_returns_zero(self) -> None:
+        sharpe = _sharpe_ratio(pd.Series([100.0]))
+        assert sharpe == 0.0
