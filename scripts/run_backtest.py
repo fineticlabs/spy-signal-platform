@@ -36,7 +36,7 @@ from src.backtest.data_loader import (
     resample,
     slice_window,
 )
-from src.backtest.engine import run_backtest
+from src.backtest.engine import _compute_first5min_rvol, run_backtest
 from src.backtest.metrics import compute_metrics, print_summary, save_equity_curve
 from src.models import TimeFrame
 from src.storage.database import BarDatabase
@@ -116,6 +116,10 @@ def _run_symbol(
     if df_1min.empty:
         print(f"\n[{sym}] No 1-min bars found. Run scripts/backfill_data.py first.")
         return None
+
+    # Pre-compute first-5-min RVOL on full history so OOS slices inherit values
+    rvol_arr = _compute_first5min_rvol(df_1min.index, df_1min["volume"].values)
+    df_1min["RVOL"] = rvol_arr
 
     df = resample(df_1min, tf) if tf != TimeFrame.ONE_MIN else df_1min
 

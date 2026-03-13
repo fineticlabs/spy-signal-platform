@@ -132,6 +132,12 @@ class LevelSnapshot(BaseModel):
     premarket_high: Decimal | None = Field(default=None, description="Premarket high")
     premarket_low: Decimal | None = Field(default=None, description="Premarket low")
 
+    # First-5-min relative volume
+    rvol: Decimal | None = Field(
+        default=None,
+        description="First-5-min RVOL (today's opening volume / 20-day avg)",
+    )
+
 
 class Signal(BaseModel):
     """Trading signal produced by a strategy when entry conditions are met."""

@@ -35,6 +35,11 @@ Design notes
   today_open = first 1-min bar open at 9:30 ET; prev_day_close = last bar close
   of the preceding trading day.  Both values are known before any ORB signal
   can fire (ORB signals require ≥5 completed bars), so no lookahead bias.
+- First-5-min relative volume (RVOL): sum volume of first 5 bars (9:30-9:34 ET),
+  divide by 20-day rolling average of same.  Informational only in backtest
+  (no blocking).  Live strategy uses RVOL for confidence adjustment:
+  RVOL < 0.5 → demote (-2 confidence, LOW_RVOL tag);
+  RVOL >= 1.5 → boost (+1 confidence, HIGH_RVOL tag).
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -87,6 +92,9 @@ _REALIZED_VOL_MAX = 0.18  # 18% annualized ~ VIX 20; blocks high-vol regimes
 # Daily ADX trending filter
 _DAILY_ADX_PERIOD = 14
 _DAILY_ADX_MIN = 25.0  # daily ADX > 25 confirms trending market
+
+# First-5-min relative volume (RVOL) — informational only (no blocking)
+_RVOL_WINDOW = 20  # trailing days for rolling average of first-5-min volume
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -335,6 +343,80 @@ def _compute_daily_adx(
     return adx_out
 
 
+# ── First-5-min relative volume (RVOL) ───────────────────────────────────────
+
+
+def _compute_first5min_rvol(
+    index: pd.DatetimeIndex,
+    volume: Any,
+    orb_bars: int = _ORB_BARS,
+    window: int = _RVOL_WINDOW,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Rolling RVOL of the first 5-min session volume, broadcast to 1-min bars.
+
+    For each trading day D:
+        first5_vol = sum of volume for the first ``orb_bars`` bars (9:30-9:34 ET)
+        avg_first5  = mean of first5_vol over the preceding ``window`` trading days
+        RVOL        = first5_vol / avg_first5
+
+    The RVOL value is constant for all bars of that trading day.  Days without
+    enough history (fewer than ``window`` prior days) get NaN (default-allow).
+
+    No lookahead: the first-5-min volume is fully observed by 9:35 ET, before
+    any ORB signal can fire.
+
+    Args:
+        index:    UTC DatetimeIndex aligned with *volume*.
+        volume:   Numpy-like array of 1-min bar volumes.
+        orb_bars: Number of opening bars to sum (default 5).
+        window:   Rolling average lookback in trading days (default 20).
+
+    Returns:
+        Float64 numpy array of length ``len(index)`` with RVOL per bar.
+        NaN where insufficient history or data.
+    """
+    vol_arr = np.asarray(volume, dtype=float)
+    et_index = _to_et_index(index)
+    n = len(index)
+
+    # Group bar positions by ET calendar date (ordered)
+    dates: list[Any] = []
+    date_to_positions: dict[Any, list[int]] = {}
+    for i, ts in enumerate(et_index):
+        d = ts.date()
+        if d not in date_to_positions:
+            dates.append(d)
+            date_to_positions[d] = []
+        date_to_positions[d].append(i)
+
+    # Compute first-5-min volume for each trading day
+    daily_first5_vol: list[float] = []
+    for d in dates:
+        positions = date_to_positions[d]
+        if len(positions) >= orb_bars:
+            first5 = float(np.sum(vol_arr[positions[:orb_bars]]))
+        else:
+            first5 = float("nan")
+        daily_first5_vol.append(first5)
+
+    # Rolling mean of prior ``window`` days, shifted by 1 (no lookahead)
+    first5_series = pd.Series(daily_first5_vol, dtype=float)
+    rolling_avg = first5_series.rolling(window).mean().shift(1)
+
+    # RVOL = today's first-5-min vol / trailing average
+    rvol_daily = first5_series / rolling_avg
+
+    # Broadcast to 1-min bars
+    rvol_out = np.full(n, np.nan)
+    for idx_d, d in enumerate(dates):
+        v = rvol_daily.iloc[idx_d]
+        if not np.isnan(float(v)):
+            for pos in date_to_positions[d]:
+                rvol_out[pos] = float(v)
+
+    return rvol_out
+
+
 # ── Backtesting.py Strategy ───────────────────────────────────────────────────
 
 
@@ -418,6 +500,14 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         # Daily ADX(14) — shifted 1 day, > 25 required to confirm trending regime
         daily_adx_arr = _compute_daily_adx(index, high, low, close)
         self.daily_adx = self.I(lambda: daily_adx_arr, name="DailyADX")
+
+        # First-5-min RVOL — pre-computed on full dataset (passed as column) or
+        # computed locally (only useful when full history is available)
+        if hasattr(self.data, "RVOL"):
+            rvol_arr = np.asarray(self.data.RVOL, dtype=float)
+        else:
+            rvol_arr = _compute_first5min_rvol(index, volume)
+        self.rvol = self.I(lambda: rvol_arr, name="RVOL")
 
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None

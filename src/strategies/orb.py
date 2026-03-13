@@ -34,6 +34,8 @@ _ATR_MULTIPLIER = Decimal("1.5")
 _RISK_MULTIPLIER = Decimal("2.0")
 _VIX_MAX = Decimal("25")
 _ADX_MIN = Decimal("20")
+_RVOL_LOW = Decimal("0.5")  # RVOL < 0.5 → demote (-2 confidence, LOW_RVOL tag)
+_RVOL_HIGH = Decimal("1.5")  # RVOL >= 1.5 → boost (+1 confidence, HIGH_RVOL tag)
 
 
 class ORBStrategy(Strategy):
@@ -157,6 +159,16 @@ class ORBStrategy(Strategy):
         dir_str = str(direction)
         confidence = 3
         tags: list[str] = []
+
+        # RVOL confidence adjustment (informational, no blocking)
+        rvol = levels.rvol
+        if rvol is not None:
+            if rvol < _RVOL_LOW:
+                confidence -= 2
+                tags.append("LOW_RVOL")
+            elif rvol >= _RVOL_HIGH:
+                confidence += 1
+                tags.append("HIGH_RVOL")
 
         # Engulfing bar: boost confidence if breakout candle engulfs prior
         if len(self._recent_bars) >= 2:

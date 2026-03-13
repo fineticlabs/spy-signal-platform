@@ -81,6 +81,8 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
             lines.append(f"VWAP: {_price(lvl.vwap)}")
         if lvl.prev_day_high is not None and lvl.prev_day_low is not None:
             lines.append(f"PDH/PDL: {_price(lvl.prev_day_high)} / {_price(lvl.prev_day_low)}")
+        if lvl.rvol is not None:
+            lines.append(f"RVOL: {_price(lvl.rvol)}x")
 
     lines += ["", f"_{_md2(signal.reason)}_"]
 
