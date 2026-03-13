@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from src.filters.economic_calendar import is_high_impact_day
 from src.models import Bar, Direction, Signal
 from src.strategies.base import Strategy
 from src.strategies.candlestick_filters import (
@@ -96,6 +97,12 @@ class ORBStrategy(Strategy):
             return None
         if _LUNCH_START <= bar_time < _LUNCH_END:
             logger.debug("orb_filter_lunch_chop", bar_time=str(bar_time))
+            return None
+
+        # --- Economic calendar filter: skip FOMC/NFP/CPI/PPI days ---
+        bar_date = bar.timestamp.astimezone(_ET).date()
+        if is_high_impact_day(bar_date):
+            logger.debug("orb_filter_econ_event", date=str(bar_date))
             return None
 
         # --- ORB must be complete ---

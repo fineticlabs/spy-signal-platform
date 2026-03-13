@@ -40,6 +40,9 @@ Design notes
   (no blocking).  Live strategy uses RVOL for confidence adjustment:
   RVOL < 0.5 → demote (-2 confidence, LOW_RVOL tag);
   RVOL >= 1.5 → boost (+1 confidence, HIGH_RVOL tag).
+- Economic calendar filter: blocks all ORB trades on days with FOMC, NFP,
+  CPI, or PPI releases.  The opening range on these days is unreliable due
+  to pre-release positioning and post-release volatility spikes.
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -58,6 +61,8 @@ import pandas as pd
 import structlog
 import talib
 from backtesting import Backtest, Strategy
+
+from src.filters.economic_calendar import compute_econ_blocked_array
 
 logger = structlog.get_logger(__name__)
 
@@ -509,6 +514,13 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             rvol_arr = _compute_first5min_rvol(index, volume)
         self.rvol = self.I(lambda: rvol_arr, name="RVOL")
 
+        # Economic calendar filter: block ORB on FOMC/NFP/CPI/PPI days
+        econ_blocked_arr = compute_econ_blocked_array(index)
+        self.econ_blocked = self.I(
+            lambda: econ_blocked_arr.astype(float),
+            name="EconBlocked",
+        )
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -539,6 +551,10 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
 
         # Skip Mondays — consistently worst WR and expectancy across all regimes
         if ts.tz_convert(_ET_TZ).dayofweek == 0:
+            return
+
+        # Skip high-impact economic event days (FOMC, NFP, CPI, PPI)
+        if self.econ_blocked[-1] > 0.5:
             return
 
         # Enforce max trades per day
