@@ -98,7 +98,13 @@ def fetch_historical_bars(
 
     page_bars: list[Bar] = []
 
+    skipped = 0
     for raw in raw_bars:
+        # Skip bad bars with zero or negative prices (common in Alpaca historical data)
+        if any(getattr(raw, f) <= 0 for f in ("open", "high", "low", "close")):
+            skipped += 1
+            continue
+
         bar = Bar(
             symbol=symbol,
             timeframe=timeframe,
@@ -113,6 +119,9 @@ def fetch_historical_bars(
             vwap=Decimal(str(raw.vwap)) if raw.vwap is not None else Decimal(str(raw.close)),
         )
         page_bars.append(bar)
+
+    if skipped:
+        logger.warning("skipped_bad_bars", symbol=symbol, skipped=skipped)
 
     if page_bars:
         try:
