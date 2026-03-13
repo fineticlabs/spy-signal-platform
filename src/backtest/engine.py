@@ -10,6 +10,12 @@ Design notes
 - Timezone: uses ZoneInfo("America/New_York") to handle EDT/EST correctly.
   A fixed -5h offset was wrong during EDT season (Mar-Nov) and caused the
   lunch chop filter and entry cutoff to fire 1 hour late.
+- Trading windows: 9:35-11:00 ET (first hour) and 14:30-15:30 ET (power hour).
+  All other times are blocked — no lunch chop parameter needed.
+- 15-min EMA(20) trend alignment: LONG only if close > EMA, SHORT only if close < EMA.
+  EMA is computed by resampling 1-min to 15-min, shifted 1 bar, forward-filled back.
+- Dynamic targets: ORB range vs trailing 20-day p25/p75.
+  range > p75 → 2.5R target; range < p25 → 1.5R target; else → 2R (default).
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -40,12 +46,18 @@ _ATR_MULTIPLIER = 1.5
 _RISK_MULTIPLIER = 2.0
 _VOL_WINDOW = 20
 _VOL_MULTIPLIER = 1.5  # restored: 2.0x was too strict, filtered too many setups
-_LUNCH_START = time(11, 30)
-_LUNCH_END = time(13, 0)  # shortened from 13:30 → give back 30 min of afternoon
-_CUTOFF = time(15, 30)
+
+# Trading windows (ET wall-clock times)
+_WINDOW1_START = time(9, 35)  # first hour open
+_WINDOW1_END = time(11, 0)
+_WINDOW2_START = time(14, 30)  # power hour
+_WINDOW2_END = time(15, 30)
 _FORCE_FLAT = time(15, 55)
+
 _MAX_TRADES_PER_DAY = 5
 _MIN_ORB_PCT = 0.0015  # lowered from 0.3% → 0.15% of price (less restrictive)
+_EMA15M_PERIOD = 20  # EMA period on 15-min bars for trend alignment
+_ORB_RANGE_WINDOW = 20  # trailing days for ORB range percentiles
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -83,17 +95,15 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
 
     Parameters (can be optimised via ``Backtest.optimize``):
         atr_mult:           ATR multiplier for stop distance (default 1.5).
-        risk_mult:          Risk-to-reward for target (default 2.0).
+        risk_mult:          Risk-to-reward for target when no percentile data (default 2.0).
         vol_mult:           Volume multiplier threshold (default 1.5).
-        skip_lunch:         Whether to skip the 11:30-13:30 ET window (default 1).
         max_trades_per_day: Max entries per calendar day ET (default 5).
-        min_orb_pct:        Min ORB range as fraction of price (default 0.003).
+        min_orb_pct:        Min ORB range as fraction of price (default 0.0015).
     """
 
     atr_mult: float = _ATR_MULTIPLIER
     risk_mult: float = _RISK_MULTIPLIER
     vol_mult: float = _VOL_MULTIPLIER
-    skip_lunch: int = 1  # 0 or 1 (bool params must be int for .optimize)
     max_trades_per_day: int = _MAX_TRADES_PER_DAY
     min_orb_pct: float = _MIN_ORB_PCT
 
@@ -133,6 +143,21 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         )
         self.orb_range_pct = self.I(lambda: orb_range_arr, name="ORB_Range_Pct")
 
+        # 15-min EMA(20) trend alignment filter (no-lookahead: shifted 1 bar)
+        close_arr = np.asarray(close, dtype=float)
+        ema15m_arr = _compute_15m_ema(index, close_arr, period=_EMA15M_PERIOD)
+        self.ema15m = self.I(lambda: ema15m_arr, name="EMA15m")
+
+        # ORB range percentile arrays for dynamic target selection
+        orb_p25_arr, orb_p75_arr = _compute_orb_percentile_arrays(
+            index=index,
+            orb_high_arr=orb_high_arr,
+            orb_low_arr=orb_low_arr,
+            window=_ORB_RANGE_WINDOW,
+        )
+        self.orb_p25 = self.I(lambda: orb_p25_arr, name="ORB_P25")
+        self.orb_p75 = self.I(lambda: orb_p75_arr, name="ORB_P75")
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -147,10 +172,10 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             self.position.close()
             return
 
-        # No new entries outside trading window
-        if t >= _CUTOFF:
-            return
-        if self.skip_lunch and _LUNCH_START <= t < _LUNCH_END:
+        # Only trade during first-hour window or power-hour window
+        in_window1 = _WINDOW1_START <= t < _WINDOW1_END
+        in_window2 = _WINDOW2_START <= t < _WINDOW2_END
+        if not (in_window1 or in_window2):
             return
 
         # Already in a position - nothing to enter
@@ -181,6 +206,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
 
         atr = self.atr[-1]
         avg_vol = self.avg_vol[-1]
+        ema15m_val = self.ema15m[-1]
 
         if np.isnan(atr) or np.isnan(avg_vol) or avg_vol <= 0:
             return
@@ -192,25 +218,48 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         if volume < avg_vol * self.vol_mult:
             return
 
+        # 15-min EMA trend alignment: allow both directions if EMA not yet available
+        if not np.isnan(ema15m_val):
+            bullish_trend = close > ema15m_val
+            bearish_trend = close < ema15m_val
+        else:
+            bullish_trend = True
+            bearish_trend = True
+
+        # Dynamic risk multiplier based on ORB range vs trailing 20-day percentiles
+        p25 = self.orb_p25[-1]
+        p75 = self.orb_p75[-1]
+        orb_range_abs = orb_high - orb_low
+
+        if not np.isnan(p25) and not np.isnan(p75):
+            if orb_range_abs > p75:
+                dynamic_risk_mult = 2.5
+            elif orb_range_abs < p25:
+                dynamic_risk_mult = 1.5
+            else:
+                dynamic_risk_mult = self.risk_mult
+        else:
+            dynamic_risk_mult = self.risk_mult
+
         # LONG breakout
-        if close > orb_high:
+        if close > orb_high and bullish_trend:
             entry = close
             stop = entry - self.atr_mult * atr
             risk = entry - stop
             if risk <= 0:
                 return
-            target = entry + self.risk_mult * risk
+            target = entry + dynamic_risk_mult * risk
             self.buy(sl=stop, tp=target)
             self._daily_trade_count += 1
 
         # SHORT breakdown
-        elif close < orb_low:
+        elif close < orb_low and bearish_trend:
             entry = close
             stop = entry + self.atr_mult * atr
             risk = stop - entry
             if risk <= 0:
                 return
-            target = entry - self.risk_mult * risk
+            target = entry - dynamic_risk_mult * risk
             self.sell(sl=stop, tp=target)
             self._daily_trade_count += 1
 
@@ -277,6 +326,139 @@ def _compute_orb_arrays(
     return orb_high_out, orb_low_out
 
 
+# ── 15-min EMA trend alignment ────────────────────────────────────────────────
+
+
+def _compute_15m_ema(
+    index: pd.DatetimeIndex,
+    close: np.ndarray[Any, np.dtype[np.float64]],
+    period: int = 20,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Compute a no-lookahead 15-min EMA mapped back to 1-min resolution.
+
+    Steps:
+        1. Build a 1-min close Series with ET-aware index.
+        2. Resample to 15-min (last close of each 15-min bar).
+        3. Compute EMA(period) via TA-Lib.
+        4. Shift by 1 bar to prevent lookahead (each 15-min bar uses EMA
+           from the *previous* 15-min bar).
+        5. Reindex back to 1-min with forward-fill (EMA value is constant
+           within each 15-min bucket until the next bar closes).
+
+    Args:
+        index:  UTC DatetimeIndex aligned with *close*.
+        close:  Float64 numpy array of 1-min close prices.
+        period: EMA lookback period (default 20).
+
+    Returns:
+        Float64 numpy array of length ``len(index)`` with NaN where EMA is
+        not yet available.
+    """
+    et_index = _to_et_index(index)
+    close_series = pd.Series(close, index=et_index)
+
+    # Resample to 15-min (last close of each bucket), drop empty buckets
+    close_15m = close_series.resample("15min").last().dropna()
+    if len(close_15m) < period:
+        return np.full(len(index), np.nan)
+
+    # EMA on 15-min bars
+    ema_raw = talib.EMA(close_15m.to_numpy(dtype=float), timeperiod=period)
+    ema_15m = pd.Series(ema_raw, index=close_15m.index)
+
+    # Shift by 1: bar N uses EMA computed through bar N-1
+    ema_shifted = ema_15m.shift(1)
+
+    # Forward-fill back to 1-min resolution
+    ema_1m = ema_shifted.reindex(et_index, method="ffill")
+
+    result: np.ndarray[Any, np.dtype[np.float64]] = ema_1m.to_numpy(dtype=float)
+    return result
+
+
+# ── ORB range percentile arrays ───────────────────────────────────────────────
+
+
+def _compute_orb_percentile_arrays(
+    index: pd.DatetimeIndex,
+    orb_high_arr: np.ndarray[Any, np.dtype[np.float64]],
+    orb_low_arr: np.ndarray[Any, np.dtype[np.float64]],
+    window: int = 20,
+) -> tuple[np.ndarray[Any, np.dtype[np.float64]], np.ndarray[Any, np.dtype[np.float64]]]:
+    """Compute trailing 20-day p25/p75 of ORB range for each bar.
+
+    For each trading day D, we look at the ORB range (high - low) of the
+    *preceding* ``window`` trading days (not including D itself) and compute
+    the 25th and 75th percentiles.  These percentiles are then broadcast to
+    every 1-min bar of day D.
+
+    Bars belonging to the first ``window`` trading days receive NaN (not
+    enough history yet).
+
+    Args:
+        index:       UTC DatetimeIndex aligned with orb arrays.
+        orb_high_arr: Pre-computed ORB highs (NaN for ORB bars themselves).
+        orb_low_arr:  Pre-computed ORB lows.
+        window:      Number of trailing trading days for percentile calculation.
+
+    Returns:
+        (p25_array, p75_array) - both float64 numpy arrays, NaN until
+        sufficient history is available.
+    """
+    et_index = _to_et_index(index)
+    n = len(index)
+
+    p25_out = np.full(n, np.nan)
+    p75_out = np.full(n, np.nan)
+
+    # Build ordered list of trading dates and their bar positions
+    dates: list[Any] = []
+    date_to_positions: dict[Any, list[int]] = {}
+    for i, ts in enumerate(et_index):
+        d = ts.date()
+        if d not in date_to_positions:
+            dates.append(d)
+            date_to_positions[d] = []
+        date_to_positions[d].append(i)
+
+    # Extract ORB range for each trading day (first non-NaN bar on that day)
+    daily_range: dict[Any, float] = {}
+    for d in dates:
+        positions = date_to_positions[d]
+        range_val = np.nan
+        for pos in positions:
+            if not np.isnan(orb_high_arr[pos]) and not np.isnan(orb_low_arr[pos]):
+                range_val = float(orb_high_arr[pos] - orb_low_arr[pos])
+                break
+        daily_range[d] = range_val
+
+    # Compute trailing p25/p75 for each day using only prior days' ranges
+    for idx_d, d in enumerate(dates):
+        # Use only the preceding `window` days (no lookahead)
+        start_idx = max(0, idx_d - window)
+        end_idx = idx_d  # exclusive: do not include current day
+
+        if end_idx - start_idx < window:
+            continue  # not enough history yet
+
+        prior_ranges = [
+            daily_range[dates[i]]
+            for i in range(start_idx, end_idx)
+            if not np.isnan(daily_range[dates[i]])
+        ]
+        if len(prior_ranges) < window:
+            continue
+
+        p25 = float(np.percentile(prior_ranges, 25))
+        p75 = float(np.percentile(prior_ranges, 75))
+
+        for pos in date_to_positions[d]:
+            p25_out[pos] = p25
+            p75_out[pos] = p75
+
+    return p25_out, p75_out
+
+
 # ── Backtest runner ───────────────────────────────────────────────────────────
 
 
@@ -287,7 +469,6 @@ def run_backtest(
     atr_mult: float = _ATR_MULTIPLIER,
     risk_mult: float = _RISK_MULTIPLIER,
     vol_mult: float = _VOL_MULTIPLIER,
-    skip_lunch: bool = True,
     max_trades_per_day: int = _MAX_TRADES_PER_DAY,
     min_orb_pct: float = _MIN_ORB_PCT,
 ) -> Any:
@@ -298,11 +479,11 @@ def run_backtest(
         cash:              Starting equity in USD.
         slippage:          Slippage per share per side in USD (default $0.02).
         atr_mult:          ATR stop multiplier.
-        risk_mult:         Reward-to-risk multiplier for target.
+        risk_mult:         Reward-to-risk multiplier for target (fallback when no
+                           percentile data available).
         vol_mult:          Volume threshold multiplier (default 1.5).
-        skip_lunch:        Whether to skip the 11:30-13:30 ET chop zone.
         max_trades_per_day: Max entries per ET calendar day (default 5).
-        min_orb_pct:       Min ORB range as fraction of price (default 0.003).
+        min_orb_pct:       Min ORB range as fraction of price (default 0.0015).
 
     Returns:
         ``backtesting.Stats`` object (dict-like).  Access ``._trades`` for the
@@ -331,7 +512,6 @@ def run_backtest(
         atr_mult=atr_mult,
         risk_mult=risk_mult,
         vol_mult=vol_mult,
-        skip_lunch=int(skip_lunch),
         max_trades_per_day=max_trades_per_day,
         min_orb_pct=min_orb_pct,
     )

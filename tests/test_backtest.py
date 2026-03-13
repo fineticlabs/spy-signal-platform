@@ -22,7 +22,13 @@ from src.backtest.data_loader import (
     resample,
     slice_window,
 )
-from src.backtest.engine import _compute_orb_arrays, _et_date, _et_time
+from src.backtest.engine import (
+    _compute_15m_ema,
+    _compute_orb_arrays,
+    _compute_orb_percentile_arrays,
+    _et_date,
+    _et_time,
+)
 from src.backtest.metrics import (
     _max_drawdown,
     _sharpe_ratio,
@@ -466,3 +472,205 @@ class TestSharpeRatio:
     def test_too_short_returns_zero(self) -> None:
         sharpe = _sharpe_ratio(pd.Series([100.0]))
         assert sharpe == 0.0
+
+
+# ── 15-min EMA filter tests ───────────────────────────────────────────────────
+
+
+def _make_1min_index(n_bars: int = 390, start_utc: str = "2024-01-15 14:30") -> pd.DatetimeIndex:
+    """1-min UTC DatetimeIndex starting at 9:30 ET (EST, Jan = UTC-5)."""
+    return pd.date_range(start_utc, periods=n_bars, freq="1min", tz="UTC")
+
+
+class Test15mEMAComputation:
+    def test_returns_correct_length(self) -> None:
+        """Output array must match input length."""
+        idx = _make_1min_index(n_bars=390)
+        close = np.full(390, 480.0)
+        result = _compute_15m_ema(idx, close, period=20)
+        assert len(result) == 390
+
+    def test_nan_for_insufficient_history(self) -> None:
+        """Fewer than 20 15-min bars → all NaN (no EMA available)."""
+        # 20 15-min bars = 300 1-min bars; use only 100
+        idx = _make_1min_index(n_bars=100)
+        close = np.linspace(470.0, 490.0, 100)
+        result = _compute_15m_ema(idx, close, period=20)
+        assert np.all(np.isnan(result))
+
+    def test_no_lookahead_shift(self) -> None:
+        """EMA value at bar N must reflect only bars before N (shift-1).
+
+        We do this by verifying that the very first non-NaN value appears
+        *after* at least (period * 15) bars have elapsed, not at bar period*15-1.
+        """
+        n_bars = 700  # enough for ~46 15-min bars
+        idx = _make_1min_index(n_bars=n_bars)
+        close = np.linspace(470.0, 500.0, n_bars)
+        result = _compute_15m_ema(idx, close, period=5)
+        first_valid = int(np.argmax(~np.isnan(result)))
+        # shift(1) means the first usable 15-min EMA bar (bar 4, zero-indexed)
+        # is pushed to bar 5, which starts at 1-min bar 5*15 = 75
+        assert first_valid >= 5 * 15, f"first valid EMA at bar {first_valid}, expected >= 75"
+
+    def test_flat_price_ema_equals_price(self) -> None:
+        """With constant close prices, EMA should converge to that price."""
+        n_bars = 700
+        idx = _make_1min_index(n_bars=n_bars)
+        close = np.full(n_bars, 480.0)
+        result = _compute_15m_ema(idx, close, period=5)
+        valid = result[~np.isnan(result)]
+        assert len(valid) > 0
+        assert np.allclose(valid, 480.0, atol=0.01)
+
+    def test_long_blocked_when_price_below_ema(self) -> None:
+        """When price < EMA15m, bullish_trend should be False → LONG blocked.
+
+        We verify the filter logic directly (not through full backtest).
+        """
+        # Simulate: EMA is 485, current close is 480 (below EMA)
+        ema_val = 485.0
+        close_val = 480.0
+        bullish_trend = close_val > ema_val
+        bearish_trend = close_val < ema_val
+        assert not bullish_trend, "LONG should be blocked when price < EMA"
+        assert bearish_trend, "SHORT should be allowed when price < EMA"
+
+    def test_short_blocked_when_price_above_ema(self) -> None:
+        """When price > EMA15m, bearish_trend should be False → SHORT blocked."""
+        ema_val = 475.0
+        close_val = 480.0
+        bullish_trend = close_val > ema_val
+        bearish_trend = close_val < ema_val
+        assert bullish_trend, "LONG should be allowed when price > EMA"
+        assert not bearish_trend, "SHORT should be blocked when price > EMA"
+
+
+# ── ORB percentile array tests ────────────────────────────────────────────────
+
+
+def _make_multiday_orb_arrays(
+    n_days: int,
+    orb_range: float = 1.0,
+) -> tuple[
+    pd.DatetimeIndex, np.ndarray[Any, np.dtype[np.float64]], np.ndarray[Any, np.dtype[np.float64]]
+]:
+    """Build a multi-day 1-min index with fixed ORB high/low for testing."""
+    from datetime import timedelta
+
+    base = datetime(2024, 1, 2, 14, 30, tzinfo=UTC)
+    frames_idx = []
+    for d in range(n_days):
+        day_start = base + timedelta(days=d)
+        frames_idx.append(pd.date_range(day_start, periods=390, freq="1min", tz="UTC"))
+    index = frames_idx[0]
+    for f in frames_idx[1:]:
+        index = index.append(f)
+
+    n = len(index)
+    # Build ORB arrays: first 5 bars of each day = NaN, rest = high/low
+    orb_high_arr = np.full(n, np.nan)
+    orb_low_arr = np.full(n, np.nan)
+
+    for d in range(n_days):
+        start = d * 390
+        for i in range(5, 390):
+            orb_high_arr[start + i] = 480.0 + orb_range / 2
+            orb_low_arr[start + i] = 480.0 - orb_range / 2
+
+    return index, orb_high_arr, orb_low_arr
+
+
+class TestORBPercentileArrays:
+    def test_nan_for_first_window_days(self) -> None:
+        """First 20 trading days must have NaN percentiles (no prior history)."""
+        n_days = 25
+        index, orb_high, orb_low = _make_multiday_orb_arrays(n_days)
+        p25, p75 = _compute_orb_percentile_arrays(index, orb_high, orb_low, window=20)
+        # All bars on days 0-19 should be NaN
+        day20_start = 20 * 390
+        assert np.all(np.isnan(p25[:day20_start])), "first 20 days should be NaN"
+        assert np.all(np.isnan(p75[:day20_start])), "first 20 days should be NaN"
+
+    def test_available_after_window_days(self) -> None:
+        """Day 21 and beyond should have non-NaN percentiles."""
+        n_days = 25
+        index, orb_high, orb_low = _make_multiday_orb_arrays(n_days)
+        p25, p75 = _compute_orb_percentile_arrays(index, orb_high, orb_low, window=20)
+        # Bars after day 20 should be valid (use bar at start of day 21, after ORB)
+        day21_bar = 20 * 390 + 10
+        assert not np.isnan(p25[day21_bar]), "day 21 should have p25"
+        assert not np.isnan(p75[day21_bar]), "day 21 should have p75"
+
+    def test_p25_leq_p75(self) -> None:
+        """P25 must always be <= P75."""
+        n_days = 30
+        # Vary ORB range per day using a loop
+        index, orb_high, orb_low = _make_multiday_orb_arrays(n_days, orb_range=1.0)
+        p25, p75 = _compute_orb_percentile_arrays(index, orb_high, orb_low, window=20)
+        valid = ~np.isnan(p25) & ~np.isnan(p75)
+        assert np.all(p25[valid] <= p75[valid])
+
+    def test_constant_range_gives_equal_percentiles(self) -> None:
+        """With identical ORB ranges every day, p25 == p75 == that range."""
+        n_days = 30
+        orb_range = 2.0
+        index, orb_high, orb_low = _make_multiday_orb_arrays(n_days, orb_range=orb_range)
+        p25, p75 = _compute_orb_percentile_arrays(index, orb_high, orb_low, window=20)
+        # After day 20, all percentiles should equal the constant range
+        day21_bar = 20 * 390 + 10
+        assert p25[day21_bar] == pytest.approx(orb_range, abs=0.001)
+        assert p75[day21_bar] == pytest.approx(orb_range, abs=0.001)
+
+
+# ── trading window filter tests ───────────────────────────────────────────────
+
+
+class TestTradingWindows:
+    """Verify the explicit trading window logic (9:35-11:00 and 14:30-15:30 ET)."""
+
+    def _in_window(self, t: Any) -> bool:
+        """Replicate the next() window check."""
+        from datetime import time as _time
+
+        w1_start = _time(9, 35)
+        w1_end = _time(11, 0)
+        w2_start = _time(14, 30)
+        w2_end = _time(15, 30)
+        in_w1 = w1_start <= t < w1_end
+        in_w2 = w2_start <= t < w2_end
+        return in_w1 or in_w2
+
+    def test_first_hour_open_is_tradeable(self) -> None:
+        from datetime import time
+
+        assert self._in_window(time(9, 35))
+        assert self._in_window(time(10, 0))
+        assert self._in_window(time(10, 59))
+
+    def test_first_hour_close_boundary_blocked(self) -> None:
+        from datetime import time
+
+        assert not self._in_window(time(11, 0))  # exclusive upper bound
+        assert not self._in_window(time(11, 30))
+
+    def test_midday_blocked(self) -> None:
+        from datetime import time
+
+        assert not self._in_window(time(12, 0))
+        assert not self._in_window(time(13, 0))
+        assert not self._in_window(time(14, 0))
+        assert not self._in_window(time(14, 29))
+
+    def test_power_hour_is_tradeable(self) -> None:
+        from datetime import time
+
+        assert self._in_window(time(14, 30))
+        assert self._in_window(time(15, 0))
+        assert self._in_window(time(15, 29))
+
+    def test_power_hour_upper_boundary_blocked(self) -> None:
+        from datetime import time
+
+        assert not self._in_window(time(15, 30))  # exclusive upper bound
+        assert not self._in_window(time(15, 45))

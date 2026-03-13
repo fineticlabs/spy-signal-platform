@@ -90,6 +90,7 @@ ignore = [
     "ANN401",  # allow Any in some cases
     "S101",    # allow assert in tests
     "E501",    # line length handled by formatter
+    "TCH002",
     "TCH003",
 ]
 

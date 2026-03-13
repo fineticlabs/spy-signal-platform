@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import structlog
@@ -174,13 +175,21 @@ def _sharpe_ratio(equity: pd.Series, periods_per_year: int = 252) -> float:
     return float(mean / std * math.sqrt(periods_per_year))
 
 
+_ET_TZ = ZoneInfo("America/New_York")
+
+
 def _time_of_day_breakdown(trades: pd.DataFrame) -> dict[str, dict[str, float]]:
-    """Aggregate P&L and win-rate by ET hour of entry."""
+    """Aggregate P&L and win-rate by ET hour of entry (EDT/EST-aware)."""
     if "EntryTime" not in trades.columns or "PnL" not in trades.columns:
         return {}
 
     try:
-        et_hours = (trades["EntryTime"] - pd.Timedelta(hours=5)).dt.hour
+        entry_times: pd.Series = trades["EntryTime"]
+        # Backtesting.py stores EntryTime as UTC; localize if tz-naive
+        if entry_times.dt.tz is None:
+            entry_times = entry_times.dt.tz_localize("UTC")
+        et_hours = entry_times.dt.tz_convert(_ET_TZ).dt.hour
+
         result: dict[str, dict[str, float]] = {}
         for hour in sorted(et_hours.unique()):
             mask = et_hours == hour
