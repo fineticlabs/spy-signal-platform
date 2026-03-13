@@ -112,6 +112,9 @@ def compute_metrics(
     # Time-of-day breakdown (by ET hour of entry)
     tod_breakdown = _time_of_day_breakdown(trades)
 
+    # Day-of-week breakdown (Mon=0 … Fri=4, in ET)
+    dow_breakdown = _day_of_week_breakdown(trades)
+
     return {
         "total_trades": total,
         "n_wins": n_wins,
@@ -130,6 +133,7 @@ def compute_metrics(
         "avg_trades_per_day": round(avg_per_day, 2),
         "realized_rr": round(realized_rr, 4),
         "tod_breakdown": tod_breakdown,
+        "dow_breakdown": dow_breakdown,
     }
 
 
@@ -207,6 +211,42 @@ def _time_of_day_breakdown(trades: pd.DataFrame) -> dict[str, dict[str, float]]:
         return {}
 
 
+_DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+
+
+def _day_of_week_breakdown(trades: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Aggregate P&L and win-rate by ET day of week of entry.
+
+    Returns keys in Mon-Fri order regardless of which days have trades.
+    """
+    if "EntryTime" not in trades.columns or "PnL" not in trades.columns:
+        return {}
+
+    try:
+        entry_times: pd.Series = trades["EntryTime"]
+        if entry_times.dt.tz is None:
+            entry_times = entry_times.dt.tz_localize("UTC")
+        et_dow = entry_times.dt.tz_convert(_ET_TZ).dt.dayofweek  # 0=Mon … 4=Fri
+
+        result: dict[str, dict[str, float]] = {}
+        for dow in range(5):  # Mon=0 … Fri=4
+            mask = et_dow == dow
+            if not mask.any():
+                continue
+            subset = trades.loc[mask, "PnL"]
+            wins = int((subset > 0).sum())
+            total = len(subset)
+            result[_DOW_NAMES[dow]] = {
+                "trades": total,
+                "win_rate": round(wins / total, 4) if total > 0 else 0.0,
+                "total_pnl": round(float(subset.sum()), 2),
+            }
+        return result
+    except Exception as exc:
+        logger.warning("dow_breakdown_failed", error=str(exc))
+        return {}
+
+
 # ── display ───────────────────────────────────────────────────────────────────
 
 
@@ -240,6 +280,18 @@ def print_summary(metrics: dict[str, Any], label: str = "Backtest Results") -> N
         for period, vals in tod.items():
             print(
                 f"  {period}: {vals['trades']} trades, "
+                f"WR={vals['win_rate']*100:.0f}%, "
+                f"PnL=${vals['total_pnl']:.2f}"
+            )
+
+    dow: dict[str, Any] = metrics.get("dow_breakdown", {})
+    if dow:
+        print(sep)
+        print("  Day-of-week breakdown")
+        print(sep)
+        for day, vals in dow.items():
+            print(
+                f"  {day:<12}: {vals['trades']:>3} trades, "
                 f"WR={vals['win_rate']*100:.0f}%, "
                 f"PnL=${vals['total_pnl']:.2f}"
             )

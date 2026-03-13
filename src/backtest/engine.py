@@ -295,6 +295,10 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             self._last_et_date = today
             self._daily_trade_count = 0
 
+        # Skip Mondays — lowest win rate and expectancy in day-of-week analysis
+        if ts.tz_convert(_ET_TZ).dayofweek == 0:
+            return
+
         # Enforce max trades per day
         if self._daily_trade_count >= self.max_trades_per_day:
             return
