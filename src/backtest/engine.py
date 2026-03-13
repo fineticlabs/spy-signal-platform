@@ -5,8 +5,13 @@ Design notes
 - ``ORBStrategy`` is a ``backtesting.Strategy`` subclass.
 - All opening-range logic uses *completed* bars only (shift-1 to avoid
   lookahead bias: the ORB high/low is locked after the 5th bar closes).
-- Volume filter uses a 20-bar rolling mean shifted by 1 (same protection).
+- Volume filter uses a 20-bar rolling mean shifted by 1 (same protection); threshold 1.5x.
 - ATR is computed via TA-Lib on the full price series (also shifted).
+- Timezone: uses ZoneInfo("America/New_York") to handle EDT/EST correctly.
+  A fixed -5h offset was wrong during EDT season (Mar-Nov) and caused the
+  lunch chop filter and entry cutoff to fire 1 hour late.
+- Max 5 trades per calendar day (ET) enforced in next().
+- ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
 - Commission: $0 (Alpaca is commission-free).
 - Forced flat at 15:55 ET.
@@ -14,8 +19,9 @@ Design notes
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -27,32 +33,46 @@ logger = structlog.get_logger(__name__)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-_ET_OFFSET = pd.Timedelta(hours=-5)  # ET = UTC-5 (EST); adjust for EDT if needed
+_ET_TZ = ZoneInfo("America/New_York")
 _ORB_BARS = 5  # number of 1-min bars in the opening range (9:30-9:34)
 _ATR_PERIOD = 14
 _ATR_MULTIPLIER = 1.5
 _RISK_MULTIPLIER = 2.0
 _VOL_WINDOW = 20
-_VOL_MULTIPLIER = 1.5
+_VOL_MULTIPLIER = 1.5  # restored: 2.0x was too strict, filtered too many setups
 _LUNCH_START = time(11, 30)
-_LUNCH_END = time(13, 30)
-_CUTOFF = time(15, 45)
+_LUNCH_END = time(13, 0)  # shortened from 13:30 → give back 30 min of afternoon
+_CUTOFF = time(15, 30)
 _FORCE_FLAT = time(15, 55)
+_MAX_TRADES_PER_DAY = 5
+_MIN_ORB_PCT = 0.0015  # lowered from 0.3% → 0.15% of price (less restrictive)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def _et_time(ts: pd.Timestamp) -> time:
-    """Convert a UTC pandas Timestamp to an ET wall-clock time (EST = UTC-5)."""
-    et: pd.Timestamp = ts + _ET_OFFSET
+    """Convert a UTC pandas Timestamp to an ET wall-clock time (EDT/EST-aware)."""
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    et: pd.Timestamp = ts.tz_convert(_ET_TZ)
     result: time = et.to_pydatetime().time()
     return result
 
 
-def _is_market_hour(ts: pd.Timestamp) -> bool:
-    t = _et_time(ts)
-    return time(9, 30) <= t < _FORCE_FLAT
+def _et_date(ts: pd.Timestamp) -> date:
+    """Convert a UTC pandas Timestamp to an ET calendar date (EDT/EST-aware)."""
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    result: date = ts.tz_convert(_ET_TZ).to_pydatetime().date()
+    return result
+
+
+def _to_et_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Convert a DatetimeIndex (UTC) to America/New_York, handling tz-naive input."""
+    if index.tzinfo is None:
+        index = index.tz_localize("UTC")
+    return index.tz_convert(_ET_TZ)
 
 
 # ── Backtesting.py Strategy ───────────────────────────────────────────────────
@@ -62,16 +82,20 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
     """Opening Range Breakout implemented as a Backtesting.py Strategy.
 
     Parameters (can be optimised via ``Backtest.optimize``):
-        atr_mult:     ATR multiplier for stop distance (default 1.5).
-        risk_mult:    Risk-to-reward for target (default 2.0).
-        vol_mult:     Volume multiplier threshold (default 1.5).
-        skip_lunch:   Whether to skip the 11:30-13:30 ET window (default 1).
+        atr_mult:           ATR multiplier for stop distance (default 1.5).
+        risk_mult:          Risk-to-reward for target (default 2.0).
+        vol_mult:           Volume multiplier threshold (default 1.5).
+        skip_lunch:         Whether to skip the 11:30-13:30 ET window (default 1).
+        max_trades_per_day: Max entries per calendar day ET (default 5).
+        min_orb_pct:        Min ORB range as fraction of price (default 0.003).
     """
 
     atr_mult: float = _ATR_MULTIPLIER
     risk_mult: float = _RISK_MULTIPLIER
     vol_mult: float = _VOL_MULTIPLIER
-    skip_lunch: int = 1  # 0 or 1 (bool parameters must be int for .optimize)
+    skip_lunch: int = 1  # 0 or 1 (bool params must be int for .optimize)
+    max_trades_per_day: int = _MAX_TRADES_PER_DAY
+    min_orb_pct: float = _MIN_ORB_PCT
 
     def init(self) -> None:
         """Pre-compute all series indicators once on the full price history."""
@@ -80,7 +104,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         close = self.data.Close
         volume = self.data.Volume
 
-        # ATR(14) — batch via TA-Lib; shift by 1 to avoid lookahead
+        # ATR(14) - batch via TA-Lib; shift by 1 to avoid lookahead
         atr_raw = talib.ATR(high, low, close, timeperiod=_ATR_PERIOD)
         self.atr = self.I(lambda: np.roll(atr_raw, 1), name="ATR")
 
@@ -89,9 +113,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         avg_vol_raw = vol_series.rolling(_VOL_WINDOW).mean().to_numpy()
         self.avg_vol = self.I(lambda: np.roll(avg_vol_raw, 1), name="AvgVol")
 
-        # ORB high/low: for each bar, look back to find the max-high / min-low
-        # of the first 5 bars *of that calendar day* that occur before 9:35 ET.
-        # Computed once via pandas for efficiency; stored as arrays.
+        # ORB high/low + range filter arrays
         index: pd.DatetimeIndex = self.data.index
         orb_high_arr, orb_low_arr = _compute_orb_arrays(
             index=index,
@@ -101,6 +123,19 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         )
         self.orb_high_series = self.I(lambda: orb_high_arr, name="ORB_High")
         self.orb_low_series = self.I(lambda: orb_low_arr, name="ORB_Low")
+
+        # ORB range as % of midpoint - used to filter narrow/choppy ranges
+        midpoint = (orb_high_arr + orb_low_arr) / 2.0
+        orb_range_arr = np.where(
+            (midpoint > 0) & ~np.isnan(orb_high_arr) & ~np.isnan(orb_low_arr),
+            (orb_high_arr - orb_low_arr) / midpoint,
+            np.nan,
+        )
+        self.orb_range_pct = self.I(lambda: orb_range_arr, name="ORB_Range_Pct")
+
+        # Daily trade counter state (reset per ET calendar day in next())
+        self._last_et_date: date | None = None
+        self._daily_trade_count: int = 0
 
     def next(self) -> None:
         """Called on every completed bar."""
@@ -118,15 +153,30 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         if self.skip_lunch and _LUNCH_START <= t < _LUNCH_END:
             return
 
-        # Already in a position — nothing to enter
+        # Already in a position - nothing to enter
         if self.position:
+            return
+
+        # Reset daily trade counter on new ET calendar day
+        today = _et_date(ts)
+        if today != self._last_et_date:
+            self._last_et_date = today
+            self._daily_trade_count = 0
+
+        # Enforce max trades per day
+        if self._daily_trade_count >= self.max_trades_per_day:
             return
 
         orb_high = self.orb_high_series[-1]
         orb_low = self.orb_low_series[-1]
+        orb_range = self.orb_range_pct[-1]
 
         # ORB not yet established (NaN)
         if np.isnan(orb_high) or np.isnan(orb_low):
+            return
+
+        # Skip narrow ORB days - too choppy to trade breakouts
+        if np.isnan(orb_range) or orb_range < self.min_orb_pct:
             return
 
         atr = self.atr[-1]
@@ -151,6 +201,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
                 return
             target = entry + self.risk_mult * risk
             self.buy(sl=stop, tp=target)
+            self._daily_trade_count += 1
 
         # SHORT breakdown
         elif close < orb_low:
@@ -161,6 +212,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
                 return
             target = entry - self.risk_mult * risk
             self.sell(sl=stop, tp=target)
+            self._daily_trade_count += 1
 
 
 # ── ORB array pre-computation ─────────────────────────────────────────────────
@@ -190,7 +242,7 @@ def _compute_orb_arrays(
         orb_bars: Number of 1-min bars that define the opening range.
 
     Returns:
-        (orb_high_array, orb_low_array) — both float64 numpy arrays with NaN
+        (orb_high_array, orb_low_array) - both float64 numpy arrays with NaN
         where the ORB is not yet established.
     """
     high_arr = np.asarray(high, dtype=float)
@@ -200,10 +252,10 @@ def _compute_orb_arrays(
     orb_high_out = np.full(n, np.nan)
     orb_low_out = np.full(n, np.nan)
 
-    # Convert index to ET for day-grouping
-    et_index = index + _ET_OFFSET
+    # Convert index to ET for day-grouping (handles EDT/EST correctly)
+    et_index = _to_et_index(index)
 
-    # Group bar positions by calendar date
+    # Group bar positions by calendar date in ET
     date_groups: dict[Any, list[int]] = {}
     for i, ts in enumerate(et_index):
         d = ts.date()
@@ -236,17 +288,21 @@ def run_backtest(
     risk_mult: float = _RISK_MULTIPLIER,
     vol_mult: float = _VOL_MULTIPLIER,
     skip_lunch: bool = True,
+    max_trades_per_day: int = _MAX_TRADES_PER_DAY,
+    min_orb_pct: float = _MIN_ORB_PCT,
 ) -> Any:
     """Run the ORB backtest on *df* and return the Backtesting stats dict.
 
     Args:
-        df:          OHLCV DataFrame with DatetimeIndex (UTC).
-        cash:        Starting equity in USD.
-        slippage:    Slippage per share per side in USD (default $0.02).
-        atr_mult:    ATR stop multiplier.
-        risk_mult:   Reward-to-risk multiplier for target.
-        vol_mult:    Volume threshold multiplier.
-        skip_lunch:  Whether to skip the 11:30-13:30 ET chop zone.
+        df:                OHLCV DataFrame with DatetimeIndex (UTC).
+        cash:              Starting equity in USD.
+        slippage:          Slippage per share per side in USD (default $0.02).
+        atr_mult:          ATR stop multiplier.
+        risk_mult:         Reward-to-risk multiplier for target.
+        vol_mult:          Volume threshold multiplier (default 1.5).
+        skip_lunch:        Whether to skip the 11:30-13:30 ET chop zone.
+        max_trades_per_day: Max entries per ET calendar day (default 5).
+        min_orb_pct:       Min ORB range as fraction of price (default 0.003).
 
     Returns:
         ``backtesting.Stats`` object (dict-like).  Access ``._trades`` for the
@@ -276,6 +332,8 @@ def run_backtest(
         risk_mult=risk_mult,
         vol_mult=vol_mult,
         skip_lunch=int(skip_lunch),
+        max_trades_per_day=max_trades_per_day,
+        min_orb_pct=min_orb_pct,
     )
 
     logger.info(

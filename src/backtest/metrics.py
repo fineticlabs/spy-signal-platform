@@ -15,7 +15,6 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import pandas as pd
 import structlog
 
@@ -32,18 +31,22 @@ def compute_metrics(
     trades: pd.DataFrame,
     equity_curve: pd.Series | None = None,
     trading_days: int | None = None,
+    initial_capital: float = 50_000.0,
 ) -> dict[str, Any]:
     """Compute performance metrics from a Backtesting.py trades DataFrame.
 
     Args:
-        trades:       ``stats._trades`` DataFrame from ``Backtest.run()``.
-                      Must contain columns ``PnL``, ``ReturnPct``,
-                      ``EntryTime``, ``ExitTime``.
-        equity_curve: Optional equity-curve Series for max drawdown /
-                      Sharpe.  If omitted, drawdown is approximated from
-                      cumulative P&L and Sharpe is not computed.
-        trading_days: Number of calendar days in the test period.  Used to
-                      compute avg trades per day.
+        trades:          ``stats._trades`` DataFrame from ``Backtest.run()``.
+                         Must contain columns ``PnL``, ``ReturnPct``,
+                         ``EntryTime``, ``ExitTime``.
+        equity_curve:    Optional equity-curve Series for max drawdown /
+                         Sharpe.  If omitted, drawdown is approximated from
+                         cumulative P&L.
+        trading_days:    Number of calendar days in the test period.  Used to
+                         compute avg trades per day.
+        initial_capital: Starting capital used to normalise drawdown
+                         percentages (default $50,000).  Prevents -1000%+
+                         readings when cumulative PnL peaks are tiny.
 
     Returns:
         Dict of metric names to values.
@@ -86,11 +89,13 @@ def compute_metrics(
     # Realized average R:R (average winner / average loser)
     realized_rr = avg_winner / avg_loser if avg_loser > 0 else float("inf")
 
-    # Max drawdown
-    max_dd = _max_drawdown(equity_curve if equity_curve is not None else _cumulative_equity(pnl))
+    # Max drawdown - normalised against initial_capital so percentages are
+    # sensible even when the cumulative P&L curve peaks at a small value.
+    _eq = equity_curve if equity_curve is not None else _cumulative_equity(pnl)
+    max_dd = _max_drawdown(_eq, initial_capital=initial_capital)
 
-    # Sharpe ratio (annualized daily returns)
-    sharpe = _sharpe_ratio(equity_curve if equity_curve is not None else _cumulative_equity(pnl))
+    # Sharpe ratio (annualized)
+    sharpe = _sharpe_ratio(_eq)
 
     # Avg trades per day
     avg_per_day: float = 0.0
@@ -118,6 +123,7 @@ def compute_metrics(
         "avg_loser": round(avg_loser, 2),
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
+        "net_profit": round(gross_profit - gross_loss, 2),
         "max_drawdown_pct": round(max_dd, 4),
         "sharpe_ratio": round(sharpe, 4),
         "avg_trades_per_day": round(avg_per_day, 2),
@@ -131,17 +137,24 @@ def _cumulative_equity(pnl: pd.Series) -> pd.Series:
     return pnl.cumsum().reset_index(drop=True)
 
 
-def _max_drawdown(equity: pd.Series) -> float:
-    """Peak-to-trough max drawdown as a fraction of the running peak.
+def _max_drawdown(equity: pd.Series, initial_capital: float = 50_000.0) -> float:
+    """Peak-to-trough max drawdown as a fraction of the starting capital.
+
+    The equity series may start at 0 (cumulative P&L) or at initial_capital.
+    We shift it so it always starts at *initial_capital* before computing
+    drawdown percentages - this prevents -1000%+ readings when the cumulative
+    P&L peaks at a tiny value (e.g. first trade earns $50, then loses $500 =>
+    naive calc gives -1100% instead of -1%  relative to $50k capital).
 
     Returns a negative number (e.g. -0.15 means 15% drawdown).
     """
     if equity.empty:
         return 0.0
-    running_max = equity.cummax()
-    # Avoid div-by-zero when peak is 0
-    peak = running_max.replace(0, np.nan)
-    dd = (equity - running_max) / peak.abs()
+    # Shift so the curve starts at initial_capital regardless of its origin
+    shifted = equity - float(equity.iloc[0]) + initial_capital
+    running_max = shifted.cummax()
+    # running_max is always >= initial_capital > 0, so no div-by-zero
+    dd = (shifted - running_max) / running_max
     val = float(dd.min())
     return val if not math.isnan(val) else 0.0
 
@@ -204,6 +217,7 @@ def print_summary(metrics: dict[str, Any], label: str = "Backtest Results") -> N
     _row("Avg loser", f"${float(metrics.get('avg_loser', 0)):.2f}")
     _row("Gross profit", f"${float(metrics.get('gross_profit', 0)):.2f}")
     _row("Gross loss", f"${float(metrics.get('gross_loss', 0)):.2f}")
+    _row("Net profit", f"${float(metrics.get('net_profit', 0)):.2f}")
     _row("Max drawdown", f"{float(metrics.get('max_drawdown_pct', 0)) * 100:.2f}%")
     _row("Sharpe ratio", f"{float(metrics.get('sharpe_ratio', 0)):.3f}")
     _row("Realized R:R", f"{float(metrics.get('realized_rr', 0)):.2f}")

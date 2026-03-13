@@ -22,7 +22,7 @@ from src.backtest.data_loader import (
     resample,
     slice_window,
 )
-from src.backtest.engine import _compute_orb_arrays, _et_time
+from src.backtest.engine import _compute_orb_arrays, _et_date, _et_time
 from src.backtest.metrics import (
     _max_drawdown,
     _sharpe_ratio,
@@ -283,20 +283,63 @@ class TestORBArraysNoLookahead:
                 104.0
             ), f"day2 bar {i}: expected 104.0 got {orb_high[i]}"
 
+    def test_orb_range_pct_is_nonzero(self) -> None:
+        """Verify the ORB range (high-low)/midpoint is non-zero for non-flat bars."""
+        idx, high, low = self._build_index_and_prices(n_bars=20)
+        orb_high, orb_low = _compute_orb_arrays(idx, high, low, orb_bars=5)
+        # For bars after ORB: orb_high=5.0, orb_low=0.5, midpoint=2.75
+        # range_pct = (5.0-0.5)/2.75 ≈ 1.636
+        midpoint = (orb_high[10] + orb_low[10]) / 2.0
+        range_pct = (orb_high[10] - orb_low[10]) / midpoint
+        assert range_pct == pytest.approx((5.0 - 0.5) / 2.75, abs=0.001)
+
 
 class TestETTime:
-    def test_930_et_converts_correctly(self) -> None:
-        """14:30 UTC = 9:30 ET (EST, UTC-5)."""
+    def test_930_et_converts_correctly_est(self) -> None:
+        """14:30 UTC = 9:30 EST (January = UTC-5)."""
         from datetime import time
 
         ts = pd.Timestamp("2024-01-15 14:30:00", tz="UTC")
         assert _et_time(ts) == time(9, 30)
 
-    def test_1600_et_converts_correctly(self) -> None:
+    def test_1600_et_converts_correctly_est(self) -> None:
         from datetime import time
 
         ts = pd.Timestamp("2024-01-15 21:00:00", tz="UTC")
         assert _et_time(ts) == time(16, 0)
+
+    def test_930_et_converts_correctly_edt(self) -> None:
+        """13:30 UTC = 9:30 EDT (July = UTC-4). Old fixed -5h offset was wrong here."""
+        from datetime import time
+
+        ts = pd.Timestamp("2024-07-15 13:30:00", tz="UTC")
+        assert _et_time(ts) == time(9, 30)
+
+    def test_lunch_1130_edt(self) -> None:
+        """15:30 UTC = 11:30 EDT. The old offset saw this as 10:30, skipping lunch filter."""
+        from datetime import time
+
+        ts = pd.Timestamp("2024-07-15 15:30:00", tz="UTC")
+        assert _et_time(ts) == time(11, 30)
+
+    def test_tz_naive_input_treated_as_utc(self) -> None:
+        """A tz-naive Timestamp is assumed to be UTC and converted correctly."""
+        from datetime import time
+
+        ts_naive = pd.Timestamp("2024-01-15 14:30:00")  # no tz
+        assert _et_time(ts_naive) == time(9, 30)
+
+
+class TestETDate:
+    def test_date_est(self) -> None:
+        """14:30 UTC Jan 15 = Jan 15 ET (EST, UTC-5)."""
+        ts = pd.Timestamp("2024-01-15 14:30:00", tz="UTC")
+        assert _et_date(ts) == date(2024, 1, 15)
+
+    def test_date_edt_midnight_rollover(self) -> None:
+        """03:00 UTC = 23:00 ET previous day during EDT (UTC-4)."""
+        ts = pd.Timestamp("2024-07-16 03:00:00", tz="UTC")  # 23:00 EDT July 15
+        assert _et_date(ts) == date(2024, 7, 15)
 
 
 # ── metrics tests ─────────────────────────────────────────────────────────────
@@ -367,22 +410,41 @@ class TestComputeMetrics:
 
 class TestMaxDrawdown:
     def test_no_drawdown(self) -> None:
-        """Monotonically increasing equity → drawdown is 0 or very small."""
+        """Monotonically increasing PnL curve → drawdown is exactly 0."""
         equity = pd.Series([0.0, 100.0, 200.0, 300.0])
         dd = _max_drawdown(equity)
-        assert dd <= 0.0
+        assert dd == 0.0
 
-    def test_full_loss_from_peak(self) -> None:
-        """Equity goes to 0 from 100 → -100% drawdown."""
+    def test_full_loss_normalised_by_initial_capital(self) -> None:
+        """$100 loss from a $100 peak on $100 starting capital → -100% drawdown.
+
+        Pass initial_capital=100 to match the curve's starting point so
+        normalisation works the same as the old fixed-divisor calculation.
+        """
         equity = pd.Series([100.0, 50.0, 0.0])
-        dd = _max_drawdown(equity)
+        dd = _max_drawdown(equity, initial_capital=100.0)
         assert dd == pytest.approx(-1.0, abs=0.01)
 
-    def test_partial_drawdown(self) -> None:
-        """Peak=200, trough=100 → -50% drawdown."""
-        equity = pd.Series([0.0, 100.0, 200.0, 100.0, 150.0])
-        dd = _max_drawdown(equity)
-        assert dd == pytest.approx(-0.5, abs=0.01)
+    def test_partial_drawdown_normalised(self) -> None:
+        """$10k loss from $60k peak on $50k capital → -(10k/60k) ≈ -16.7%."""
+        # PnL curve peaks at +$10k then falls to $0 (back to start)
+        equity = pd.Series([0.0, 10_000.0, 0.0])
+        dd = _max_drawdown(equity, initial_capital=50_000.0)
+        # shifted: [50000, 60000, 50000]; peak = 60000
+        # dd = (50000 - 60000) / 60000 = -10000/60000 ≈ -0.1667
+        assert dd == pytest.approx(-10_000 / 60_000, abs=0.001)
+
+    def test_no_blowup_on_small_early_peak(self) -> None:
+        """Regression: tiny PnL peak then large loss must not produce -1000%+.
+
+        Old bug: peak=$50, loss=$500 → (50-550)/50 = -10.0 (-1000%).
+        New code: normalised by $50k capital → ≈ -1% drawdown.
+        """
+        equity = pd.Series([0.0, 50.0, -450.0])  # cumulative PnL
+        dd = _max_drawdown(equity, initial_capital=50_000.0)
+        # shifted: [50000, 50050, 49550]; peak = 50050
+        # dd = (49550 - 50050) / 50050 ≈ -0.01
+        assert -0.02 < dd < 0.0, f"Expected small drawdown near -1%, got {dd:.1%}"
 
     def test_empty_series(self) -> None:
         dd = _max_drawdown(pd.Series([], dtype=float))
