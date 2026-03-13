@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime  # noqa: TCH003
-from decimal import Decimal  # noqa: TCH003
+from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 
 import structlog
@@ -159,5 +159,27 @@ class Signal(BaseModel):
         default=None, description="Full level state at signal time"
     )
     timestamp: datetime = Field(..., description="Timestamp of the bar that triggered the signal")
+
+    model_config = {"frozen": True}
+
+
+class TradeResult(BaseModel):
+    """Outcome of a completed trade, used for risk state tracking."""
+
+    signal: Signal = Field(..., description="The signal that initiated the trade")
+    pnl: Decimal = Field(..., description="Realized P&L in dollars (negative = loss)")
+    timestamp: datetime = Field(..., description="Time the trade was closed (UTC)")
+
+    model_config = {"frozen": True}
+
+
+class RiskDecision(BaseModel):
+    """Result of a pre-trade risk check from :class:`~src.risk.manager.RiskManager`."""
+
+    approved: bool = Field(..., description="True if the trade is approved to proceed")
+    reason: str = Field(..., description="Human-readable explanation of the decision")
+    position_size: int = Field(
+        default=0, ge=0, description="Approved position size in shares (0 if rejected)"
+    )
 
     model_config = {"frozen": True}
