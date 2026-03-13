@@ -16,6 +16,15 @@ Design notes
   EMA is computed by resampling 1-min to 15-min, shifted 1 bar, forward-filled back.
 - Dynamic targets: ORB range vs trailing 20-day p25/p75.
   range > p75 → 2.5R target; range < p25 → 1.5R target; else → 2R (default).
+- Gap classification filter (gap-and-go bias):
+    gap = (today_open - prev_day_close) / prev_day_close * 100
+    gap >  +0.3%: LONG only (gap-up momentum favours breakout longs)
+    gap < -0.3%: SHORT only (gap-down momentum favours breakdown shorts)
+    |gap| ≤ 0.3%: both directions allowed (neutral open)
+    NaN (first day): both allowed
+  today_open = first 1-min bar open at 9:30 ET; prev_day_close = last bar close
+  of the preceding trading day.  Both values are known before any ORB signal
+  can fire (ORB signals require ≥5 completed bars), so no lookahead bias.
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -58,6 +67,7 @@ _MAX_TRADES_PER_DAY = 5
 _MIN_ORB_PCT = 0.0015  # lowered from 0.3% → 0.15% of price (less restrictive)
 _EMA15M_PERIOD = 20  # EMA period on 15-min bars for trend alignment
 _ORB_RANGE_WINDOW = 20  # trailing days for ORB range percentiles
+_GAP_THRESHOLD_PCT = 0.3  # ±0.3% gap separates directional bias from neutral
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -85,6 +95,98 @@ def _to_et_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     if index.tzinfo is None:
         index = index.tz_localize("UTC")
     return index.tz_convert(_ET_TZ)
+
+
+# ── Gap classification ────────────────────────────────────────────────────────
+
+
+def _compute_gap_array(
+    index: pd.DatetimeIndex,
+    open_prices: Any,
+    close_prices: Any,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Pre-compute the daily opening gap percentage for every 1-min bar.
+
+    gap = (today_first_open - prev_day_last_close) / prev_day_last_close * 100
+
+    The gap is the same value for all bars within a trading day.  The first
+    trading day in the dataset returns NaN (no prior day available).
+
+    Zero lookahead: ``today_first_open`` is the open of the 9:30 ET bar;
+    ORB signals require at least 5 completed bars (≥9:35 ET), so the gap
+    is always known before any signal can fire.
+
+    Args:
+        index:        UTC DatetimeIndex aligned with the price arrays.
+        open_prices:  Numpy-like array of bar open prices.
+        close_prices: Numpy-like array of bar close prices.
+
+    Returns:
+        Float64 numpy array of length ``len(index)``.  NaN for the first
+        trading day; percentage gap (e.g. 0.5 = +0.5%) for all other days.
+    """
+    open_arr = np.asarray(open_prices, dtype=float)
+    close_arr = np.asarray(close_prices, dtype=float)
+    n = len(index)
+    gap_out = np.full(n, np.nan)
+
+    et_index = _to_et_index(index)
+
+    # Build ordered list of trading dates → bar positions
+    dates: list[Any] = []
+    date_to_positions: dict[Any, list[int]] = {}
+    for i, ts in enumerate(et_index):
+        d = ts.date()
+        if d not in date_to_positions:
+            dates.append(d)
+            date_to_positions[d] = []
+        date_to_positions[d].append(i)
+
+    for idx_d in range(1, len(dates)):  # skip first day (no prior day)
+        d = dates[idx_d]
+        d_prev = dates[idx_d - 1]
+
+        positions_today = date_to_positions[d]
+        positions_prev = date_to_positions[d_prev]
+
+        if not positions_today or not positions_prev:
+            continue
+
+        today_open = open_arr[positions_today[0]]  # first bar open at 9:30
+        prev_close = close_arr[positions_prev[-1]]  # last bar close yesterday
+
+        if prev_close <= 0 or np.isnan(prev_close) or np.isnan(today_open):
+            continue
+
+        gap_pct = (today_open - prev_close) / prev_close * 100.0
+        for pos in positions_today:
+            gap_out[pos] = gap_pct
+
+    return gap_out
+
+
+def _classify_gap(gap_pct: float, threshold: float) -> tuple[bool, bool]:
+    """Classify a gap and return (allows_long, allows_short) directional flags.
+
+    Args:
+        gap_pct:   Opening gap in percent (e.g. 0.5 = +0.5%, -0.4 = -0.4%).
+                   Pass ``float('nan')`` for the first trading day.
+        threshold: Absolute gap percentage that separates directional bias
+                   from neutral (default ``_GAP_THRESHOLD_PCT`` = 0.3).
+
+    Returns:
+        ``(allows_long, allows_short)`` tuple:
+        - Gap up  (> +threshold): (True, False)  — LONG only
+        - Gap down (< -threshold): (False, True) — SHORT only
+        - Flat / NaN              : (True, True)  — both directions
+    """
+    if np.isnan(gap_pct):
+        return True, True
+    if gap_pct > threshold:
+        return True, False
+    if gap_pct < -threshold:
+        return False, True
+    return True, True
 
 
 # ── Backtesting.py Strategy ───────────────────────────────────────────────────
@@ -158,6 +260,11 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         self.orb_p25 = self.I(lambda: orb_p25_arr, name="ORB_P25")
         self.orb_p75 = self.I(lambda: orb_p75_arr, name="ORB_P75")
 
+        # Daily gap classification (no lookahead: gap known at 9:30, ORB fires >=9:35)
+        open_arr_for_gap = np.asarray(self.data.Open, dtype=float)
+        gap_arr = _compute_gap_array(index, open_arr_for_gap, close_arr)
+        self.gap_pct = self.I(lambda: gap_arr, name="GapPct")
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -226,6 +333,10 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             bullish_trend = True
             bearish_trend = True
 
+        # Gap classification filter
+        gap_val = float(self.gap_pct[-1])
+        gap_allows_long, gap_allows_short = _classify_gap(gap_val, _GAP_THRESHOLD_PCT)
+
         # Dynamic risk multiplier based on ORB range vs trailing 20-day percentiles
         p25 = self.orb_p25[-1]
         p75 = self.orb_p75[-1]
@@ -242,7 +353,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             dynamic_risk_mult = self.risk_mult
 
         # LONG breakout
-        if close > orb_high and bullish_trend:
+        if close > orb_high and bullish_trend and gap_allows_long:
             entry = close
             stop = entry - self.atr_mult * atr
             risk = entry - stop
@@ -253,7 +364,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             self._daily_trade_count += 1
 
         # SHORT breakdown
-        elif close < orb_low and bearish_trend:
+        elif close < orb_low and bearish_trend and gap_allows_short:
             entry = close
             stop = entry + self.atr_mult * atr
             risk = stop - entry

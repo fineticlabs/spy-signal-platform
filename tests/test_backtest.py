@@ -23,7 +23,9 @@ from src.backtest.data_loader import (
     slice_window,
 )
 from src.backtest.engine import (
+    _classify_gap,
     _compute_15m_ema,
+    _compute_gap_array,
     _compute_orb_arrays,
     _compute_orb_percentile_arrays,
     _et_date,
@@ -674,3 +676,134 @@ class TestTradingWindows:
 
         assert not self._in_window(time(15, 30))  # exclusive upper bound
         assert not self._in_window(time(15, 45))
+
+
+# ── TestClassifyGap ───────────────────────────────────────────────────────────
+
+
+class TestClassifyGap:
+    """Unit tests for _classify_gap() pure helper."""
+
+    def test_gap_up_allows_long_blocks_short(self) -> None:
+        allows_long, allows_short = _classify_gap(0.5, 0.3)
+        assert allows_long is True
+        assert allows_short is False
+
+    def test_gap_down_blocks_long_allows_short(self) -> None:
+        allows_long, allows_short = _classify_gap(-0.5, 0.3)
+        assert allows_long is False
+        assert allows_short is True
+
+    def test_flat_gap_allows_both(self) -> None:
+        allows_long, allows_short = _classify_gap(0.0, 0.3)
+        assert allows_long is True
+        assert allows_short is True
+
+    def test_gap_within_threshold_allows_both(self) -> None:
+        allows_long, allows_short = _classify_gap(0.2, 0.3)
+        assert allows_long is True
+        assert allows_short is True
+
+        allows_long2, allows_short2 = _classify_gap(-0.2, 0.3)
+        assert allows_long2 is True
+        assert allows_short2 is True
+
+    def test_nan_gap_allows_both(self) -> None:
+        allows_long, allows_short = _classify_gap(float("nan"), 0.3)
+        assert allows_long is True
+        assert allows_short is True
+
+    def test_exact_threshold_boundary_allows_both(self) -> None:
+        # exactly at threshold → not strictly greater, so neutral
+        allows_long, allows_short = _classify_gap(0.3, 0.3)
+        assert allows_long is True
+        assert allows_short is True
+
+        allows_long2, allows_short2 = _classify_gap(-0.3, 0.3)
+        assert allows_long2 is True
+        assert allows_short2 is True
+
+    def test_just_above_threshold_is_directional(self) -> None:
+        allows_long, allows_short = _classify_gap(0.31, 0.3)
+        assert allows_long is True
+        assert allows_short is False
+
+        allows_long2, allows_short2 = _classify_gap(-0.31, 0.3)
+        assert allows_long2 is False
+        assert allows_short2 is True
+
+
+# ── TestComputeGapArray ───────────────────────────────────────────────────────
+
+
+def _make_2day_index(
+    day1_start: datetime | None = None,
+    bars_per_day: int = 390,
+) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+    """Build a 2-day 1-min UTC index with known open/close prices.
+
+    Day 1: open=480.0, close=481.0
+    Day 2: open=483.0, close=482.0  → gap = (483 - 481) / 481 * 100 ≈ +0.416%
+    """
+    if day1_start is None:
+        day1_start = datetime(2024, 1, 16, 14, 30, tzinfo=UTC)  # 9:30 ET
+
+    idx_day1 = pd.date_range(start=day1_start, periods=bars_per_day, freq="1min", tz="UTC")
+    day2_start = day1_start + pd.Timedelta(days=1)
+    idx_day2 = pd.date_range(start=day2_start, periods=bars_per_day, freq="1min", tz="UTC")
+    index = idx_day1.append(idx_day2)
+
+    opens = np.full(len(index), 480.0)
+    opens[bars_per_day:] = 483.0  # day 2 opens at 483
+
+    closes = np.full(len(index), 481.0)  # day 1 closes at 481
+    closes[bars_per_day:] = 482.0  # day 2 closes at 482
+
+    return index, opens, closes
+
+
+class TestComputeGapArray:
+    """Tests for _compute_gap_array()."""
+
+    def test_output_length_matches_index(self) -> None:
+        index, opens, closes = _make_2day_index()
+        result = _compute_gap_array(index, opens, closes)
+        assert len(result) == len(index)
+
+    def test_first_day_is_nan(self) -> None:
+        index, opens, closes = _make_2day_index()
+        result = _compute_gap_array(index, opens, closes)
+        # All 390 bars of day 1 should be NaN
+        assert np.all(np.isnan(result[:390]))
+
+    def test_second_day_gap_value_correct(self) -> None:
+        index, opens, closes = _make_2day_index()
+        result = _compute_gap_array(index, opens, closes)
+        expected_gap = (483.0 - 481.0) / 481.0 * 100.0
+        day2_gaps = result[390:]
+        assert not np.any(np.isnan(day2_gaps))
+        np.testing.assert_allclose(day2_gaps, expected_gap, rtol=1e-9)
+
+    def test_same_value_all_bars_within_day(self) -> None:
+        index, opens, closes = _make_2day_index()
+        result = _compute_gap_array(index, opens, closes)
+        day2_gaps = result[390:]
+        # All bars on day 2 should have identical gap value
+        assert np.all(day2_gaps == day2_gaps[0])
+
+    def test_gap_down_is_negative(self) -> None:
+        index, opens, closes = _make_2day_index()
+        closes[:390] = 485.0  # day 1 closes at 485
+        opens[390:] = 483.0  # day 2 opens at 483 (gap down)
+        result = _compute_gap_array(index, opens, closes)
+        expected_gap = (483.0 - 485.0) / 485.0 * 100.0
+        np.testing.assert_allclose(result[390], expected_gap, rtol=1e-9)
+        assert result[390] < 0
+
+    def test_single_day_all_nan(self) -> None:
+        start = datetime(2024, 1, 15, 14, 30, tzinfo=UTC)
+        index = pd.date_range(start=start, periods=390, freq="1min", tz="UTC")
+        opens = np.full(390, 480.0)
+        closes = np.full(390, 481.0)
+        result = _compute_gap_array(index, opens, closes)
+        assert np.all(np.isnan(result))
