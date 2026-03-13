@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from src.filters.earnings_calendar import is_earnings_blackout
 from src.filters.economic_calendar import is_high_impact_day
 from src.models import Bar, Direction, Signal
 from src.strategies.base import Strategy
@@ -105,6 +106,9 @@ class ORBStrategy(Strategy):
             logger.debug("orb_filter_econ_event", date=str(bar_date))
             return None
 
+        # --- Earnings proximity: informational tag, no blocking ---
+        _is_earnings = is_earnings_blackout(bar.symbol, bar_date)
+
         # --- ORB must be complete ---
         if not levels.orb_complete:
             logger.debug("orb_filter_incomplete")
@@ -166,6 +170,10 @@ class ORBStrategy(Strategy):
         dir_str = str(direction)
         confidence = 3
         tags: list[str] = []
+
+        # Earnings proximity tag (informational, no blocking)
+        if _is_earnings:
+            tags.append("EARNINGS")
 
         # RVOL confidence adjustment (informational, no blocking)
         rvol = levels.rvol

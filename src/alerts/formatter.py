@@ -89,6 +89,26 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
     return "\n".join(lines)
 
 
+def format_earnings_blackout_alert(symbol: str, earnings_date: str) -> str:
+    """Format an earnings blackout notification as a Telegram MarkdownV2 message.
+
+    Sent when a ticker is blocked from ORB trading due to nearby earnings.
+
+    Args:
+        symbol:        Ticker symbol being blocked.
+        earnings_date: Human-readable date of the earnings announcement.
+
+    Returns:
+        MarkdownV2-formatted string.
+    """
+    return (
+        f"🚫 *EARNINGS BLACKOUT*\n\n"
+        f"{_md2(symbol)} blocked from ORB trading\\.\n"
+        f"Earnings: {_md2(earnings_date)}\n"
+        f"Resumes day after next\\."
+    )
+
+
 def format_risk_alert(message: str) -> str:
     """Format a risk-management warning as a Telegram MarkdownV2 message.
 

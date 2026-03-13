@@ -43,6 +43,9 @@ Design notes
 - Economic calendar filter: blocks all ORB trades on days with FOMC, NFP,
   CPI, or PPI releases.  The opening range on these days is unreliable due
   to pre-release positioning and post-release volatility spikes.
+- Earnings proximity filter: informational only (no blocking).  Tracks
+  earnings day + day after per ticker via yfinance dates cached locally
+  in data/earnings_cache.json.  Live strategy tags signals with [EARNINGS].
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -62,6 +65,7 @@ import structlog
 import talib
 from backtesting import Backtest, Strategy
 
+from src.filters.earnings_calendar import compute_earnings_blocked_array
 from src.filters.economic_calendar import compute_econ_blocked_array
 
 logger = structlog.get_logger(__name__)
@@ -434,6 +438,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         vol_mult:           Volume multiplier threshold (default 1.5).
         max_trades_per_day: Max entries per calendar day ET (default 5).
         min_orb_pct:        Min ORB range as fraction of price (default 0.0015).
+        symbol:             Ticker symbol for per-ticker filters (default "SPY").
     """
 
     atr_mult: float = _ATR_MULTIPLIER
@@ -441,6 +446,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
     vol_mult: float = _VOL_MULTIPLIER
     max_trades_per_day: int = _MAX_TRADES_PER_DAY
     min_orb_pct: float = _MIN_ORB_PCT
+    symbol: str = "SPY"
 
     def init(self) -> None:
         """Pre-compute all series indicators once on the full price history."""
@@ -521,6 +527,13 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             name="EconBlocked",
         )
 
+        # Earnings proximity filter: block ticker on earnings day + day after
+        earnings_blocked_arr = compute_earnings_blocked_array(index, self.symbol)
+        self.earnings_blocked = self.I(
+            lambda: earnings_blocked_arr.astype(float),
+            name="EarningsBlocked",
+        )
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -556,6 +569,9 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         # Skip high-impact economic event days (FOMC, NFP, CPI, PPI)
         if self.econ_blocked[-1] > 0.5:
             return
+
+        # Earnings proximity: informational only (no blocking in backtest)
+        # Live strategy tags signals with [EARNINGS] for manual discretion.
 
         # Enforce max trades per day
         if self._daily_trade_count >= self.max_trades_per_day:
@@ -869,6 +885,7 @@ def run_backtest(
     vol_mult: float = _VOL_MULTIPLIER,
     max_trades_per_day: int = _MAX_TRADES_PER_DAY,
     min_orb_pct: float = _MIN_ORB_PCT,
+    symbol: str = "SPY",
 ) -> Any:
     """Run the ORB backtest on *df* and return the Backtesting stats dict.
 
@@ -882,6 +899,7 @@ def run_backtest(
         vol_mult:          Volume threshold multiplier (default 1.5).
         max_trades_per_day: Max entries per ET calendar day (default 5).
         min_orb_pct:       Min ORB range as fraction of price (default 0.0015).
+        symbol:            Ticker symbol for per-ticker filters (default "SPY").
 
     Returns:
         ``backtesting.Stats`` object (dict-like).  Access ``._trades`` for the
@@ -912,6 +930,7 @@ def run_backtest(
         vol_mult=vol_mult,
         max_trades_per_day=max_trades_per_day,
         min_orb_pct=min_orb_pct,
+        symbol=symbol,
     )
 
     logger.info(

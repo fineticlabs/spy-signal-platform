@@ -150,7 +150,7 @@ def _run_symbol(
             continue
 
         try:
-            stats = run_backtest(oos_df, cash=cash)
+            stats = run_backtest(oos_df, cash=cash, symbol=sym)
             trades: pd.DataFrame = stats["_trades"]
 
             if len(trades) > 0:
