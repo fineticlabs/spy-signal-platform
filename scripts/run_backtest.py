@@ -36,7 +36,11 @@ from src.backtest.data_loader import (
     resample,
     slice_window,
 )
-from src.backtest.engine import _compute_first5min_rvol, run_backtest
+from src.backtest.engine import (
+    _compute_first5min_rvol,
+    compute_intraday_vwap,
+    run_backtest,
+)
 from src.backtest.metrics import compute_metrics, print_summary, save_equity_curve
 from src.models import TimeFrame
 from src.storage.database import BarDatabase
@@ -95,6 +99,7 @@ def _run_symbol(
     is_days: int,
     oos_days: int,
     cash: float,
+    spy_ref: pd.DataFrame | None = None,
 ) -> TickerResult | None:
     """Load bars, walk-forward split, and run backtest for a single symbol.
 
@@ -105,6 +110,9 @@ def _run_symbol(
         is_days:  In-sample window size in calendar days.
         oos_days: Out-of-sample window size in calendar days.
         cash:     Starting cash for the backtest engine.
+        spy_ref:  SPY 1-min reference DataFrame with ``SPY_VWAP`` and
+                  ``SPY_CLOSE`` columns, indexed by UTC timestamp.
+                  Used for market direction confirmation on non-SPY/QQQ tickers.
 
     Returns:
         A :class:`TickerResult` with aggregated trades, or ``None`` if the
@@ -120,6 +128,14 @@ def _run_symbol(
     # Pre-compute first-5-min RVOL on full history so OOS slices inherit values
     rvol_arr = _compute_first5min_rvol(df_1min.index, df_1min["volume"].values)
     df_1min["RVOL"] = rvol_arr
+
+    # Merge SPY VWAP + close for market direction confirmation
+    # SPY and QQQ are exempt — they don't need this filter
+    if spy_ref is not None and sym not in {"SPY", "QQQ"}:
+        df_1min = df_1min.join(spy_ref[["SPY_VWAP", "SPY_CLOSE"]], how="left")
+        # Forward-fill to handle any timestamp misalignment between tickers
+        df_1min["SPY_VWAP"] = df_1min["SPY_VWAP"].ffill()
+        df_1min["SPY_CLOSE"] = df_1min["SPY_CLOSE"].ffill()
 
     df = resample(df_1min, tf) if tf != TimeFrame.ONE_MIN else df_1min
 
@@ -306,6 +322,28 @@ def main() -> None:
     db = BarDatabase()
     db.connect()
 
+    # ── Pre-load SPY reference data for market direction confirmation ─────────
+    # Non-SPY/QQQ tickers need SPY's intraday VWAP and close price to confirm
+    # that their breakout direction aligns with the broad market.
+    spy_ref: pd.DataFrame | None = None
+    logger.info("loading_spy_reference")
+    spy_1min = load_bars(db, symbol="SPY", timeframe=TimeFrame.ONE_MIN)
+    if not spy_1min.empty:
+        spy_vwap = compute_intraday_vwap(
+            spy_1min.index,
+            spy_1min["high"].values,
+            spy_1min["low"].values,
+            spy_1min["close"].values,
+            spy_1min["volume"].values,
+        )
+        spy_ref = pd.DataFrame(
+            {"SPY_VWAP": spy_vwap, "SPY_CLOSE": spy_1min["close"].values},
+            index=spy_1min.index,
+        )
+        print(f"SPY reference loaded: {len(spy_ref)} bars for market direction filter")
+    else:
+        print("WARNING: No SPY data — market direction filter disabled")
+
     ticker_results: list[TickerResult] = []
 
     for sym in symbols:
@@ -316,6 +354,7 @@ def main() -> None:
             is_days=args.is_days,
             oos_days=args.oos_days,
             cash=args.cash,
+            spy_ref=spy_ref,
         )
         if result is not None:
             ticker_results.append(result)

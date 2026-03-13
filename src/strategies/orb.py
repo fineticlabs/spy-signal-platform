@@ -38,6 +38,7 @@ _VIX_MAX = Decimal("25")
 _ADX_MIN = Decimal("20")
 _RVOL_LOW = Decimal("0.5")  # RVOL < 0.5 → demote (-2 confidence, LOW_RVOL tag)
 _RVOL_HIGH = Decimal("1.5")  # RVOL >= 1.5 → boost (+1 confidence, HIGH_RVOL tag)
+_MARKET_DIRECTION_EXEMPT = {"SPY", "QQQ"}  # these ARE the market direction
 
 
 class ORBStrategy(Strategy):
@@ -79,11 +80,22 @@ class ORBStrategy(Strategy):
         indicators: IndicatorSnapshot,
         levels: LevelSnapshot,
         regime: RegimeDetector,
+        spy_vwap: Decimal | None = None,
+        spy_price: Decimal | None = None,
     ) -> Signal | None:
         """Return a Signal if ORB entry conditions are met, else ``None``.
 
         Volume history is updated on every call regardless of filtering so that
         the rolling average stays current even while conditions are not met.
+
+        Args:
+            bar:        Current completed bar.
+            indicators: Indicator snapshot at signal time.
+            levels:     Level snapshot (ORB, VWAP, etc.).
+            regime:     Regime detector with VIX/ADX state.
+            spy_vwap:   SPY's current intraday VWAP (for market direction
+                        confirmation on non-SPY/QQQ tickers).
+            spy_price:  SPY's current price (last close).
         """
         # Capture avg BEFORE this bar contaminates the window, then record it.
         avg_vol = self._avg_volume()
@@ -163,6 +175,18 @@ class ORBStrategy(Strategy):
         else:
             return None  # price inside ORB range — no breakout
 
+        # --- Market direction confirmation: informational tag, no blocking ---
+        _spy_aligned: bool | None = None
+        if (
+            bar.symbol not in _MARKET_DIRECTION_EXEMPT
+            and spy_vwap is not None
+            and spy_price is not None
+        ):
+            if direction == Direction.LONG:
+                _spy_aligned = spy_price > spy_vwap
+            else:
+                _spy_aligned = spy_price < spy_vwap
+
         if risk <= 0:
             return None
 
@@ -170,6 +194,14 @@ class ORBStrategy(Strategy):
         dir_str = str(direction)
         confidence = 3
         tags: list[str] = []
+
+        # SPY VWAP alignment tag (informational, no blocking)
+        if _spy_aligned is True:
+            confidence += 1
+            tags.append("SPY_ALIGNED")
+        elif _spy_aligned is False:
+            confidence -= 2
+            tags.append("SPY_CONFLICT")
 
         # Earnings proximity tag (informational, no blocking)
         if _is_earnings:

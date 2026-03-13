@@ -43,6 +43,10 @@ Design notes
 - Economic calendar filter: blocks all ORB trades on days with FOMC, NFP,
   CPI, or PPI releases.  The opening range on these days is unreliable due
   to pre-release positioning and post-release volatility spikes.
+- Broad market direction confirmation: informational only (no blocking).
+  For non-SPY/QQQ tickers, checks SPY's position vs its intraday VWAP.
+  Live strategy tags signals with [SPY_ALIGNED] (+1 confidence) or
+  [SPY_CONFLICT] (-2 confidence) for manual discretion.
 - Earnings proximity filter: informational only (no blocking).  Tracks
   earnings day + day after per ticker via yfinance dates cached locally
   in data/earnings_cache.json.  Live strategy tags signals with [EARNINGS].
@@ -104,6 +108,9 @@ _DAILY_ADX_MIN = 25.0  # daily ADX > 25 confirms trending market
 
 # First-5-min relative volume (RVOL) — informational only (no blocking)
 _RVOL_WINDOW = 20  # trailing days for rolling average of first-5-min volume
+
+# Market direction confirmation — exempt tickers (they ARE the market)
+_MARKET_DIRECTION_EXEMPT = {"SPY", "QQQ"}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -426,6 +433,61 @@ def _compute_first5min_rvol(
     return rvol_out
 
 
+# ── Intraday VWAP computation ────────────────────────────────────────────────
+
+
+def compute_intraday_vwap(
+    index: pd.DatetimeIndex,
+    high: Any,
+    low: Any,
+    close: Any,
+    volume: Any,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Compute intraday VWAP, resetting at the start of each trading day.
+
+    VWAP = cumulative(typical_price * volume) / cumulative(volume)
+    where typical_price = (high + low + close) / 3.
+
+    Args:
+        index:  UTC DatetimeIndex aligned with price/volume arrays.
+        high:   Numpy-like array of bar highs.
+        low:    Numpy-like array of bar lows.
+        close:  Numpy-like array of bar closes.
+        volume: Numpy-like array of bar volumes.
+
+    Returns:
+        Float64 numpy array of VWAP values, same length as *index*.
+    """
+    h = np.asarray(high, dtype=float)
+    l_ = np.asarray(low, dtype=float)
+    c = np.asarray(close, dtype=float)
+    v = np.asarray(volume, dtype=float)
+    n = len(index)
+
+    typical = (h + l_ + c) / 3.0
+    tp_vol = typical * v
+
+    et_index = _to_et_index(index)
+    vwap_out = np.full(n, np.nan)
+
+    # Group by ET calendar date
+    date_groups: dict[Any, list[int]] = {}
+    for i, ts in enumerate(et_index):
+        d = ts.date()
+        date_groups.setdefault(d, []).append(i)
+
+    for positions in date_groups.values():
+        cum_tpv = 0.0
+        cum_vol = 0.0
+        for pos in positions:
+            cum_tpv += tp_vol[pos]
+            cum_vol += v[pos]
+            if cum_vol > 0:
+                vwap_out[pos] = cum_tpv / cum_vol
+
+    return vwap_out
+
+
 # ── Backtesting.py Strategy ───────────────────────────────────────────────────
 
 
@@ -534,6 +596,18 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             name="EarningsBlocked",
         )
 
+        # Market direction confirmation: SPY VWAP + close for cross-ticker filter
+        # SPY and QQQ are exempt (they ARE the market direction).
+        self._needs_market_confirm = self.symbol not in _MARKET_DIRECTION_EXEMPT
+        if self._needs_market_confirm and hasattr(self.data, "SPY_VWAP"):
+            spy_vwap_arr = np.asarray(self.data.SPY_VWAP, dtype=float)
+            spy_close_arr = np.asarray(self.data.SPY_CLOSE, dtype=float)
+            self.spy_vwap = self.I(lambda: spy_vwap_arr, name="SPY_VWAP")
+            self.spy_close = self.I(lambda: spy_close_arr, name="SPY_CLOSE")
+        else:
+            self.spy_vwap = None
+            self.spy_close = None
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -624,6 +698,9 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         # Gap classification filter
         gap_val = float(self.gap_pct[-1])
         gap_allows_long, gap_allows_short = _classify_gap(gap_val, _GAP_THRESHOLD_PCT)
+
+        # Market direction confirmation: informational only (no blocking)
+        # Live strategy uses SPY VWAP alignment for confidence adjustment.
 
         # Dynamic risk multiplier based on ORB range vs trailing 20-day percentiles
         p25 = self.orb_p25[-1]
