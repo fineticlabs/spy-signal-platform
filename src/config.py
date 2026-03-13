@@ -78,7 +78,6 @@ class AppSettings(BaseSettings):
             "MSFT",
             "AMD",
             "TSLA",
-            "META",
             "AMZN",
             "UBER",
             "SMCI",

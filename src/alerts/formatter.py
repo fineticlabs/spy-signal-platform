@@ -53,8 +53,13 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
     direction_emoji = "🟢" if signal.direction == "LONG" else "🔴"
     time_et = signal.timestamp.astimezone(_ET).strftime("%H:%M ET")
 
+    tag_str = " ".join(f"[{_md2(t)}]" for t in signal.tags) if signal.tags else ""
+    header = f"{direction_emoji} *{_md2(str(signal.direction))}* — {_md2(signal.strategy_name)}"
+    if tag_str:
+        header += f" {tag_str}"
+
     lines: list[str] = [
-        f"{direction_emoji} *{_md2(str(signal.direction))}* — {_md2(signal.strategy_name)}",
+        header,
         "",
         f"*{_md2(signal.symbol)} @ {_price(signal.entry_price)}*",
         f"Entry:  {_price(signal.entry_price)}",

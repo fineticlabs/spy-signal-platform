@@ -160,6 +160,7 @@ class Signal(BaseModel):
         default=None, description="Full level state at signal time"
     )
     timestamp: datetime = Field(..., description="Timestamp of the bar that triggered the signal")
+    tags: list[str] = Field(default_factory=list, description="Quality tags: ENGULFING, COMPRESSED")
 
     model_config = {"frozen": True}
 

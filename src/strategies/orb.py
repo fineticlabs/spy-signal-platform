@@ -10,11 +10,15 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
-from src.models import Direction, Signal
+from src.models import Bar, Direction, Signal
 from src.strategies.base import Strategy
+from src.strategies.candlestick_filters import (
+    has_inside_bar_compression,
+    is_engulfing,
+)
 
 if TYPE_CHECKING:
-    from src.models import Bar, IndicatorSnapshot, LevelSnapshot
+    from src.models import IndicatorSnapshot, LevelSnapshot
     from src.strategies.regime import RegimeDetector
 
 logger = structlog.get_logger(__name__)
@@ -54,6 +58,7 @@ class ORBStrategy(Strategy):
 
     def __init__(self) -> None:
         self._volumes: deque[int] = deque(maxlen=_VOL_WINDOW)
+        self._recent_bars: deque[Bar] = deque(maxlen=5)  # for candlestick filters
 
     # ── Strategy interface ─────────────────────────────────────────────────────
 
@@ -79,6 +84,7 @@ class ORBStrategy(Strategy):
         # Capture avg BEFORE this bar contaminates the window, then record it.
         avg_vol = self._avg_volume()
         self._volumes.append(bar.volume)
+        self._recent_bars.append(bar)
 
         bar_time = bar.timestamp.astimezone(_ET).time()
 
@@ -147,6 +153,36 @@ class ORBStrategy(Strategy):
         if risk <= 0:
             return None
 
+        # ── Candlestick quality boosters ─────────────────────────────────
+        dir_str = str(direction)
+        confidence = 3
+        tags: list[str] = []
+
+        # Engulfing bar: boost confidence if breakout candle engulfs prior
+        if len(self._recent_bars) >= 2:
+            prev = self._recent_bars[-2]
+            if is_engulfing(
+                float(bar.open),
+                float(bar.high),
+                float(bar.low),
+                float(bar.close),
+                float(prev.open),
+                float(prev.close),
+                dir_str,
+            ):
+                confidence += 1
+                tags.append("ENGULFING")
+
+        # Inside bar compression: boost confidence if compression before breakout
+        if len(self._recent_bars) >= 5:
+            highs = [float(b.high) for b in list(self._recent_bars)[:-1]]
+            lows = [float(b.low) for b in list(self._recent_bars)[:-1]]
+            if has_inside_bar_compression(highs, lows, lookback=3):
+                confidence += 1
+                tags.append("COMPRESSED")
+
+        confidence = min(confidence, 5)
+
         rr = _RISK_MULTIPLIER  # always 2.0 by construction
 
         signal = Signal(
@@ -156,7 +192,7 @@ class ORBStrategy(Strategy):
             stop_price=stop,
             target_price=target,
             risk_reward_ratio=rr,
-            confidence_score=3,
+            confidence_score=confidence,
             reason=reason,
             timeframe=bar.timeframe,
             regime=regime.current_regime,
@@ -165,15 +201,17 @@ class ORBStrategy(Strategy):
             indicators_snapshot=indicators,
             levels_snapshot=levels,
             timestamp=bar.timestamp,
+            tags=tags,
         )
 
         logger.info(
             "orb_signal",
-            direction=str(direction),
+            direction=dir_str,
             entry=str(entry),
             stop=str(stop),
             target=str(target),
             rr=str(rr),
+            tags=tags,
         )
         return signal
 
