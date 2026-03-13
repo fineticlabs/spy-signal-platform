@@ -57,6 +57,13 @@ backtest = [
     "matplotlib>=3.9",
     "seaborn>=0.13",
 ]
+ml = [
+    "lightgbm>=4.3",
+    "optuna>=3.6",
+    "shap>=0.45",
+    "scikit-learn>=1.5",
+    "imbalanced-learn>=0.12",
+]
 
 [build-system]
 requires = ["hatchling"]
