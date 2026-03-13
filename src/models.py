@@ -56,3 +56,24 @@ class Bar(BaseModel):
         return v
 
     model_config = {"frozen": True}
+
+
+class IndicatorSnapshot(BaseModel):
+    """Point-in-time values for all active indicators.
+
+    All fields are ``Optional[Decimal]``; a ``None`` value means the indicator
+    has not yet accumulated enough bars to produce a result.
+    """
+
+    ema9: Decimal | None = Field(default=None, description="EMA(9) of close price")
+    ema20: Decimal | None = Field(default=None, description="EMA(20) of close price")
+    ema50: Decimal | None = Field(default=None, description="EMA(50) of close price")
+    rsi: Decimal | None = Field(default=None, description="RSI(14) oscillator (0-100)")
+    macd: Decimal | None = Field(default=None, description="MACD line (fast EMA - slow EMA)")
+    macd_signal: Decimal | None = Field(default=None, description="MACD signal line")
+    macd_histogram: Decimal | None = Field(default=None, description="MACD histogram")
+    bb_upper: Decimal | None = Field(default=None, description="Bollinger upper band")
+    bb_middle: Decimal | None = Field(default=None, description="Bollinger middle (SMA)")
+    bb_lower: Decimal | None = Field(default=None, description="Bollinger lower band")
+    atr: Decimal | None = Field(default=None, description="ATR(14) volatility measure")
+    vwap: Decimal | None = Field(default=None, description="Session VWAP")

@@ -125,6 +125,10 @@ module = [
     "streamlit.*",
     "plotly.*",
     "duckdb.*",
+    "pandas",
+    "pandas.*",
+    "numpy",
+    "numpy.*",
 ]
 ignore_missing_imports = true
 
