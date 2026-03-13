@@ -84,6 +84,10 @@ class AppSettings(BaseSettings):
             "SHOP",
             "PLTR",
             "NFLX",
+            "MSTR",
+            "SNOW",
+            "ARM",
+            "DASH",
         ],
         description="Ticker symbols to trade (comma-separated in .env)",
     )
