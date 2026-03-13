@@ -72,8 +72,21 @@ class AppSettings(BaseSettings):
     )
     db_path: str = Field(default="data/spy_signals.db", description="Path to SQLite database")
     symbols: list[str] = Field(
-        default=["SPY"],
-        description="Ticker symbols to trade (comma-separated in .env, e.g. SPY,QQQ,IWM)",
+        default=[
+            "SPY",
+            "QQQ",
+            "MSFT",
+            "AMD",
+            "TSLA",
+            "META",
+            "AMZN",
+            "UBER",
+            "SMCI",
+            "SHOP",
+            "PLTR",
+            "NFLX",
+        ],
+        description="Ticker symbols to trade (comma-separated in .env)",
     )
 
     @field_validator("symbols", mode="before")
