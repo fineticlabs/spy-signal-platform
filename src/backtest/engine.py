@@ -851,16 +851,15 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         # Consecutive-candle confirmation: require prev bar also outside ORB
         prev_close = float(self.data.Close[-2]) if len(self.data.Close) >= 2 else float("nan")
 
-        # ── VP intersection tagging helper ──────────────────────────────
-        def _vp_tags(target_price: float, entry_price: float) -> str:
-            """Build VP tag string based on target zone vs prior-day VP levels.
+        # ── VP intersection check ─────────────────────────────────────
+        def _vp_check(target_price: float, entry_price: float) -> tuple[bool, str]:
+            """Check VP intersection and return (blocked, tag_string).
 
-            Checks:
-              - VP_LVN_TARGET: target is outside Value Area (beyond VAH for longs,
-                below VAL for shorts) → path through low-volume zone, less resistance.
-              - VP_HVN_TARGET: target must cross through the Value Area (high volume
-                zone between VAL and VAH) → more resistance to reach target.
-              - VP_POC_CROSS: entry-to-target path crosses POC → magnet/barrier.
+            Returns:
+                (blocked, tag): blocked=True if target is inside Value Area
+                (VP_HVN_TARGET), meaning high-volume resistance will likely
+                prevent target from being reached.  tag is a comma-separated
+                string of VP tags for the trade log.
             """
             parts: list[str] = []
             vp_poc_val = float(self.vp_poc[-1])
@@ -868,16 +867,18 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             vp_val_val = float(self.vp_val[-1])
 
             if np.isnan(vp_poc_val):
-                return ""
+                return False, ""
+
+            blocked = False
 
             # Target beyond Value Area → moving through LVN (low resistance)
             if target_price > vp_vah_val or target_price < vp_val_val:
                 parts.append("VP_LVN_TARGET")
 
-            # Target path crosses through Value Area interior → HVN resistance
-            # (entry outside VA, target inside or on other side of VA)
+            # Target inside Value Area → HVN resistance → BLOCK
             if vp_val_val < target_price < vp_vah_val:
                 parts.append("VP_HVN_TARGET")
+                blocked = True
 
             # POC cross: entry-to-target path crosses POC
             if (entry_price < vp_poc_val < target_price) or (
@@ -885,7 +886,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             ):
                 parts.append("VP_POC_CROSS")
 
-            return ",".join(parts)
+            return blocked, ",".join(parts)
 
         # LONG breakout: two consecutive closes above ORB high
         if (
@@ -901,7 +902,9 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             if risk <= 0:
                 return
             target = entry + dynamic_risk_mult * risk
-            tag = _vp_tags(target, entry)
+            vp_blocked, tag = _vp_check(target, entry)
+            if vp_blocked:
+                return
             self.buy(sl=stop, tp=target, tag=tag if tag else None)
             self._daily_trade_count += 1
 
@@ -919,7 +922,9 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             if risk <= 0:
                 return
             target = entry - dynamic_risk_mult * risk
-            tag = _vp_tags(target, entry)
+            vp_blocked, tag = _vp_check(target, entry)
+            if vp_blocked:
+                return
             self.sell(sl=stop, tp=target, tag=tag if tag else None)
             self._daily_trade_count += 1
 
