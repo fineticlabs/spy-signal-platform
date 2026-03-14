@@ -52,9 +52,13 @@ Design notes
   in data/earnings_cache.json.  Live strategy tags signals with [EARNINGS].
 - Prior-day volume profile: informational only (no blocking).  Computes
   POC, Value Area (VAH/VAL), HVN, LVN from prior day's intraday bars.
-  Tags trades: VP_LVN_TARGET (target near LVN, +1 confidence in live),
-  VP_HVN_TARGET (target near HVN, -1 confidence), VP_POC_CROSS (path
+  Tags trades: VP_LVN_TARGET (target beyond VA, +1 confidence in live),
+  VP_HVN_TARGET (target inside VA → BLOCKED), VP_POC_CROSS (path
   crosses POC, -1 confidence).
+- VIX term structure: ratio = VIX / VIX3M from prior day.
+  BACKWARDATION (ratio > 1.00) → BLOCKED (19% WR, PF 0.65 in backtest).
+  CONTANGO (ratio < 0.85) → informational tag only (+1 confidence in live).
+  Normal (0.85-1.00) → no tag.
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -77,6 +81,10 @@ from backtesting import Backtest, Strategy
 from src.backtest.volume_profile import compute_volume_profile
 from src.filters.earnings_calendar import compute_earnings_blocked_array
 from src.filters.economic_calendar import compute_econ_blocked_array
+from src.filters.vix_term_structure import (
+    BACKWARDATION_THRESHOLD,
+    classify_term_structure,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -739,6 +747,15 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         self.vp_hvn = self.I(lambda: vp_hvn, name="VP_HVN")
         self.vp_lvn = self.I(lambda: vp_lvn, name="VP_LVN")
 
+        # VIX term structure: informational only (no blocking)
+        # Ratio = VIX / VIX3M, shifted 1 day (no lookahead).
+        # Passed as a column from run_backtest.py (pre-loaded from cache/yfinance).
+        if hasattr(self.data, "VIX_TERM_RATIO"):
+            vts_arr = np.asarray(self.data.VIX_TERM_RATIO, dtype=float)
+        else:
+            vts_arr = np.full(len(index), np.nan)
+        self.vix_term_ratio = self.I(lambda: vts_arr, name="VIX_Term_Ratio")
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -773,6 +790,11 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
 
         # Skip high-impact economic event days (FOMC, NFP, CPI, PPI)
         if self.econ_blocked[-1] > 0.5:
+            return
+
+        # Skip backwardation days (VIX/VIX3M > 1.00 = near-term fear spike)
+        vts_ratio_val = float(self.vix_term_ratio[-1])
+        if not np.isnan(vts_ratio_val) and vts_ratio_val > BACKWARDATION_THRESHOLD:
             return
 
         # Earnings proximity: informational only (no blocking in backtest)
@@ -888,6 +910,17 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
 
             return blocked, ",".join(parts)
 
+        # ── VIX term structure tag ────────────────────────────────────
+        vts_ratio = float(self.vix_term_ratio[-1])
+        vts_label = classify_term_structure(vts_ratio) if not np.isnan(vts_ratio) else None
+
+        def _build_tag(vp_tag: str) -> str | None:
+            """Combine VP tag and VTS tag into a single comma-separated string."""
+            parts = [vp_tag] if vp_tag else []
+            if vts_label:
+                parts.append(vts_label)
+            return ",".join(parts) if parts else None
+
         # LONG breakout: two consecutive closes above ORB high
         if (
             close > orb_high
@@ -902,10 +935,10 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             if risk <= 0:
                 return
             target = entry + dynamic_risk_mult * risk
-            vp_blocked, tag = _vp_check(target, entry)
+            vp_blocked, vp_tag = _vp_check(target, entry)
             if vp_blocked:
                 return
-            self.buy(sl=stop, tp=target, tag=tag if tag else None)
+            self.buy(sl=stop, tp=target, tag=_build_tag(vp_tag))
             self._daily_trade_count += 1
 
         # SHORT breakdown: two consecutive closes below ORB low
@@ -922,10 +955,10 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             if risk <= 0:
                 return
             target = entry - dynamic_risk_mult * risk
-            vp_blocked, tag = _vp_check(target, entry)
+            vp_blocked, vp_tag = _vp_check(target, entry)
             if vp_blocked:
                 return
-            self.sell(sl=stop, tp=target, tag=tag if tag else None)
+            self.sell(sl=stop, tp=target, tag=_build_tag(vp_tag))
             self._daily_trade_count += 1
 
 

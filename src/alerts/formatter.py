@@ -86,6 +86,9 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
         if lvl.vp_poc is not None:
             va_str = f"{_price(lvl.vp_val)} \\- {_price(lvl.vp_vah)}"
             lines.append(f"VP POC: {_price(lvl.vp_poc)} \\| VA: {va_str}")
+        if lvl.vix_term_ratio is not None:
+            ratio_str = _md2(f"{lvl.vix_term_ratio:.2f}")
+            lines.append(f"VIX Term: {ratio_str}")
 
     lines += ["", f"_{_md2(signal.reason)}_"]
 

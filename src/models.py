@@ -145,6 +145,12 @@ class LevelSnapshot(BaseModel):
     vp_hvn: Decimal | None = Field(default=None, description="Nearest prior-day HVN")
     vp_lvn: Decimal | None = Field(default=None, description="Nearest prior-day LVN")
 
+    # VIX term structure
+    vix_term_ratio: Decimal | None = Field(
+        default=None,
+        description="VIX/VIX3M ratio (prior day): <0.85 contango, >1.0 backwardation",
+    )
+
 
 class Signal(BaseModel):
     """Trading signal produced by a strategy when entry conditions are met."""

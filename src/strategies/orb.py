@@ -87,6 +87,7 @@ class ORBStrategy(Strategy):
         vp_val: Decimal | None = None,
         vp_hvn: Decimal | None = None,
         vp_lvn: Decimal | None = None,
+        vix_term_ratio: Decimal | None = None,
     ) -> Signal | None:
         """Return a Signal if ORB entry conditions are met, else ``None``.
 
@@ -237,6 +238,21 @@ class ORBStrategy(Strategy):
             if (close < vp_poc < target) or (target < vp_poc < close):
                 confidence -= 1
                 tags.append("VP_POC_CROSS")
+
+        # VIX term structure confidence adjustment (informational, no blocking)
+        if vix_term_ratio is not None:
+            from src.filters.vix_term_structure import (
+                BACKWARDATION_THRESHOLD,
+                CONTANGO_THRESHOLD,
+            )
+
+            ratio_f = float(vix_term_ratio)
+            if ratio_f < CONTANGO_THRESHOLD:
+                confidence += 1
+                tags.append("CONTANGO")
+            elif ratio_f > BACKWARDATION_THRESHOLD:
+                confidence -= 2
+                tags.append("BACKWARDATION")
 
         # Engulfing bar: boost confidence if breakout candle engulfs prior
         if len(self._recent_bars) >= 2:

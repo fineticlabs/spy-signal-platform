@@ -42,6 +42,10 @@ from src.backtest.engine import (
     run_backtest,
 )
 from src.backtest.metrics import compute_metrics, print_summary, save_equity_curve
+from src.filters.vix_term_structure import (
+    compute_vix_term_structure_array,
+    get_vix_term_structure,
+)
 from src.models import TimeFrame
 from src.storage.database import BarDatabase
 
@@ -100,6 +104,7 @@ def _run_symbol(
     oos_days: int,
     cash: float,
     spy_ref: pd.DataFrame | None = None,
+    vts_df: pd.DataFrame | None = None,
 ) -> TickerResult | None:
     """Load bars, walk-forward split, and run backtest for a single symbol.
 
@@ -113,6 +118,8 @@ def _run_symbol(
         spy_ref:  SPY 1-min reference DataFrame with ``SPY_VWAP`` and
                   ``SPY_CLOSE`` columns, indexed by UTC timestamp.
                   Used for market direction confirmation on non-SPY/QQQ tickers.
+        vts_df:   VIX term structure DataFrame with ``ratio`` column indexed
+                  by date.  Used for contango/backwardation regime tagging.
 
     Returns:
         A :class:`TickerResult` with aggregated trades, or ``None`` if the
@@ -136,6 +143,11 @@ def _run_symbol(
         # Forward-fill to handle any timestamp misalignment between tickers
         df_1min["SPY_VWAP"] = df_1min["SPY_VWAP"].ffill()
         df_1min["SPY_CLOSE"] = df_1min["SPY_CLOSE"].ffill()
+
+    # Merge VIX term structure ratio (shifted 1 day, no lookahead)
+    if vts_df is not None and not vts_df.empty:
+        vts_arr = compute_vix_term_structure_array(df_1min.index, vts_df)
+        df_1min["VIX_TERM_RATIO"] = vts_arr
 
     df = resample(df_1min, tf) if tf != TimeFrame.ONE_MIN else df_1min
 
@@ -344,6 +356,17 @@ def main() -> None:
     else:
         print("WARNING: No SPY data — market direction filter disabled")
 
+    # ── Pre-load VIX term structure for contango/backwardation tagging ─────
+    logger.info("loading_vix_term_structure")
+    vts_df = get_vix_term_structure()
+    if not vts_df.empty:
+        print(
+            f"VIX term structure loaded: {len(vts_df)} daily ratios "
+            f"({vts_df.index[0].date()} to {vts_df.index[-1].date()})"
+        )
+    else:
+        print("WARNING: No VIX term structure data — contango/backwardation tagging disabled")
+
     ticker_results: list[TickerResult] = []
 
     for sym in symbols:
@@ -355,6 +378,7 @@ def main() -> None:
             oos_days=args.oos_days,
             cash=args.cash,
             spy_ref=spy_ref,
+            vts_df=vts_df,
         )
         if result is not None:
             ticker_results.append(result)
