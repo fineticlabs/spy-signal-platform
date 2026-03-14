@@ -151,6 +151,12 @@ class LevelSnapshot(BaseModel):
         description="VIX/VIX3M ratio (prior day): <0.85 contango, >1.0 backwardation",
     )
 
+    # HMM regime detection
+    hmm_regime: str | None = Field(
+        default=None,
+        description="HMM regime: CALM (low vol), NORMAL, or VOLATILE (high vol)",
+    )
+
 
 class Signal(BaseModel):
     """Trading signal produced by a strategy when entry conditions are met."""

@@ -48,6 +48,7 @@ from src.filters.vix_term_structure import (
 )
 from src.models import TimeFrame
 from src.storage.database import BarDatabase
+from src.strategies.hmm_regime import compute_hmm_regime_for_window
 
 logger = structlog.get_logger(__name__)
 
@@ -172,10 +173,19 @@ def _run_symbol(
     for i, window in enumerate(windows, start=1):
         print(f"  [{i}/{len(windows)}] {window}")
 
+        # Slice both IS and OOS from 1-min data for HMM training
+        is_1min, oos_1min = slice_window(df_1min, window)
         _, oos_df = slice_window(df, window)
         if oos_df.empty:
             logger.warning("empty_oos_window", symbol=sym, window=str(window))
             continue
+
+        # Train HMM on IS period, predict regime on OOS period
+        hmm_regime_arr = compute_hmm_regime_for_window(is_1min, oos_1min)
+        # Map 1-min HMM predictions to the OOS DataFrame's index (handles resampled tf)
+        hmm_series = pd.Series(hmm_regime_arr, index=oos_1min.index, dtype=float)
+        oos_df = oos_df.copy()
+        oos_df["HMM_REGIME"] = hmm_series.reindex(oos_df.index, method="ffill").fillna(1.0)
 
         try:
             stats = run_backtest(oos_df, cash=cash, symbol=sym)

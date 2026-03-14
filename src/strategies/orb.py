@@ -88,6 +88,7 @@ class ORBStrategy(Strategy):
         vp_hvn: Decimal | None = None,
         vp_lvn: Decimal | None = None,
         vix_term_ratio: Decimal | None = None,
+        hmm_regime: str | None = None,
     ) -> Signal | None:
         """Return a Signal if ORB entry conditions are met, else ``None``.
 
@@ -253,6 +254,18 @@ class ORBStrategy(Strategy):
             elif ratio_f > BACKWARDATION_THRESHOLD:
                 confidence -= 2
                 tags.append("BACKWARDATION")
+
+        # HMM regime confidence adjustment (informational, no blocking)
+        # Backtest showed VOLATILE is best for ORB (+1), CALM is weakest (-1)
+        if hmm_regime is not None:
+            if hmm_regime == "VOLATILE":
+                confidence += 1
+                tags.append("HMM_VOLATILE")
+            elif hmm_regime == "CALM":
+                confidence -= 1
+                tags.append("HMM_CALM")
+            elif hmm_regime == "NORMAL":
+                tags.append("HMM_NORMAL")
 
         # Engulfing bar: boost confidence if breakout candle engulfs prior
         if len(self._recent_bars) >= 2:

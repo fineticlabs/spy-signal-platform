@@ -89,6 +89,8 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
         if lvl.vix_term_ratio is not None:
             ratio_str = _md2(f"{lvl.vix_term_ratio:.2f}")
             lines.append(f"VIX Term: {ratio_str}")
+        if lvl.hmm_regime is not None:
+            lines.append(f"HMM: {_md2(lvl.hmm_regime)}")
 
     lines += ["", f"_{_md2(signal.reason)}_"]
 

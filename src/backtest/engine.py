@@ -59,6 +59,12 @@ Design notes
   BACKWARDATION (ratio > 1.00) → BLOCKED (19% WR, PF 0.65 in backtest).
   CONTANGO (ratio < 0.85) → informational tag only (+1 confidence in live).
   Normal (0.85-1.00) → no tag.
+- HMM regime detection: informational only (no blocking).  3-state
+  GaussianHMM trained on IS period 5-min bars (returns, volume ratio,
+  ATR change).  States labelled by return variance: VOLATILE/NORMAL/CALM.
+  A/B test showed blocking VOLATILE degraded all metrics vs realized-vol
+  + daily ADX filters.  Kept as tag (HMM_CALM/NORMAL/VOLATILE) for
+  manual discretion in live trading.
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -85,6 +91,7 @@ from src.filters.vix_term_structure import (
     BACKWARDATION_THRESHOLD,
     classify_term_structure,
 )
+from src.strategies.hmm_regime import HMMRegime
 
 logger = structlog.get_logger(__name__)
 
@@ -756,6 +763,13 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             vts_arr = np.full(len(index), np.nan)
         self.vix_term_ratio = self.I(lambda: vts_arr, name="VIX_Term_Ratio")
 
+        # HMM regime: trained per walk-forward window, passed as column
+        if hasattr(self.data, "HMM_REGIME"):
+            hmm_arr = np.asarray(self.data.HMM_REGIME, dtype=float)
+        else:
+            hmm_arr = np.full(len(index), float(HMMRegime.NORMAL))
+        self.hmm_regime = self.I(lambda: hmm_arr, name="HMM_Regime")
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -796,6 +810,14 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         vts_ratio_val = float(self.vix_term_ratio[-1])
         if not np.isnan(vts_ratio_val) and vts_ratio_val > BACKWARDATION_THRESHOLD:
             return
+
+        # HMM regime: informational only (no blocking).
+        # A/B tests showed:
+        #   - Blocking VOLATILE degraded all metrics (ORB needs vol to work).
+        #   - Blocking CALM improved quality (PF 1.544, Sharpe 2.657) but
+        #     dropped net profit $3K since CALM trades are marginally
+        #     profitable ($19/trade, PF 1.203).
+        # Kept as tag only (HMM_CALM/NORMAL/VOLATILE) for live discretion.
 
         # Earnings proximity: informational only (no blocking in backtest)
         # Live strategy tags signals with [EARNINGS] for manual discretion.
@@ -914,11 +936,23 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         vts_ratio = float(self.vix_term_ratio[-1])
         vts_label = classify_term_structure(vts_ratio) if not np.isnan(vts_ratio) else None
 
+        # HMM regime tag (informational only — no blocking)
+        hmm_regime_val = int(float(self.hmm_regime[-1]))
+        hmm_label: str | None = None
+        if hmm_regime_val == HMMRegime.CALM:
+            hmm_label = "HMM_CALM"
+        elif hmm_regime_val == HMMRegime.NORMAL:
+            hmm_label = "HMM_NORMAL"
+        elif hmm_regime_val == HMMRegime.VOLATILE:
+            hmm_label = "HMM_VOLATILE"
+
         def _build_tag(vp_tag: str) -> str | None:
-            """Combine VP tag and VTS tag into a single comma-separated string."""
+            """Combine VP tag, VTS tag, and HMM tag into a comma-separated string."""
             parts = [vp_tag] if vp_tag else []
             if vts_label:
                 parts.append(vts_label)
+            if hmm_label:
+                parts.append(hmm_label)
             return ",".join(parts) if parts else None
 
         # LONG breakout: two consecutive closes above ORB high
