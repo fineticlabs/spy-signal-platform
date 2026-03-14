@@ -82,6 +82,11 @@ class ORBStrategy(Strategy):
         regime: RegimeDetector,
         spy_vwap: Decimal | None = None,
         spy_price: Decimal | None = None,
+        vp_poc: Decimal | None = None,
+        vp_vah: Decimal | None = None,
+        vp_val: Decimal | None = None,
+        vp_hvn: Decimal | None = None,
+        vp_lvn: Decimal | None = None,
     ) -> Signal | None:
         """Return a Signal if ORB entry conditions are met, else ``None``.
 
@@ -216,6 +221,22 @@ class ORBStrategy(Strategy):
             elif rvol >= _RVOL_HIGH:
                 confidence += 1
                 tags.append("HIGH_RVOL")
+
+        # Volume profile confidence adjustment (informational, no blocking)
+        if vp_poc is not None:
+            # LVN target: target beyond Value Area → low-volume zone, less resistance
+            if vp_vah is not None and vp_val is not None:
+                if target > vp_vah or target < vp_val:
+                    confidence += 1
+                    tags.append("VP_LVN_TARGET")
+                # HVN target: target inside Value Area → high-volume resistance
+                elif vp_val < target < vp_vah:
+                    confidence -= 1
+                    tags.append("VP_HVN_TARGET")
+            # POC cross: entry-to-target path crosses POC → potential barrier
+            if (close < vp_poc < target) or (target < vp_poc < close):
+                confidence -= 1
+                tags.append("VP_POC_CROSS")
 
         # Engulfing bar: boost confidence if breakout candle engulfs prior
         if len(self._recent_bars) >= 2:

@@ -138,6 +138,13 @@ class LevelSnapshot(BaseModel):
         description="First-5-min RVOL (today's opening volume / 20-day avg)",
     )
 
+    # Prior-day volume profile levels
+    vp_poc: Decimal | None = Field(default=None, description="Prior-day Volume Profile POC")
+    vp_vah: Decimal | None = Field(default=None, description="Prior-day Value Area High")
+    vp_val: Decimal | None = Field(default=None, description="Prior-day Value Area Low")
+    vp_hvn: Decimal | None = Field(default=None, description="Nearest prior-day HVN")
+    vp_lvn: Decimal | None = Field(default=None, description="Nearest prior-day LVN")
+
 
 class Signal(BaseModel):
     """Trading signal produced by a strategy when entry conditions are met."""

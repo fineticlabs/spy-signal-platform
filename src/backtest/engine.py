@@ -50,6 +50,11 @@ Design notes
 - Earnings proximity filter: informational only (no blocking).  Tracks
   earnings day + day after per ticker via yfinance dates cached locally
   in data/earnings_cache.json.  Live strategy tags signals with [EARNINGS].
+- Prior-day volume profile: informational only (no blocking).  Computes
+  POC, Value Area (VAH/VAL), HVN, LVN from prior day's intraday bars.
+  Tags trades: VP_LVN_TARGET (target near LVN, +1 confidence in live),
+  VP_HVN_TARGET (target near HVN, -1 confidence), VP_POC_CROSS (path
+  crosses POC, -1 confidence).
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -69,6 +74,7 @@ import structlog
 import talib
 from backtesting import Backtest, Strategy
 
+from src.backtest.volume_profile import compute_volume_profile
 from src.filters.earnings_calendar import compute_earnings_blocked_array
 from src.filters.economic_calendar import compute_econ_blocked_array
 
@@ -488,6 +494,117 @@ def compute_intraday_vwap(
     return vwap_out
 
 
+# ── Prior-day Volume Profile ─────────────────────────────────────────────────
+
+
+def _compute_prior_day_vp_arrays(
+    index: pd.DatetimeIndex,
+    high: Any,
+    low: Any,
+    close: Any,
+    volume: Any,
+) -> tuple[
+    np.ndarray[Any, np.dtype[np.float64]],
+    np.ndarray[Any, np.dtype[np.float64]],
+    np.ndarray[Any, np.dtype[np.float64]],
+    np.ndarray[Any, np.dtype[np.float64]],
+    np.ndarray[Any, np.dtype[np.float64]],
+]:
+    """Compute prior-day volume profile levels broadcast to each trading day.
+
+    For each trading day D, computes the volume profile from day D-1's
+    intraday bars and broadcasts the resulting POC, VAH, VAL, nearest-HVN,
+    and nearest-LVN to all 1-min bars of day D.
+
+    No lookahead: day D only sees day D-1's completed volume profile.
+
+    Args:
+        index:  UTC DatetimeIndex aligned with price/volume arrays.
+        high:   Numpy-like array of bar highs.
+        low:    Numpy-like array of bar lows.
+        close:  Numpy-like array of bar closes.
+        volume: Numpy-like array of bar volumes.
+
+    Returns:
+        Tuple of 5 float64 numpy arrays (length = len(index)):
+        (vp_poc, vp_vah, vp_val, vp_hvn_nearest, vp_lvn_nearest).
+        NaN where no prior-day VP is available or no HVN/LVN exists.
+    """
+    high_arr = np.asarray(high, dtype=float)
+    low_arr = np.asarray(low, dtype=float)
+    close_arr = np.asarray(close, dtype=float)
+    vol_arr = np.asarray(volume, dtype=float)
+    et_index = _to_et_index(index)
+    n = len(index)
+
+    # Output arrays
+    poc_out = np.full(n, np.nan)
+    vah_out = np.full(n, np.nan)
+    val_out = np.full(n, np.nan)
+    hvn_out = np.full(n, np.nan)
+    lvn_out = np.full(n, np.nan)
+
+    # Group bar positions by ET calendar date (ordered)
+    dates: list[Any] = []
+    date_to_positions: dict[Any, list[int]] = {}
+    for i, ts in enumerate(et_index):
+        d = ts.date()
+        if d not in date_to_positions:
+            dates.append(d)
+            date_to_positions[d] = []
+        date_to_positions[d].append(i)
+
+    # For each day D (starting from day 2), compute VP from day D-1
+    for idx_d in range(1, len(dates)):
+        d = dates[idx_d]
+        d_prev = dates[idx_d - 1]
+
+        prev_positions = date_to_positions[d_prev]
+        today_positions = date_to_positions[d]
+
+        if len(prev_positions) < 5:
+            continue  # not enough bars for a meaningful VP
+
+        # Extract prior day's OHLCV
+        prev_h = high_arr[prev_positions]
+        prev_l = low_arr[prev_positions]
+        prev_c = close_arr[prev_positions]
+        prev_v = vol_arr[prev_positions]
+
+        vp = compute_volume_profile(prev_h, prev_l, prev_c, prev_v)
+        if vp is None:
+            continue
+
+        # Compute today's midpoint for nearest-HVN/LVN calculation
+        # Use the ORB midpoint (first 5 bars) as reference price
+        if len(today_positions) >= 5:
+            orb_high = float(np.max(high_arr[today_positions[:5]]))
+            orb_low = float(np.min(low_arr[today_positions[:5]]))
+            ref_price = (orb_high + orb_low) / 2.0
+        else:
+            ref_price = float(close_arr[today_positions[0]])
+
+        # Find nearest HVN to reference price
+        nearest_hvn = float("nan")
+        if vp.hvn:
+            nearest_hvn = min(vp.hvn, key=lambda x: abs(x - ref_price))
+
+        # Find nearest LVN to reference price
+        nearest_lvn = float("nan")
+        if vp.lvn:
+            nearest_lvn = min(vp.lvn, key=lambda x: abs(x - ref_price))
+
+        # Broadcast to all bars of day D
+        for pos in today_positions:
+            poc_out[pos] = vp.poc
+            vah_out[pos] = vp.vah
+            val_out[pos] = vp.val_
+            hvn_out[pos] = nearest_hvn
+            lvn_out[pos] = nearest_lvn
+
+    return poc_out, vah_out, val_out, hvn_out, lvn_out
+
+
 # ── Backtesting.py Strategy ───────────────────────────────────────────────────
 
 
@@ -608,6 +725,20 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             self.spy_vwap = None
             self.spy_close = None
 
+        # Prior-day volume profile: informational only (no blocking)
+        vp_poc, vp_vah, vp_val, vp_hvn, vp_lvn = _compute_prior_day_vp_arrays(
+            index,
+            high,
+            low,
+            close,
+            volume,
+        )
+        self.vp_poc = self.I(lambda: vp_poc, name="VP_POC")
+        self.vp_vah = self.I(lambda: vp_vah, name="VP_VAH")
+        self.vp_val = self.I(lambda: vp_val, name="VP_VAL")
+        self.vp_hvn = self.I(lambda: vp_hvn, name="VP_HVN")
+        self.vp_lvn = self.I(lambda: vp_lvn, name="VP_LVN")
+
         # Daily trade counter state (reset per ET calendar day in next())
         self._last_et_date: date | None = None
         self._daily_trade_count: int = 0
@@ -720,6 +851,42 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         # Consecutive-candle confirmation: require prev bar also outside ORB
         prev_close = float(self.data.Close[-2]) if len(self.data.Close) >= 2 else float("nan")
 
+        # ── VP intersection tagging helper ──────────────────────────────
+        def _vp_tags(target_price: float, entry_price: float) -> str:
+            """Build VP tag string based on target zone vs prior-day VP levels.
+
+            Checks:
+              - VP_LVN_TARGET: target is outside Value Area (beyond VAH for longs,
+                below VAL for shorts) → path through low-volume zone, less resistance.
+              - VP_HVN_TARGET: target must cross through the Value Area (high volume
+                zone between VAL and VAH) → more resistance to reach target.
+              - VP_POC_CROSS: entry-to-target path crosses POC → magnet/barrier.
+            """
+            parts: list[str] = []
+            vp_poc_val = float(self.vp_poc[-1])
+            vp_vah_val = float(self.vp_vah[-1])
+            vp_val_val = float(self.vp_val[-1])
+
+            if np.isnan(vp_poc_val):
+                return ""
+
+            # Target beyond Value Area → moving through LVN (low resistance)
+            if target_price > vp_vah_val or target_price < vp_val_val:
+                parts.append("VP_LVN_TARGET")
+
+            # Target path crosses through Value Area interior → HVN resistance
+            # (entry outside VA, target inside or on other side of VA)
+            if vp_val_val < target_price < vp_vah_val:
+                parts.append("VP_HVN_TARGET")
+
+            # POC cross: entry-to-target path crosses POC
+            if (entry_price < vp_poc_val < target_price) or (
+                target_price < vp_poc_val < entry_price
+            ):
+                parts.append("VP_POC_CROSS")
+
+            return ",".join(parts)
+
         # LONG breakout: two consecutive closes above ORB high
         if (
             close > orb_high
@@ -734,7 +901,8 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             if risk <= 0:
                 return
             target = entry + dynamic_risk_mult * risk
-            self.buy(sl=stop, tp=target)
+            tag = _vp_tags(target, entry)
+            self.buy(sl=stop, tp=target, tag=tag if tag else None)
             self._daily_trade_count += 1
 
         # SHORT breakdown: two consecutive closes below ORB low
@@ -751,7 +919,8 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             if risk <= 0:
                 return
             target = entry - dynamic_risk_mult * risk
-            self.sell(sl=stop, tp=target)
+            tag = _vp_tags(target, entry)
+            self.sell(sl=stop, tp=target, tag=tag if tag else None)
             self._daily_trade_count += 1
 
 
