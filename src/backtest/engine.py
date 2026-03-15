@@ -65,6 +65,13 @@ Design notes
   A/B test showed blocking VOLATILE degraded all metrics vs realized-vol
   + daily ADX filters.  Kept as tag (HMM_CALM/NORMAL/VOLATILE) for
   manual discretion in live trading.
+- Kalman adaptive stops: filterpy KalmanFilter tracks post-ORB price
+  evolution.  Innovation sequence (prediction errors) measures how
+  "surprised" the filter is.  Large innovations = widen stops to avoid
+  noise stop-outs; small innovations = slightly tighter stops.
+  Multiplier = 1.0 + (avg_innovation - 0.3) * 0.5, clamped [0.90, 1.50].
+  Target uses original ATR risk (decoupled from stop width).
+  A/B: +5.7% WR, +$8.88/trade, +$6,749 net vs fixed ATR stops.
 - Max 5 trades per calendar day (ET) enforced in next().
 - ORB range filter: skips days where range < min_orb_pct of price.
 - Slippage: $0.02 per share, round-trip (applied via ``Backtest`` argument).
@@ -91,6 +98,7 @@ from src.filters.vix_term_structure import (
     BACKWARDATION_THRESHOLD,
     classify_term_structure,
 )
+from src.levels.kalman_levels import compute_kalman_stop_multiplier
 from src.strategies.hmm_regime import HMMRegime
 
 logger = structlog.get_logger(__name__)
@@ -763,6 +771,16 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             vts_arr = np.full(len(index), np.nan)
         self.vix_term_ratio = self.I(lambda: vts_arr, name="VIX_Term_Ratio")
 
+        # Kalman filter adaptive stop multiplier: uncertainty-scaled ATR stops
+        # Uses the already-shifted ATR array (no additional lookahead).
+        kalman_mult_arr = compute_kalman_stop_multiplier(
+            index,
+            close_arr,
+            np.roll(atr_raw, 1),  # same shifted ATR as self.atr
+            orb_bars=_ORB_BARS,
+        )
+        self.kalman_mult = self.I(lambda: kalman_mult_arr, name="KalmanMult")
+
         # HMM regime: trained per walk-forward window, passed as column
         if hasattr(self.data, "HMM_REGIME"):
             hmm_arr = np.asarray(self.data.HMM_REGIME, dtype=float)
@@ -955,6 +973,14 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
                 parts.append(hmm_label)
             return ",".join(parts) if parts else None
 
+        # Kalman-adaptive stop sizing: scale ATR stop by uncertainty multiplier
+        # Target uses the ORIGINAL ATR risk (decoupled) so winners stay large.
+        kalman_m = float(self.kalman_mult[-1])
+        if np.isnan(kalman_m) or kalman_m <= 0:
+            kalman_m = 1.0
+        base_atr_risk = self.atr_mult * atr  # original ATR-based risk distance
+        adaptive_atr_stop = base_atr_risk * kalman_m  # Kalman-scaled for stop only
+
         # LONG breakout: two consecutive closes above ORB high
         if (
             close > orb_high
@@ -964,11 +990,12 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             and gap_allows_long
         ):
             entry = close
-            stop = entry - self.atr_mult * atr
+            stop = entry - adaptive_atr_stop
             risk = entry - stop
             if risk <= 0:
                 return
-            target = entry + dynamic_risk_mult * risk
+            # Target based on original ATR risk, not Kalman-scaled stop
+            target = entry + dynamic_risk_mult * base_atr_risk
             vp_blocked, vp_tag = _vp_check(target, entry)
             if vp_blocked:
                 return
@@ -984,11 +1011,12 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             and gap_allows_short
         ):
             entry = close
-            stop = entry + self.atr_mult * atr
+            stop = entry + adaptive_atr_stop
             risk = stop - entry
             if risk <= 0:
                 return
-            target = entry - dynamic_risk_mult * risk
+            # Target based on original ATR risk, not Kalman-scaled stop
+            target = entry - dynamic_risk_mult * base_atr_risk
             vp_blocked, vp_tag = _vp_check(target, entry)
             if vp_blocked:
                 return

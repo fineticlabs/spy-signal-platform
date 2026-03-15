@@ -157,6 +157,12 @@ class LevelSnapshot(BaseModel):
         description="HMM regime: CALM (low vol), NORMAL, or VOLATILE (high vol)",
     )
 
+    # Kalman adaptive stop multiplier
+    kalman_stop_mult: Decimal | None = Field(
+        default=None,
+        description="Kalman innovation-based stop multiplier (0.90-1.50, default 1.0)",
+    )
+
 
 class Signal(BaseModel):
     """Trading signal produced by a strategy when entry conditions are met."""

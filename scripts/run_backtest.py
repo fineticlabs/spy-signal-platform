@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,6 +50,10 @@ from src.filters.vix_term_structure import (
 from src.models import TimeFrame
 from src.storage.database import BarDatabase
 from src.strategies.hmm_regime import compute_hmm_regime_for_window
+
+# Suppress sklearn/hmmlearn RuntimeWarnings (convergence, matmul overflow)
+warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"sklearn\..*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"hmmlearn\..*")
 
 logger = structlog.get_logger(__name__)
 

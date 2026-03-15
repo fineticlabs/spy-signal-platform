@@ -91,6 +91,8 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
             lines.append(f"VIX Term: {ratio_str}")
         if lvl.hmm_regime is not None:
             lines.append(f"HMM: {_md2(lvl.hmm_regime)}")
+        if lvl.kalman_stop_mult is not None:
+            lines.append(f"Stop Mult: {_price(lvl.kalman_stop_mult)}x")
 
     lines += ["", f"_{_md2(signal.reason)}_"]
 

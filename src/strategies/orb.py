@@ -89,6 +89,7 @@ class ORBStrategy(Strategy):
         vp_lvn: Decimal | None = None,
         vix_term_ratio: Decimal | None = None,
         hmm_regime: str | None = None,
+        kalman_stop_mult: Decimal | None = None,
     ) -> Signal | None:
         """Return a Signal if ORB entry conditions are met, else ``None``.
 
@@ -164,20 +165,25 @@ class ORBStrategy(Strategy):
 
         close = bar.close
 
+        # --- Kalman-adaptive stop sizing ---
+        km = kalman_stop_mult if kalman_stop_mult is not None else Decimal("1.0")
+        adaptive_atr_stop = _ATR_MULTIPLIER * atr * km
+        base_atr_risk = _ATR_MULTIPLIER * atr  # original risk for target (decoupled)
+
         # --- Determine direction ---
         if close > orb_high:
             direction = Direction.LONG
             entry = close
-            stop = entry - _ATR_MULTIPLIER * atr
+            stop = entry - adaptive_atr_stop
             risk = entry - stop
-            target = entry + _RISK_MULTIPLIER * risk
+            target = entry + _RISK_MULTIPLIER * base_atr_risk
             reason = f"Close {close} broke above ORB high {orb_high} " f"with volume {bar.volume:,}"
         elif close < orb_low:
             direction = Direction.SHORT
             entry = close
-            stop = entry + _ATR_MULTIPLIER * atr
+            stop = entry + adaptive_atr_stop
             risk = stop - entry
-            target = entry - _RISK_MULTIPLIER * risk
+            target = entry - _RISK_MULTIPLIER * base_atr_risk
             reason = f"Close {close} broke below ORB low {orb_low} " f"with volume {bar.volume:,}"
         else:
             return None  # price inside ORB range — no breakout
