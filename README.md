@@ -1,10 +1,10 @@
 # SPY Intraday Signal Platform
 
-A personal intraday trading signal platform that monitors 15 US stocks and ETFs, detects breakout setups using statistical models, and sends Telegram alerts for manual execution. It does not auto-trade or manage money. Built as a personal tool, not a product.
+A personal intraday trading signal platform that monitors 26 US stocks and ETFs, detects breakout setups using statistical models, and sends Telegram alerts for manual execution. It does not auto-trade or manage money. Built as a personal tool, not a product.
 
 ## What is this?
 
-Every trading day at 9:30 AM ET, markets open and the first few minutes of trading establish an "opening range" for each stock. This platform watches those opening ranges across 15 liquid tickers, detects when price breaks out with conviction, runs the setup through a series of quality filters, and sends a Telegram alert with exact entry, stop-loss, and target prices. You decide whether to take the trade.
+Every trading day at 9:30 AM ET, markets open and the first few minutes of trading establish an "opening range" for each stock. This platform watches those opening ranges across 26 liquid tickers, detects when price breaks out with conviction, runs the setup through a series of quality filters, and sends a Telegram alert with exact entry, stop-loss, and target prices. You decide whether to take the trade.
 
 The system is a discretionary trading assistant: it analyzes, scores, and alerts. It never places orders.
 
@@ -20,19 +20,20 @@ The core strategy is an **Opening Range Breakout (ORB)**:
 
 ## Performance (backtest)
 
-Walk-forward out-of-sample backtest across 15 tickers, 5.6 years (2020-2026), $50,000 starting capital:
+Walk-forward out-of-sample backtest across 26 tickers, 5.6 years (2020-2026), $50,000 starting capital:
 
 | Metric | Value |
 |---|---|
-| Profit Factor | 1.514 |
-| Sharpe Ratio | 2.586 |
-| Win Rate | 48.3% |
-| Expectancy | $69.82 / trade |
-| Net Profit | $73,662 |
+| Profit Factor | 1.423 |
+| Sharpe Ratio | 2.270 |
+| Win Rate | 47.0% |
+| Expectancy | $59.07 / trade |
+| Net Profit | $117,018 |
+| Annual Yield | 23.8% (CAGR on $50K starting capital) |
 | Max Drawdown | -6.23% |
-| Total Trades | 1,055 (~3 signals / day) |
+| Total Trades | 1,981 (~5 signals / day) |
 
-All 15 tickers are individually profitable. Results validated via Monte Carlo permutation test (p=0.0000, 10,000 permutations) and Combinatorial Purged Cross-Validation (15/15 paths profitable).
+All 26 tickers are individually profitable. Results validated via Monte Carlo permutation test (p=0.0000, 10,000 permutations) and Combinatorial Purged Cross-Validation (15/15 paths profitable on original universe).
 
 **Disclaimer:** Past performance does not guarantee future results. Backtest assumes $0.02/share slippage, zero commissions (Alpaca), and does not account for liquidity constraints or partial fills.
 
@@ -81,7 +82,11 @@ The strategy applies these filters before generating a signal:
 
 ## Tickers
 
-SPY, QQQ, MSFT, AMD, TSLA, AMZN, UBER, SMCI, SHOP, PLTR, NFLX, MSTR, SNOW, ARM, DASH
+**Original 15:** SPY, QQQ, MSFT, AMD, TSLA, AMZN, UBER, SMCI, SHOP, PLTR, NFLX, MSTR, SNOW, ARM, DASH
+
+**Expansion 11:** PYPL, INTC, MU, HOOD, DKNG, SOXL*, ROKU, TQQQ*, BA, MRVL, META
+
+*\* 3x leveraged ETFs (SOXL = semiconductors, TQQQ = Nasdaq-100)*
 
 ## Project structure
 
@@ -147,7 +152,7 @@ make backtest               # Run the walk-forward backtest
 
 | Script | Description |
 |---|---|
-| `run_backtest.py` | Full 15-ticker walk-forward backtest with per-ticker summary, combined metrics, equity curve, and trade log CSV. |
+| `run_backtest.py` | Full 26-ticker walk-forward backtest with per-ticker summary, combined metrics, equity curve, and trade log CSV. |
 | `replay_day.py` | Replay a single trading day to see what signals would have fired, with entry/stop/target and P&L outcome. |
 | `backfill_data.py` | Download historical 1-min bars from Alpaca for one or more tickers. |
 | `run_monte_carlo.py` | Monte Carlo permutation test (10,000 shuffles) to validate that backtest results are not due to chance. |
