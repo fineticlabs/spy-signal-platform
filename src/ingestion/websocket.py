@@ -6,10 +6,16 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from alpaca.data.enums import DataFeed
 from alpaca.data.live import StockDataStream
 
 from src.config import get_alpaca_settings
 from src.models import Bar, TimeFrame
+
+_FEED_MAP: dict[str, DataFeed] = {
+    "iex": DataFeed.IEX,
+    "sip": DataFeed.SIP,
+}
 
 if TYPE_CHECKING:
     from alpaca.data.models.bars import Bar as AlpacaBar
@@ -80,10 +86,11 @@ class AlpacaBarStream:
         is permanently lost.  It should be run as an :mod:`asyncio` task.
         """
         settings = get_alpaca_settings()
+        data_feed = _FEED_MAP.get(settings.feed, DataFeed.IEX)
         self._client = StockDataStream(
             api_key=settings.api_key,
             secret_key=settings.secret_key,
-            feed=settings.feed,  # type: ignore[arg-type]
+            feed=data_feed,
         )
         self._client.subscribe_bars(self._on_bar, *self._symbols)
 

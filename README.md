@@ -148,6 +148,62 @@ make dashboard              # Start Streamlit dashboard (separate terminal)
 make backtest               # Run the walk-forward backtest
 ```
 
+## Automation (Mac)
+
+The platform can run fully automated on macOS using launchd. Two scheduled jobs handle the entire daily workflow:
+
+- **6:25 AM PT (9:25 AM ET) Mon--Fri:** `auto_start.sh` backfills recent market data, then starts the live scanner. The scanner monitors all 26 tickers during market hours and sends real-time Telegram alerts when ORB setups fire.
+- **1:05 PM PT (4:05 PM ET) Mon--Fri:** `auto_stop.sh` stops the scanner, backfills end-of-day data, runs `replay_day.py` to evaluate the day's trades, and sends a formatted daily P&L summary to Telegram with a trade-by-trade breakdown including signals, wins, losses, win rate, and net P&L.
+
+### Setup automation
+
+```bash
+bash scripts/install_launchd.sh
+```
+
+This installs two launchd jobs (`com.fineticlabs.spy-scanner-start` and `com.fineticlabs.spy-scanner-stop`) that auto-start and auto-stop the scanner on weekdays.
+
+**IMPORTANT:** Your Mac must stay awake during market hours for the scheduled jobs to fire. Go to System Settings > Energy > turn on "Prevent automatic sleeping when display is off."
+
+To remove automation:
+
+```bash
+bash scripts/uninstall_launchd.sh
+```
+
+### Manual start/stop
+
+If you prefer to run the scanner manually without launchd automation:
+
+```bash
+bash scripts/auto_start.sh                         # Start scanner (backfill + launch)
+bash scripts/auto_stop.sh                           # Stop scanner + get daily report on Telegram
+
+# Or run directly
+make run                                            # Terminal 1: start live scanner
+make dashboard                                      # Terminal 2: start Streamlit dashboard
+
+# Replay any past trading day
+python scripts/replay_day.py --date 2026-03-17
+```
+
+### Monitoring
+
+```bash
+cat logs/scanner.pid                                # Check scanner PID
+ps aux | grep "src.main"                            # Check if scanner process is running
+cat logs/scanner_$(date +%Y-%m-%d).log              # View today's scanner log
+```
+
+Telegram alerts arrive in real-time during market hours whenever an ORB setup fires. After market close, a daily P&L summary is delivered to Telegram automatically (when using launchd or `auto_stop.sh`).
+
+### Troubleshooting
+
+- **Scanner not starting:** Check `logs/scanner_YYYY-MM-DD.log` for errors. Common causes are missing `.env` credentials or an unreachable Alpaca API.
+- **No Telegram messages:** Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`. Run `make test-telegram` to confirm the bot works.
+- **Stale PID file:** If the scanner crashed without cleanup, delete `logs/scanner.pid` and restart with `bash scripts/auto_start.sh`.
+- **Mac was asleep during market hours:** Run `python scripts/backfill_data.py` to catch up on missed bars, then `python scripts/replay_day.py --date YYYY-MM-DD` to see what signals you missed.
+
 ## Scripts
 
 | Script | Description |
@@ -159,6 +215,10 @@ make backtest               # Run the walk-forward backtest
 | `run_cpcv.py` | Combinatorial Purged Cross-Validation to test strategy robustness across all possible train/test path combinations. |
 | `train_ml_scorer.py` | LightGBM signal scorer experiment with Optuna tuning and SHAP analysis. Tested and rejected (AUC 0.487). |
 | `test_telegram.py` | Send a test message to verify Telegram bot configuration. |
+| `auto_start.sh` | Activate venv, backfill recent data, start the live scanner with PID tracking. |
+| `auto_stop.sh` | Stop the scanner, backfill EOD data, replay the day, send Telegram daily summary. |
+| `install_launchd.sh` | Install launchd plists for automated weekday scheduling (6:25 AM / 1:05 PM PT). |
+| `uninstall_launchd.sh` | Unload and remove the launchd plists. |
 
 ## Development
 
