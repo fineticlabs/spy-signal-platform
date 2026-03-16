@@ -73,6 +73,7 @@ class AppSettings(BaseSettings):
     db_path: str = Field(default="data/spy_signals.db", description="Path to SQLite database")
     symbols: list[str] = Field(
         default=[
+            # ── Original 15 ──────────────────────────────────────────────
             "SPY",
             "QQQ",
             "MSFT",
@@ -88,6 +89,18 @@ class AppSettings(BaseSettings):
             "SNOW",
             "ARM",
             "DASH",
+            # ── Expansion (added 2026-03-16) ─────────────────────────────
+            "PYPL",
+            "INTC",
+            "MU",
+            "HOOD",
+            "DKNG",
+            "SOXL",  # 3x leveraged semiconductor ETF
+            "ROKU",
+            "TQQQ",  # 3x leveraged Nasdaq-100 ETF
+            "BA",
+            "MRVL",
+            "META",
         ],
         description="Ticker symbols to trade (comma-separated in .env)",
     )

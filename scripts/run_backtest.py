@@ -82,8 +82,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Walk-forward ORB backtest runner (multi-symbol)")
     parser.add_argument(
         "--symbols",
-        default="SPY,QQQ,MSFT,AMD,TSLA,AMZN,UBER,SMCI,SHOP,PLTR,NFLX,MSTR,SNOW,ARM,DASH",
-        help="Comma-separated list of ticker symbols (default: 15-ticker portfolio)",
+        default="SPY,QQQ,MSFT,AMD,TSLA,AMZN,UBER,SMCI,SHOP,PLTR,NFLX,MSTR,SNOW,ARM,DASH,PYPL,INTC,MU,HOOD,DKNG,SOXL,ROKU,TQQQ,BA,MRVL,META",
+        help="Comma-separated list of ticker symbols (default: 26-ticker portfolio)",
     )
     parser.add_argument(
         "--is-days", type=int, default=60, help="In-sample window days (default: 60)"
