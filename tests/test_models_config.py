@@ -354,6 +354,11 @@ class TestRiskSettings:
         assert settings.risk_per_trade_pct == Decimal("1.0")
         assert settings.max_daily_loss_pct == Decimal("3.0")
         assert settings.max_trades_per_day == 5
+        assert settings.max_concurrent_positions == 3
+
+    def test_max_concurrent_positions_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        settings = self._make_settings(monkeypatch, MAX_CONCURRENT_POSITIONS="5")
+        assert settings.max_concurrent_positions == 5
 
 
 class TestAlpacaSettings:

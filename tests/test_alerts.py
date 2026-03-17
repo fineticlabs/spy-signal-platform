@@ -187,6 +187,17 @@ class TestFormatSignalAlert:
         assert "Position:" in msg
         assert "80,676\\.00" in msg
 
+    def test_concurrent_positions_warning_present(self) -> None:
+        """When max_concurrent_positions is set, a warning note is appended."""
+        msg = format_signal_alert(_make_signal(), _make_decision(), max_concurrent_positions=3)
+        assert "Max 3 concurrent positions" in msg
+        assert "check if prior positions are still open" in msg
+
+    def test_concurrent_positions_warning_absent_by_default(self) -> None:
+        """Without max_concurrent_positions, no warning is shown."""
+        msg = format_signal_alert(_make_signal(), _make_decision())
+        assert "concurrent positions" not in msg
+
     def test_reason_included_in_message(self) -> None:
         msg = format_signal_alert(_make_signal(), _make_decision())
         assert "Test reason" in msg

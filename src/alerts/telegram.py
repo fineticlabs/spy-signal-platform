@@ -26,10 +26,11 @@ class TelegramAlerter:
     """Sends formatted alerts to a Telegram chat via the Bot API.
 
     Args:
-        bot_token:    Telegram bot token from ``@BotFather``.
-        chat_id:      Numeric or ``@username`` chat ID to send alerts to.
-        account_size: Account size in USD for position sizing display.
-        risk_pct:     Risk per trade as percentage for position sizing display.
+        bot_token:                Telegram bot token from ``@BotFather``.
+        chat_id:                  Numeric or ``@username`` chat ID to send alerts to.
+        account_size:             Account size in USD for position sizing display.
+        risk_pct:                 Risk per trade as percentage for position sizing display.
+        max_concurrent_positions: Max concurrent positions (appended as a reminder note).
     """
 
     def __init__(
@@ -38,11 +39,13 @@ class TelegramAlerter:
         chat_id: str,
         account_size: Decimal | None = None,
         risk_pct: Decimal | None = None,
+        max_concurrent_positions: int | None = None,
     ) -> None:
         self._bot = Bot(token=bot_token)
         self._chat_id = chat_id
         self._account_size = account_size
         self._risk_pct = risk_pct
+        self._max_concurrent_positions = max_concurrent_positions
 
     # ── public send methods ────────────────────────────────────────────────────
 
@@ -57,6 +60,7 @@ class TelegramAlerter:
             risk_decision,
             account_size=self._account_size,
             risk_pct=self._risk_pct,
+            max_concurrent_positions=self._max_concurrent_positions,
         )
         return await self._send(text)
 

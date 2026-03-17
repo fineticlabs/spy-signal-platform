@@ -45,14 +45,16 @@ def format_signal_alert(
     risk_decision: RiskDecision,
     account_size: Decimal | None = None,
     risk_pct: Decimal | None = None,
+    max_concurrent_positions: int | None = None,
 ) -> str:
     """Format a trading signal as a Telegram MarkdownV2 message.
 
     Args:
-        signal:        The signal to format.
-        risk_decision: The approved risk decision (provides position size).
-        account_size:  Account size in USD (e.g. 50000). Enables "Risk" line detail.
-        risk_pct:      Risk per trade as percentage (e.g. 1.0). Enables "Risk" line detail.
+        signal:                   The signal to format.
+        risk_decision:            The approved risk decision (provides position size).
+        account_size:             Account size in USD (e.g. 50000). Enables "Risk" line detail.
+        risk_pct:                 Risk per trade as percentage (e.g. 1.0). Enables "Risk" line detail.
+        max_concurrent_positions: Max concurrent positions. When set, appends a reminder note.
 
     Returns:
         A MarkdownV2-formatted string ready to send via ``Bot.send_message``.
@@ -116,6 +118,13 @@ def format_signal_alert(
             lines.append(f"HMM: {_md2(lvl.hmm_regime)}")
         if lvl.kalman_stop_mult is not None:
             lines.append(f"Stop Mult: {_price(lvl.kalman_stop_mult)}x")
+
+    if max_concurrent_positions is not None:
+        note = (
+            f"⚠️ Max {max_concurrent_positions} concurrent positions "
+            f"— check if prior positions are still open before entering"
+        )
+        lines += ["", _md2(note)]
 
     lines += ["", f"_{_md2(signal.reason)}_"]
 

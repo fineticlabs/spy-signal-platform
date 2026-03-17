@@ -237,7 +237,7 @@ def main() -> None:
 
     for i, (_, trade) in enumerate(combined.iterrows(), start=1):
         entry_time = pd.Timestamp(trade["EntryTime"]).astimezone(_ET_TZ)
-        time_str = entry_time.strftime("%H:%M")
+        time_str = entry_time.strftime("%H:%M:%S")
         ticker = str(trade["ticker"])
         size = int(trade["Size"])
         direction = "LONG" if size > 0 else "SHORT"

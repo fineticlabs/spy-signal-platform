@@ -47,6 +47,9 @@ class RiskSettings(BaseSettings):
         default=Decimal("3.0"), description="Max daily loss as % before stopping"
     )
     max_trades_per_day: int = Field(default=5, description="Max number of trades per day")
+    max_concurrent_positions: int = Field(
+        default=3, description="Max concurrent open positions (informational)"
+    )
 
     @field_validator("risk_per_trade_pct", "max_daily_loss_pct")
     @classmethod
@@ -55,11 +58,11 @@ class RiskSettings(BaseSettings):
             raise ValueError(f"percentage must be between 0 and 100, got {v}")
         return v
 
-    @field_validator("max_trades_per_day")
+    @field_validator("max_trades_per_day", "max_concurrent_positions")
     @classmethod
-    def validate_max_trades(cls, v: int) -> int:
+    def validate_positive_int(cls, v: int) -> int:
         if v < 1:
-            raise ValueError(f"max_trades_per_day must be >= 1, got {v}")
+            raise ValueError(f"value must be >= 1, got {v}")
         return v
 
 

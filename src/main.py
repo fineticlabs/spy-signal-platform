@@ -361,6 +361,7 @@ async def run() -> None:
         chat_id=telegram_settings.chat_id,
         account_size=risk_settings.account_size,
         risk_pct=risk_settings.risk_per_trade_pct,
+        max_concurrent_positions=risk_settings.max_concurrent_positions,
     )
     dispatcher = AlertDispatcher(alerter=alerter)
 
