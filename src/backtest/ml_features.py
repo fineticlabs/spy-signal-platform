@@ -179,7 +179,7 @@ def _count_consecutive(
         orb_l = orb_low_arr[idx]
         if np.isnan(c) or np.isnan(orb_h) or np.isnan(orb_l):
             break
-        if direction == 1 and c > orb_h or direction == 0 and c < orb_l:
+        if (direction == 1 and c > orb_h) or (direction == 0 and c < orb_l):
             count += 1
         else:
             break

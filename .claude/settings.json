@@ -8,7 +8,24 @@
       "MultiEdit"
     ],
     "deny": [
-      "Bash(git *)"
+      "Bash(git *)",
+      "Read(.env*)",
+      "Read(secrets/**)",
+      "Bash(rm -rf *)",
+      "Bash(sudo *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "command": "file=\"$CLAUDE_FILE_PATHS\"; if [ -n \"$file\" ] && echo \"$file\" | grep -q '\\.py$'; then cd /Users/s.soni/Desktop/I/Projects/spy-signal-platform && .venv/bin/ruff check --fix \"$file\" 2>/dev/null; .venv/bin/ruff format \"$file\" 2>/dev/null; fi; exit 0"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "output=$(cat); reject=0; if echo \"$output\" | grep -qi 'pre-existing\\|pre existing\\|already existed\\|was already'; then echo 'STOP: Do not dismiss issues as pre-existing. Fix them or explicitly flag them.' >&2; reject=1; fi; if echo \"$output\" | grep -qi 'out of scope\\|beyond the scope\\|separate issue\\|follow.up task\\|in a follow-up'; then echo 'STOP: Do not defer problems to follow-ups. Fix issues you find or explain why you cannot.' >&2; reject=1; fi; exit $reject"
+      }
     ]
   }
 }
