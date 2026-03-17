@@ -156,6 +156,19 @@ markers = [
     "integration: marks tests that need network/API access",
     "backtest: marks backtesting tests",
 ]
+filterwarnings = [
+    # Benign numerical precision warnings during HMM training (see CLAUDE.md "HMM RuntimeWarnings")
+    "ignore:divide by zero encountered in matmul:RuntimeWarning:sklearn.utils.extmath",
+    "ignore:overflow encountered in matmul:RuntimeWarning:sklearn.utils.extmath",
+    "ignore:invalid value encountered in matmul:RuntimeWarning:sklearn.utils.extmath",
+    "ignore:divide by zero encountered in matmul:RuntimeWarning:sklearn.cluster._kmeans",
+    "ignore:overflow encountered in matmul:RuntimeWarning:sklearn.cluster._kmeans",
+    "ignore:invalid value encountered in matmul:RuntimeWarning:sklearn.cluster._kmeans",
+    "ignore:divide by zero encountered in matmul:RuntimeWarning:hmmlearn._emissions",
+    "ignore:overflow encountered in matmul:RuntimeWarning:hmmlearn._emissions",
+    "ignore:invalid value encountered in matmul:RuntimeWarning:hmmlearn._emissions",
+    "ignore:Number of distinct clusters.*found smaller than n_clusters:sklearn.exceptions.ConvergenceWarning:sklearn.base",
+]
 
 # ── Coverage ───────────────────────────────────────────────────────
 [tool.coverage.run]
