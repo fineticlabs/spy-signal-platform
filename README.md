@@ -1,12 +1,10 @@
 # SPY Intraday Signal Platform
 
-A personal intraday trading signal platform that monitors 26 US stocks and ETFs, detects breakout setups using statistical models, and sends Telegram alerts for manual execution. It does not auto-trade or manage money. Built as a personal tool, not a product.
+A personal intraday trading signal platform that monitors 26 US stocks and ETFs, detects breakout setups using statistical models, and sends Telegram alerts for manual execution. In paper_trade mode, it also places bracket orders on Alpaca's paper trading API for automated forward-testing. Built as a personal tool, not a product.
 
 ## What is this?
 
-Every trading day at 9:30 AM ET, markets open and the first few minutes of trading establish an "opening range" for each stock. This platform watches those opening ranges across 26 liquid tickers, detects when price breaks out with conviction, runs the setup through a series of quality filters, and sends a Telegram alert with exact entry, stop-loss, and target prices. You decide whether to take the trade.
-
-The system is a discretionary trading assistant: it analyzes, scores, and alerts. It never places orders.
+Every trading day at 9:30 AM ET, markets open and the first few minutes of trading establish an "opening range" for each stock. This platform watches those opening ranges across 26 liquid tickers, detects when price breaks out with conviction, runs the setup through a series of quality filters, and sends a Telegram alert with exact entry, stop-loss, and target prices. You decide whether to take the trade -- or let the platform place paper orders automatically for forward-testing.
 
 ## How it works
 
@@ -15,7 +13,7 @@ The core strategy is an **Opening Range Breakout (ORB)**:
 1. **Opening range** -- The first 5 completed 1-minute bars (9:30-9:35 ET) establish the high and low of the opening range for each ticker.
 2. **Breakout detection** -- If price closes above the opening range high (long) or below the opening range low (short) with volume at least 1.5x the 20-bar average, a potential signal is generated.
 3. **Quality filters** -- The signal passes through a dozen filters (trend alignment, regime detection, volatility, economic calendar, and more) that reject setups likely to fail.
-4. **Alert** -- Surviving signals are sent to Telegram with entry price, stop-loss, profit target, confidence score, and tags explaining why the signal fired.
+4. **Alert and execution** -- Surviving signals are sent to Telegram with entry price, stop-loss, profit target, confidence score, and tags explaining why the signal fired. In paper_trade mode, a bracket order (market entry + stop-loss + take-profit) is simultaneously submitted to Alpaca's paper trading API.
 5. **Exit** -- Target is a fixed multiple of the risk distance (typically 2R). All positions are flat by 3:55 PM ET.
 
 ## Performance (backtest)
@@ -37,12 +35,42 @@ All 26 tickers are individually profitable. Results validated via Monte Carlo pe
 
 **Disclaimer:** Past performance does not guarantee future results. Backtest assumes $0.02/share slippage, zero commissions (Alpaca), and does not account for liquidity constraints or partial fills.
 
+### First live day
+
+March 17, 2026 -- first day running in paper_trade mode against Alpaca paper API:
+
+| Metric | Value |
+|---|---|
+| Signals | 9 |
+| Wins / Losses | 3W / 6L |
+| Win Rate | 33.3% |
+| Net P&L | +$137.21 |
+
+Despite a sub-50% win rate, positive expectancy from the 2R target structure produced a net gain. Full replay available via `python scripts/replay_day.py --date 2026-03-17`.
+
+## Execution modes
+
+The platform supports three execution modes, controlled by the `EXECUTION_MODE` environment variable:
+
+| Mode | Behavior |
+|---|---|
+| `alerts_only` (default) | Sends Telegram alerts only. No orders placed. |
+| `paper_trade` | Sends Telegram alerts and places bracket orders on Alpaca paper trading API. |
+| `live_trade` | Sends Telegram alerts and places bracket orders on Alpaca live API. Use with caution. |
+
+Safety checks enforced in paper_trade and live_trade modes:
+- Market hours gate (9:30-16:00 ET)
+- Minimum buying power check ($1,000)
+- Paper account assertion in paper_trade mode (account number must start with "PA")
+- EOD flatten at 3:55 PM ET (cancel open orders, close all positions)
+
 ## Technical stack
 
 | Component | Technology |
 |---|---|
 | Language | Python 3.12+ with full type annotations |
 | Market data | Alpaca Markets API (1-min bars, WebSocket streaming) |
+| Execution | alpaca-py TradingClient (bracket orders: market entry + stop-loss + take-profit) |
 | Indicators | TA-Lib (batch), talipp (streaming), numpy, pandas |
 | Backtesting | Backtesting.py with walk-forward OOS engine |
 | Regime detection | Hidden Markov Model (hmmlearn) -- 3-state GaussianHMM trained on rolling 60-day windows |
@@ -51,10 +79,17 @@ All 26 tickers are individually profitable. Results validated via Monte Carlo pe
 | VIX term structure | VIX/VIX3M ratio for contango/backwardation regime tagging |
 | Storage | SQLite (WAL mode) for bar data, DuckDB for analytics |
 | Alerts | Telegram Bot API (python-telegram-bot) |
+| Automation | launchd (macOS) -- weekday auto-start/stop with daily P&L summary to Telegram |
 | Dashboard | Streamlit + Plotly |
 | API | FastAPI + Uvicorn |
 | Data models | Pydantic v2 (no raw dicts anywhere) |
 | ML (tested, rejected) | LightGBM signal scorer -- AUC 0.487, no predictive value |
+
+## Telegram alerts
+
+Real-time alerts are sent to Telegram whenever a signal fires during market hours. Each alert includes the ticker, direction, entry price, stop-loss, target, confidence score, and filter tags.
+
+After market close, a daily P&L summary is delivered to Telegram automatically (when using launchd or `auto_stop.sh`). The summary includes a trade-by-trade breakdown with ticker, direction, share count, entry/exit prices, outcome, and P&L, followed by totals for signals, wins, losses, win rate, and net P&L.
 
 ## Active filters
 
@@ -104,12 +139,13 @@ spy-signal-platform/
 │   ├── signals/             # Confluence scoring and signal explanation
 │   ├── risk/                # Position sizing, cooldown, daily loss limits
 │   ├── alerts/              # Telegram bot integration and formatting
+│   ├── execution/           # Alpaca bracket order execution (paper/live)
 │   ├── storage/             # SQLite database layer
 │   ├── backtest/            # Walk-forward engine, data loader, metrics
 │   ├── api/                 # FastAPI endpoints
 │   └── dashboard/           # Streamlit UI
 ├── scripts/                 # CLI tools (backtest, replay, backfill, etc.)
-├── tests/                   # pytest suite
+├── tests/                   # pytest suite (448 tests)
 ├── config/                  # Strategy parameters (settings.yaml)
 ├── data/                    # SQLite database, earnings cache
 └── docs/                    # Equity curves, trade logs, design docs
@@ -138,6 +174,21 @@ cp .env.example .env        # Edit with your Alpaca + Telegram credentials
 make backfill               # Download historical bar data
 make test-telegram          # Verify Telegram alerts work
 make test                   # Run tests
+```
+
+### Enable paper trading
+
+To forward-test signals with paper orders:
+
+```bash
+# In .env, set:
+EXECUTION_MODE=paper_trade
+
+# Verify paper account connectivity:
+python scripts/check_paper_account.py
+
+# Start the scanner (signals will alert AND place paper orders):
+make run
 ```
 
 ### Run
@@ -211,6 +262,7 @@ Telegram alerts arrive in real-time during market hours whenever an ORB setup fi
 | `run_backtest.py` | Full 26-ticker walk-forward backtest with per-ticker summary, combined metrics, equity curve, and trade log CSV. |
 | `replay_day.py` | Replay a single trading day to see what signals would have fired, with entry/stop/target and P&L outcome. |
 | `backfill_data.py` | Download historical 1-min bars from Alpaca for one or more tickers. |
+| `check_paper_account.py` | Display paper account equity, buying power, open positions, and open orders. |
 | `run_monte_carlo.py` | Monte Carlo permutation test (10,000 shuffles) to validate that backtest results are not due to chance. |
 | `run_cpcv.py` | Combinatorial Purged Cross-Validation to test strategy robustness across all possible train/test path combinations. |
 | `train_ml_scorer.py` | LightGBM signal scorer experiment with Optuna tuning and SHAP analysis. Tested and rejected (AUC 0.487). |
@@ -225,8 +277,7 @@ Telegram alerts arrive in real-time during market hours whenever an ORB setup fi
 ```bash
 make lint                   # Run ruff linter
 make format                 # Auto-format code
-make typecheck              # Run mypy
-make test                   # Fast unit tests
+make test                   # Fast unit tests (448 tests)
 make test-all               # All tests including slow/integration
 make check                  # lint + typecheck + test
 ```
