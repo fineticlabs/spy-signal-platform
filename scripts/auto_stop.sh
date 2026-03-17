@@ -167,13 +167,20 @@ else
             DIR=$(echo "$line" | awk '{print $4}')
             PNL=$(echo "$line" | awk '{print $(NF-1)}')
             OUTCOME=$(echo "$line" | awk '{print $8}')
+            SHARES=$(echo "$line" | awk '{print $5}')
 
             if [[ "$PNL" == *"-"* ]]; then
                 T_EMOJI="❌"
             else
                 T_EMOJI="✅"
             fi
-            TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} → ${OUTCOME} (${PNL})"$'\n'
+
+            # Show share count if it looks like a valid number
+            if [[ "$SHARES" =~ ^[0-9]+$ ]] && [[ "$SHARES" -gt 0 ]]; then
+                TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} ${SHARES}sh → ${OUTCOME} (${PNL})"$'\n'
+            else
+                TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} → ${OUTCOME} (${PNL})"$'\n'
+            fi
         fi
     done <<< "$REPLAY_OUTPUT"
 fi

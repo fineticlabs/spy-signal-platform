@@ -359,6 +359,8 @@ async def run() -> None:
     alerter = TelegramAlerter(
         bot_token=telegram_settings.bot_token,
         chat_id=telegram_settings.chat_id,
+        account_size=risk_settings.account_size,
+        risk_pct=risk_settings.risk_per_trade_pct,
     )
     dispatcher = AlertDispatcher(alerter=alerter)
 

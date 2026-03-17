@@ -160,6 +160,33 @@ class TestFormatSignalAlert:
         # Escaped version should appear
         assert "TRENDING\\_UP" in msg
 
+    def test_risk_line_without_account_context(self) -> None:
+        """Risk line shows dollar amount computed from shares * risk_per_share."""
+        # entry=486, stop=483 → risk_per_share=3, shares=166 → dollar_risk=498
+        msg = format_signal_alert(_make_signal(), _make_decision(size=166))
+        assert "Risk:" in msg
+        assert "498\\.00" in msg
+
+    def test_risk_line_with_account_context(self) -> None:
+        """Risk line shows dollar amount plus account context when provided."""
+        msg = format_signal_alert(
+            _make_signal(),
+            _make_decision(size=166),
+            account_size=Decimal("50000"),
+            risk_pct=Decimal("1.0"),
+        )
+        assert "Risk:" in msg
+        assert "498\\.00" in msg
+        assert "1\\.0%" in msg
+        assert "50,000" in msg
+
+    def test_position_value_line_present(self) -> None:
+        """Position line shows shares * entry_price."""
+        # shares=166, entry=486 → position_value = 80,676
+        msg = format_signal_alert(_make_signal(), _make_decision(size=166))
+        assert "Position:" in msg
+        assert "80,676\\.00" in msg
+
     def test_reason_included_in_message(self) -> None:
         msg = format_signal_alert(_make_signal(), _make_decision())
         assert "Test reason" in msg

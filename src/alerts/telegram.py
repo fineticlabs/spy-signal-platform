@@ -12,6 +12,8 @@ from telegram.error import TelegramError
 from src.alerts.formatter import format_daily_summary, format_risk_alert, format_signal_alert
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+
     from src.models import RiskDecision, Signal, TradeResult
 
 logger = structlog.get_logger(__name__)
@@ -24,13 +26,23 @@ class TelegramAlerter:
     """Sends formatted alerts to a Telegram chat via the Bot API.
 
     Args:
-        bot_token: Telegram bot token from ``@BotFather``.
-        chat_id:   Numeric or ``@username`` chat ID to send alerts to.
+        bot_token:    Telegram bot token from ``@BotFather``.
+        chat_id:      Numeric or ``@username`` chat ID to send alerts to.
+        account_size: Account size in USD for position sizing display.
+        risk_pct:     Risk per trade as percentage for position sizing display.
     """
 
-    def __init__(self, bot_token: str, chat_id: str) -> None:
+    def __init__(
+        self,
+        bot_token: str,
+        chat_id: str,
+        account_size: Decimal | None = None,
+        risk_pct: Decimal | None = None,
+    ) -> None:
         self._bot = Bot(token=bot_token)
         self._chat_id = chat_id
+        self._account_size = account_size
+        self._risk_pct = risk_pct
 
     # ── public send methods ────────────────────────────────────────────────────
 
@@ -40,7 +52,12 @@ class TelegramAlerter:
         Returns:
             ``True`` if delivered successfully, ``False`` if all retries failed.
         """
-        text = format_signal_alert(signal, risk_decision)
+        text = format_signal_alert(
+            signal,
+            risk_decision,
+            account_size=self._account_size,
+            risk_pct=self._risk_pct,
+        )
         return await self._send(text)
 
     async def send_risk_warning(self, message: str) -> bool:

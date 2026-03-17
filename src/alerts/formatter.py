@@ -40,12 +40,19 @@ def _stars(n: int) -> str:
     return "⭐" * filled + "☆" * (5 - filled)
 
 
-def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
+def format_signal_alert(
+    signal: Signal,
+    risk_decision: RiskDecision,
+    account_size: Decimal | None = None,
+    risk_pct: Decimal | None = None,
+) -> str:
     """Format a trading signal as a Telegram MarkdownV2 message.
 
     Args:
         signal:        The signal to format.
         risk_decision: The approved risk decision (provides position size).
+        account_size:  Account size in USD (e.g. 50000). Enables "Risk" line detail.
+        risk_pct:      Risk per trade as percentage (e.g. 1.0). Enables "Risk" line detail.
 
     Returns:
         A MarkdownV2-formatted string ready to send via ``Bot.send_message``.
@@ -58,6 +65,20 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
     if tag_str:
         header += f" {tag_str}"
 
+    shares = risk_decision.position_size
+    risk_per_share = abs(signal.entry_price - signal.stop_price)
+    dollar_risk = shares * risk_per_share
+    position_value = shares * signal.entry_price
+
+    # Build risk line with optional account context
+    risk_str = _md2(f"${dollar_risk:,.2f}")
+    if account_size is not None and risk_pct is not None:
+        acct_str = _md2(f"${account_size:,.0f}")
+        pct_str = _md2(f"{risk_pct}%")
+        risk_str += f" \\({pct_str} of {acct_str}\\)"
+
+    pos_str = _md2(f"${position_value:,.2f}")
+
     lines: list[str] = [
         header,
         "",
@@ -66,7 +87,9 @@ def format_signal_alert(signal: Signal, risk_decision: RiskDecision) -> str:
         f"Stop:   {_price(signal.stop_price)}",
         f"Target: {_price(signal.target_price)}",
         f"R:R: {_price(signal.risk_reward_ratio)} \\| Confidence: {_stars(signal.confidence_score)}",
-        f"Shares: {_md2(str(risk_decision.position_size))}",
+        f"Shares: {_md2(str(shares))}",
+        f"Risk: {risk_str}",
+        f"Position: {pos_str}",
         "",
         f"Regime: {_md2(str(signal.regime))} \\| VIX: {_price(signal.vix)} \\| ADX: {_price(signal.adx)}",
         f"Time: {_md2(time_et)}",
