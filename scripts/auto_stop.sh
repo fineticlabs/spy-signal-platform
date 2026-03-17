@@ -147,29 +147,33 @@ else
     WINS=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Wins:' | awk '{print $NF}' || echo "0")
     LOSSES=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Losses:' | awk '{print $NF}' || echo "0")
     WIN_RATE=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Win Rate:' | awk '{print $NF}' || echo "0%")
-    NET_PNL=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Net P&L:' | awk '{print $NF}' || echo "$0.00")
+    NET_PNL=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Net P&L:' | awk '{print $NF}' || echo '+$0.00')
 
     # Determine day emoji
     if [[ "$NET_PNL" == *"-"* ]]; then
         DAY_EMOJI="🔴"
-    elif [[ "$NET_PNL" == "$0.00" ]] || [[ "$SIGNALS" == "0" ]]; then
+    elif [[ "$NET_PNL" == '+$0.00' ]] || [[ "$SIGNALS" == "0" ]]; then
         DAY_EMOJI="⚪"
     else
         DAY_EMOJI="🟢"
     fi
 
     # Extract per-ticker lines (the numbered trade rows from replay output)
-    # Columns: # Entry Exit Ticker Dir Entry$ Stop$ Target$ Exit$ Outcome Dur P&L Shares Position$
-    #          1  2     3    4      5   6      7     8       9     10      11  12  13     14
+    # Visual columns: # Entry Exit Ticker Dir Entry$ Stop$ Target$ Exit$ Outcome Dur P&L Shares Position$
+    # Awk fields shift because "$" signs and "N/A" create variable field counts.
+    # Fixed fields:  $4=Ticker  $5=Dir  $7=EntryPrice
+    # NF-relative:   $(NF-7)=ExitPrice  $(NF-6)=Outcome  $(NF-3)=P&L  $(NF-2)=Shares
     TICKER_LINES=""
     while IFS= read -r line; do
-        # Match lines like:  1  09:36:22  09:48:15  SPY   LONG  ...
+        # Match lines like:  1  09:36:00  10:15:00  QQQ   LONG  ...
         if echo "$line" | grep -qE '^\s+[0-9]+\s+[0-9]{2}:[0-9]{2}'; then
             TICKER=$(echo "$line" | awk '{print $4}')
             DIR=$(echo "$line" | awk '{print $5}')
-            PNL=$(echo "$line" | awk '{print $12}')
-            OUTCOME=$(echo "$line" | awk '{print $10}')
-            SHARES=$(echo "$line" | awk '{print $13}')
+            ENTRY_PRICE=$(echo "$line" | awk '{print $7}')
+            EXIT_PRICE=$(echo "$line" | awk '{print $(NF-7)}')
+            OUTCOME=$(echo "$line" | awk '{print $(NF-6)}')
+            PNL=$(echo "$line" | awk '{print $(NF-3)}')
+            SHARES=$(echo "$line" | awk '{print $(NF-2)}')
 
             if [[ "$PNL" == *"-"* ]]; then
                 T_EMOJI="❌"
@@ -179,9 +183,9 @@ else
 
             # Show share count if it looks like a valid number
             if [[ "$SHARES" =~ ^[0-9]+$ ]] && [[ "$SHARES" -gt 0 ]]; then
-                TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} ${SHARES}sh → ${OUTCOME} (${PNL})"$'\n'
+                TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} ${SHARES}sh \$${ENTRY_PRICE}→\$${EXIT_PRICE} ${OUTCOME} (\$${PNL})"$'\n'
             else
-                TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} → ${OUTCOME} (${PNL})"$'\n'
+                TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} \$${ENTRY_PRICE}→\$${EXIT_PRICE} ${OUTCOME} (\$${PNL})"$'\n'
             fi
         fi
     done <<< "$REPLAY_OUTPUT"
