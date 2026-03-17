@@ -373,7 +373,7 @@ class TestExecutionModeConfig:
         monkeypatch.delenv("DB_PATH", raising=False)
         from src.config import AppSettings
 
-        settings = AppSettings()
+        settings = AppSettings(_env_file=None)  # type: ignore[call-arg]
         assert settings.execution_mode == "alerts_only"
 
     def test_paper_trade_mode_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -381,7 +381,7 @@ class TestExecutionModeConfig:
         monkeypatch.setenv("EXECUTION_MODE", "paper_trade")
         from src.config import AppSettings
 
-        settings = AppSettings()
+        settings = AppSettings(_env_file=None)  # type: ignore[call-arg]
         assert settings.execution_mode == "paper_trade"
 
     def test_invalid_execution_mode_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -390,4 +390,4 @@ class TestExecutionModeConfig:
         from src.config import AppSettings
 
         with pytest.raises(ValueError, match="execution_mode"):
-            AppSettings()
+            AppSettings(_env_file=None)  # type: ignore[call-arg]
