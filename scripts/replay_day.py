@@ -253,15 +253,16 @@ def _compute_peak_concurrent(combined: pd.DataFrame) -> int:
 
 def _print_trade_table(combined: pd.DataFrame) -> None:
     """Print the formatted trade table with entry/exit times and duration."""
-    sep = "-" * 108
+    sep = "-" * 130
     print(
         f"\n  {'#':>2}  {'Entry':>8}  {'Exit':>8}  {'Ticker':<6}  {'Dir':<5}  "
-        f"{'Entry$':>9}  {'Stop$':>9}  {'Target$':>9}  "
-        f"{'Outcome':<7}  {'Dur':>6}  {'P&L':>10}  Tags"
+        f"{'Entry$':>9}  {'Stop$':>9}  {'Target$':>9}  {'Exit$':>9}  "
+        f"{'Outcome':<7}  {'Dur':>6}  {'P&L':>10}  {'Shares':>6}  {'Position$':>10}"
     )
     print(f"  {sep}")
 
     total_pnl = 0.0
+    total_position = 0.0
     wins = 0
     losses = 0
 
@@ -278,17 +279,20 @@ def _print_trade_table(combined: pd.DataFrame) -> None:
         dur_str = _format_duration(duration)
         ticker = str(trade["ticker"])
         size = int(trade["Size"])
+        shares = abs(size)
         direction = "LONG" if size > 0 else "SHORT"
         entry_price = float(trade["EntryPrice"])
+        exit_price = float(trade["ExitPrice"])
+        position_val = shares * entry_price
         sl_raw = trade["SL"]
         tp_raw = trade["TP"]
         sl_str = f"${float(sl_raw):>8.2f}" if pd.notna(sl_raw) else f"{'N/A':>9}"
         tp_str = f"${float(tp_raw):>8.2f}" if pd.notna(tp_raw) else f"{'N/A':>9}"
         pnl = float(trade["PnL"])
-        tag = str(trade["Tag"]) if pd.notna(trade["Tag"]) else ""
         outcome = _outcome_label(trade)
 
         total_pnl += pnl
+        total_position += position_val
         if pnl >= 0:
             wins += 1
         else:
@@ -297,8 +301,8 @@ def _print_trade_table(combined: pd.DataFrame) -> None:
         pnl_str = f"${pnl:>+9.2f}"
         print(
             f"  {i:>2}  {entry_str:>8}  {exit_str:>8}  {ticker:<6}  {direction:<5}  "
-            f"${entry_price:>8.2f}  {sl_str}  {tp_str}  "
-            f"{outcome:<7}  {dur_str}  {pnl_str}  {tag}"
+            f"${entry_price:>8.2f}  {sl_str}  {tp_str}  ${exit_price:>8.2f}  "
+            f"{outcome:<7}  {dur_str}  {pnl_str}  {shares:>6}  ${position_val:>9,.0f}"
         )
 
     # Summary
@@ -306,16 +310,19 @@ def _print_trade_table(combined: pd.DataFrame) -> None:
     wr = wins / total * 100 if total > 0 else 0.0
     pnl_sign = "+" if total_pnl >= 0 else ""
     peak_concurrent = _compute_peak_concurrent(combined)
+    avg_position = total_position / total if total > 0 else 0.0
 
     print(f"  {sep}")
     print("\n  Day Summary")
     print(f"  {'-' * 40}")
-    print(f"  Signals:    {total}")
-    print(f"  Wins:       {wins}")
-    print(f"  Losses:     {losses}")
-    print(f"  Win Rate:   {wr:.0f}%")
-    print(f"  Net P&L:    {pnl_sign}${total_pnl:.2f}")
-    print(f"  Max concurrent positions: {peak_concurrent}")
+    print(f"  Signals:              {total}")
+    print(f"  Wins:                 {wins}")
+    print(f"  Losses:               {losses}")
+    print(f"  Win Rate:             {wr:.0f}%")
+    print(f"  Net P&L:              {pnl_sign}${total_pnl:.2f}")
+    print(f"  Max concurrent:       {peak_concurrent}")
+    print(f"  Total capital deployed: ${total_position:,.0f}")
+    print(f"  Avg position size:    ${avg_position:,.0f}")
     print()
 
 

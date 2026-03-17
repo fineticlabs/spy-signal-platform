@@ -159,15 +159,17 @@ else
     fi
 
     # Extract per-ticker lines (the numbered trade rows from replay output)
+    # Columns: # Entry Exit Ticker Dir Entry$ Stop$ Target$ Exit$ Outcome Dur P&L Shares Position$
+    #          1  2     3    4      5   6      7     8       9     10      11  12  13     14
     TICKER_LINES=""
     while IFS= read -r line; do
-        # Match lines like:  1  09:36  SPY   LONG  ...
+        # Match lines like:  1  09:36:22  09:48:15  SPY   LONG  ...
         if echo "$line" | grep -qE '^\s+[0-9]+\s+[0-9]{2}:[0-9]{2}'; then
-            TICKER=$(echo "$line" | awk '{print $3}')
-            DIR=$(echo "$line" | awk '{print $4}')
-            PNL=$(echo "$line" | awk '{print $(NF-1)}')
-            OUTCOME=$(echo "$line" | awk '{print $8}')
-            SHARES=$(echo "$line" | awk '{print $5}')
+            TICKER=$(echo "$line" | awk '{print $4}')
+            DIR=$(echo "$line" | awk '{print $5}')
+            PNL=$(echo "$line" | awk '{print $12}')
+            OUTCOME=$(echo "$line" | awk '{print $10}')
+            SHARES=$(echo "$line" | awk '{print $13}')
 
             if [[ "$PNL" == *"-"* ]]; then
                 T_EMOJI="❌"
