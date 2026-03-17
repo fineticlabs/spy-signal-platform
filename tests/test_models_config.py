@@ -433,6 +433,123 @@ class TestReplayDayOutcomeLabel:
         assert fn(trade) == "EOD"
 
 
+class TestReplayDayFormatDuration:
+    """Test the _format_duration() helper from scripts/replay_day.py."""
+
+    @pytest.fixture(autouse=True)
+    def _add_scripts_to_path(self) -> None:
+        scripts_path = str(SCRIPTS_DIR)
+        if scripts_path not in sys.path:
+            sys.path.insert(0, scripts_path)
+
+    @staticmethod
+    def _get_fn():
+        if "replay_day" in sys.modules:
+            del sys.modules["replay_day"]
+        mod = importlib.import_module("replay_day")
+        return mod._format_duration
+
+    def test_short_duration(self) -> None:
+        fn = self._get_fn()
+        assert fn(pd.Timedelta(minutes=3, seconds=45)) == "  3:45"
+
+    def test_zero_duration(self) -> None:
+        fn = self._get_fn()
+        assert fn(pd.Timedelta(seconds=0)) == "  0:00"
+
+    def test_long_duration(self) -> None:
+        fn = self._get_fn()
+        # 6h 30m = 390 minutes
+        assert fn(pd.Timedelta(hours=6, minutes=30)) == "390:00"
+
+
+class TestReplayDayPeakConcurrent:
+    """Test the _compute_peak_concurrent() helper from scripts/replay_day.py."""
+
+    @pytest.fixture(autouse=True)
+    def _add_scripts_to_path(self) -> None:
+        scripts_path = str(SCRIPTS_DIR)
+        if scripts_path not in sys.path:
+            sys.path.insert(0, scripts_path)
+
+    @staticmethod
+    def _get_fn():
+        if "replay_day" in sys.modules:
+            del sys.modules["replay_day"]
+        mod = importlib.import_module("replay_day")
+        return mod._compute_peak_concurrent
+
+    def test_no_overlap(self) -> None:
+        """Sequential trades have peak=1."""
+        fn = self._get_fn()
+        df = pd.DataFrame(
+            {
+                "EntryTime": [
+                    pd.Timestamp("2026-03-17 09:35", tz="UTC"),
+                    pd.Timestamp("2026-03-17 10:30", tz="UTC"),
+                ],
+                "ExitTime": [
+                    pd.Timestamp("2026-03-17 10:00", tz="UTC"),
+                    pd.Timestamp("2026-03-17 11:00", tz="UTC"),
+                ],
+            }
+        )
+        assert fn(df) == 1
+
+    def test_full_overlap(self) -> None:
+        """Two trades fully overlapping have peak=2."""
+        fn = self._get_fn()
+        df = pd.DataFrame(
+            {
+                "EntryTime": [
+                    pd.Timestamp("2026-03-17 09:35", tz="UTC"),
+                    pd.Timestamp("2026-03-17 09:36", tz="UTC"),
+                ],
+                "ExitTime": [
+                    pd.Timestamp("2026-03-17 10:00", tz="UTC"),
+                    pd.Timestamp("2026-03-17 10:00", tz="UTC"),
+                ],
+            }
+        )
+        assert fn(df) == 2
+
+    def test_three_way_overlap(self) -> None:
+        """Three trades all open at the same time: peak=3."""
+        fn = self._get_fn()
+        df = pd.DataFrame(
+            {
+                "EntryTime": [
+                    pd.Timestamp("2026-03-17 09:35", tz="UTC"),
+                    pd.Timestamp("2026-03-17 09:36", tz="UTC"),
+                    pd.Timestamp("2026-03-17 09:37", tz="UTC"),
+                ],
+                "ExitTime": [
+                    pd.Timestamp("2026-03-17 10:00", tz="UTC"),
+                    pd.Timestamp("2026-03-17 10:00", tz="UTC"),
+                    pd.Timestamp("2026-03-17 10:00", tz="UTC"),
+                ],
+            }
+        )
+        assert fn(df) == 3
+
+    def test_exit_before_entry_no_double_count(self) -> None:
+        """When trade A exits at the same time trade B enters, peak=1."""
+        fn = self._get_fn()
+        df = pd.DataFrame(
+            {
+                "EntryTime": [
+                    pd.Timestamp("2026-03-17 09:35", tz="UTC"),
+                    pd.Timestamp("2026-03-17 10:00", tz="UTC"),
+                ],
+                "ExitTime": [
+                    pd.Timestamp("2026-03-17 10:00", tz="UTC"),
+                    pd.Timestamp("2026-03-17 10:30", tz="UTC"),
+                ],
+            }
+        )
+        assert fn(df) == 1
+
+
 class TestRunBacktestImport:
     """Verify run_backtest.py can be imported without error."""
 

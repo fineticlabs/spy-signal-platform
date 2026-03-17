@@ -222,12 +222,42 @@ def main() -> None:
     combined = pd.concat(all_trades, ignore_index=True)
     combined = combined.sort_values("EntryTime").reset_index(drop=True)
 
-    # Print each signal
-    sep = "-" * 90
+    _print_trade_table(combined)
+
+
+def _format_duration(td: pd.Timedelta) -> str:
+    """Format a timedelta as MM:SS."""
+    total_secs = int(td.total_seconds())
+    minutes, seconds = divmod(abs(total_secs), 60)
+    return f"{minutes:>3d}:{seconds:02d}"
+
+
+def _compute_peak_concurrent(combined: pd.DataFrame) -> int:
+    """Compute the peak number of overlapping positions from entry/exit times."""
+    events: list[tuple[pd.Timestamp, int]] = []
+    for _, trade in combined.iterrows():
+        entry_ts = pd.Timestamp(trade["EntryTime"])
+        exit_ts = pd.Timestamp(trade["ExitTime"])
+        events.append((entry_ts, 1))
+        events.append((exit_ts, -1))
+    # Sort by time; on ties, exits (-1) before entries (+1) so a slot freed
+    # at the same bar as a new entry doesn't double-count.
+    events.sort(key=lambda e: (e[0], e[1]))
+    peak = 0
+    current = 0
+    for _, delta in events:
+        current += delta
+        peak = max(peak, current)
+    return peak
+
+
+def _print_trade_table(combined: pd.DataFrame) -> None:
+    """Print the formatted trade table with entry/exit times and duration."""
+    sep = "-" * 108
     print(
-        f"\n  {'#':>2}  {'Time':>8}  {'Ticker':<6}  {'Dir':<5}  "
-        f"{'Entry':>9}  {'Stop':>9}  {'Target':>9}  "
-        f"{'Outcome':<7}  {'P&L':>10}  Tags"
+        f"\n  {'#':>2}  {'Entry':>8}  {'Exit':>8}  {'Ticker':<6}  {'Dir':<5}  "
+        f"{'Entry$':>9}  {'Stop$':>9}  {'Target$':>9}  "
+        f"{'Outcome':<7}  {'Dur':>6}  {'P&L':>10}  Tags"
     )
     print(f"  {sep}")
 
@@ -237,7 +267,15 @@ def main() -> None:
 
     for i, (_, trade) in enumerate(combined.iterrows(), start=1):
         entry_time = pd.Timestamp(trade["EntryTime"]).astimezone(_ET_TZ)
-        time_str = entry_time.strftime("%H:%M:%S")
+        exit_time = pd.Timestamp(trade["ExitTime"]).astimezone(_ET_TZ)
+        entry_str = entry_time.strftime("%H:%M:%S")
+        exit_str = exit_time.strftime("%H:%M:%S")
+        duration = (
+            pd.Timedelta(trade["Duration"])
+            if pd.notna(trade.get("Duration"))
+            else exit_time - entry_time
+        )
+        dur_str = _format_duration(duration)
         ticker = str(trade["ticker"])
         size = int(trade["Size"])
         direction = "LONG" if size > 0 else "SHORT"
@@ -258,15 +296,16 @@ def main() -> None:
 
         pnl_str = f"${pnl:>+9.2f}"
         print(
-            f"  {i:>2}  {time_str:>8}  {ticker:<6}  {direction:<5}  "
+            f"  {i:>2}  {entry_str:>8}  {exit_str:>8}  {ticker:<6}  {direction:<5}  "
             f"${entry_price:>8.2f}  {sl_str}  {tp_str}  "
-            f"{outcome:<7}  {pnl_str}  {tag}"
+            f"{outcome:<7}  {dur_str}  {pnl_str}  {tag}"
         )
 
     # Summary
     total = wins + losses
     wr = wins / total * 100 if total > 0 else 0.0
     pnl_sign = "+" if total_pnl >= 0 else ""
+    peak_concurrent = _compute_peak_concurrent(combined)
 
     print(f"  {sep}")
     print("\n  Day Summary")
@@ -276,6 +315,7 @@ def main() -> None:
     print(f"  Losses:     {losses}")
     print(f"  Win Rate:   {wr:.0f}%")
     print(f"  Net P&L:    {pnl_sign}${total_pnl:.2f}")
+    print(f"  Max concurrent positions: {peak_concurrent}")
     print()
 
 
