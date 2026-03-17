@@ -124,12 +124,25 @@ class AppSettings(BaseSettings):
             raise ValueError(f"log_level must be one of {valid}, got {v!r}")
         return upper
 
+    execution_mode: str = Field(
+        default="alerts_only",
+        description="Execution mode: 'alerts_only', 'paper_trade', or 'live_trade'",
+    )
+
     @field_validator("trading_mode")
     @classmethod
     def validate_trading_mode(cls, v: str) -> str:
         valid = ("live", "paper", "backtest")
         if v not in valid:
             raise ValueError(f"trading_mode must be one of {valid}, got {v!r}")
+        return v
+
+    @field_validator("execution_mode")
+    @classmethod
+    def validate_execution_mode(cls, v: str) -> str:
+        valid = ("alerts_only", "paper_trade", "live_trade")
+        if v not in valid:
+            raise ValueError(f"execution_mode must be one of {valid}, got {v!r}")
         return v
 
 

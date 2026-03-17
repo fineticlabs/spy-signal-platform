@@ -48,10 +48,12 @@ import uvicorn
 from src.alerts.dispatcher import AlertDispatcher
 from src.alerts.telegram import TelegramAlerter
 from src.config import (
+    get_alpaca_settings,
     get_app_settings,
     get_risk_settings,
     get_telegram_settings,
 )
+from src.execution.alpaca_executor import AlpacaExecutor
 from src.indicators.registry import IndicatorRegistry
 from src.indicators.streaming import StreamingATR, StreamingEMA, StreamingMACD, StreamingRSI
 from src.ingestion.websocket import AlpacaBarStream
@@ -70,6 +72,7 @@ _ET = ZoneInfo("America/New_York")
 
 # Scheduled ET wall-clock times
 _DAILY_RESET_ET = time(9, 30)
+_EOD_FLATTEN_ET = time(15, 55)
 _EOD_SUMMARY_ET = time(16, 5)
 
 # How often the scheduler wakes (seconds)
@@ -137,6 +140,7 @@ async def _process_bar(
     risk: RiskManager,
     dispatcher: AlertDispatcher,
     db: BarDatabase,
+    executor: AlpacaExecutor | None = None,
 ) -> None:
     """Run a single bar through the full pipeline for its symbol."""
     # 1. Indicators
@@ -186,6 +190,22 @@ async def _process_bar(
     # 6. Alert if approved
     if decision.approved:
         await dispatcher.dispatch_signal(signal, decision)
+
+        # 7. Execute order if executor is configured
+        if executor is not None:
+            order = executor.submit_bracket_order(
+                symbol=signal.symbol,
+                direction=signal.direction,
+                qty=decision.position_size,
+                stop_price=signal.stop_price,
+                target_price=signal.target_price,
+            )
+            if order is not None:
+                logger.info(
+                    "order_executed",
+                    symbol=signal.symbol,
+                    order_id=str(order.id),
+                )
     else:
         logger.warning(
             "signal_rejected",
@@ -204,6 +224,7 @@ async def _bar_loop(
     risk: RiskManager,
     dispatcher: AlertDispatcher,
     db: BarDatabase,
+    executor: AlpacaExecutor | None = None,
 ) -> None:
     """Consume bars from the queue, route to the correct per-symbol pipeline."""
     logger.info("bar_loop_started", symbols=list(pipelines.keys()))
@@ -215,7 +236,7 @@ async def _bar_loop(
             queue.task_done()
             continue
         try:
-            await _process_bar(bar, pipeline, risk, dispatcher, db)
+            await _process_bar(bar, pipeline, risk, dispatcher, db, executor=executor)
         except Exception as exc:
             logger.error(
                 "bar_processing_error",
@@ -235,9 +256,11 @@ async def _scheduler(
     risk_cooldown: CooldownTracker,
     dispatcher: AlertDispatcher,
     db: BarDatabase,
+    executor: AlpacaExecutor | None = None,
 ) -> None:
-    """Fire periodic events: daily reset at 9:30 ET, EOD summary at 16:05 ET."""
+    """Fire periodic events: daily reset, EOD flatten, EOD summary."""
     last_reset_date: datetime | None = None
+    last_flatten_date: datetime | None = None
     last_eod_date: datetime | None = None
 
     while True:
@@ -259,6 +282,25 @@ async def _scheduler(
                 pipeline.levels._premarket.__init__()  # type: ignore[misc]
                 pipeline.levels._last_date = None
             last_reset_date = now_et
+
+        # ── EOD flatten at 15:55 ET ──────────────────────────────────────────
+        if (
+            executor is not None
+            and now_et.time() >= _EOD_FLATTEN_ET
+            and (last_flatten_date is None or last_flatten_date.date() < today)
+        ):
+            logger.info("eod_flatten_starting", date=str(today))
+            try:
+                cancelled = executor.cancel_open_orders()
+                closed = executor.flatten_all_positions()
+                logger.info(
+                    "eod_flatten_complete",
+                    orders_cancelled=cancelled,
+                    positions_closed=closed,
+                )
+            except Exception as exc:
+                logger.error("eod_flatten_failed", error=str(exc))
+            last_flatten_date = now_et
 
         # ── end-of-day summary ───────────────────────────────────────────────
         if now_et.time() >= _EOD_SUMMARY_ET and (
@@ -365,6 +407,22 @@ async def run() -> None:
     )
     dispatcher = AlertDispatcher(alerter=alerter)
 
+    # ── executor (paper_trade / live_trade mode only) ─────────────────────────
+    executor: AlpacaExecutor | None = None
+    if app_settings.execution_mode in ("paper_trade", "live_trade"):
+        alpaca_settings = get_alpaca_settings()
+        is_paper = app_settings.execution_mode == "paper_trade"
+        executor = AlpacaExecutor(
+            api_key=alpaca_settings.api_key,
+            secret_key=alpaca_settings.secret_key,
+            paper=is_paper,
+        )
+        logger.info(
+            "executor_enabled",
+            mode=app_settings.execution_mode,
+            paper=is_paper,
+        )
+
     # ── inject live state into FastAPI (first symbol's pipeline for dashboard) ─
     from src.api.routes import set_dependencies
 
@@ -388,6 +446,7 @@ async def run() -> None:
         "platform_starting",
         symbols=symbols,
         mode=app_settings.trading_mode,
+        execution_mode=app_settings.execution_mode,
         db=app_settings.db_path,
     )
 
@@ -396,11 +455,11 @@ async def run() -> None:
             tg.create_task(_start_api(), name="api_server")
             tg.create_task(stream.start(), name="websocket_stream")
             tg.create_task(
-                _bar_loop(queue, pipelines, risk, dispatcher, db),
+                _bar_loop(queue, pipelines, risk, dispatcher, db, executor=executor),
                 name="bar_loop",
             )
             tg.create_task(
-                _scheduler(pipelines, cooldown, dispatcher, db),
+                _scheduler(pipelines, cooldown, dispatcher, db, executor=executor),
                 name="scheduler",
             )
     except* asyncio.CancelledError:
