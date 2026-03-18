@@ -147,7 +147,7 @@ def run_cpcv(
         pnl = test_trades["PnL"]
 
         n_test = len(pnl)
-        if n_test == 0:
+        if n_test == 0:  # pragma: no cover — CombPurgedKFoldCV never yields empty test folds
             continue
 
         wins = int((pnl > 0).sum())

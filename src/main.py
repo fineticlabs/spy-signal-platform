@@ -462,7 +462,9 @@ async def run() -> None:
                 _scheduler(pipelines, cooldown, dispatcher, db, executor=executor),
                 name="scheduler",
             )
-    except* asyncio.CancelledError:
+    except* (
+        asyncio.CancelledError
+    ):  # pragma: no cover — coverage.py cannot trace except* (ExceptionGroup syntax)
         logger.info("platform_shutting_down")
     except* Exception as eg:
         for exc in eg.exceptions:
@@ -478,5 +480,5 @@ def main() -> None:
     asyncio.run(run())
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover — CLI entry point, never runs under pytest
     main()
