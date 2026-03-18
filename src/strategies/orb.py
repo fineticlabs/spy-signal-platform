@@ -296,7 +296,7 @@ class ORBStrategy(Strategy):
                 confidence += 1
                 tags.append("COMPRESSED")
 
-        confidence = min(confidence, 5)
+        confidence = max(1, min(confidence, 5))
 
         rr = _RISK_MULTIPLIER  # always 2.0 by construction
 
