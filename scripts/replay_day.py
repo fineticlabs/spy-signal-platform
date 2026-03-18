@@ -50,8 +50,44 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"hmmlearn\..*
 logger = structlog.get_logger(__name__)
 
 _ET_TZ = ZoneInfo("America/New_York")
-_DEFAULT_SYMBOLS = "SPY,QQQ,MSFT,AMD,TSLA,AMZN,UBER,SMCI,SHOP,PLTR,NFLX,MSTR,SNOW,ARM,DASH"
 _IS_DAYS = 60
+
+
+def _get_default_symbols() -> list[str]:
+    """Return the canonical symbol list from AppSettings, with hardcoded fallback."""
+    try:
+        from src.config import get_app_settings
+
+        return get_app_settings().symbols
+    except Exception:
+        return [
+            "SPY",
+            "QQQ",
+            "MSFT",
+            "AMD",
+            "TSLA",
+            "AMZN",
+            "UBER",
+            "SMCI",
+            "SHOP",
+            "PLTR",
+            "NFLX",
+            "MSTR",
+            "SNOW",
+            "ARM",
+            "DASH",
+            "PYPL",
+            "INTC",
+            "MU",
+            "HOOD",
+            "DKNG",
+            "SOXL",
+            "ROKU",
+            "TQQQ",
+            "BA",
+            "MRVL",
+            "META",
+        ]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -63,10 +99,12 @@ def _parse_args() -> argparse.Namespace:
         default="2026-03-13",
         help="Target date to replay (YYYY-MM-DD, default: 2026-03-13)",
     )
+    default_syms = _get_default_symbols()
+    default_syms_str = ",".join(default_syms)
     parser.add_argument(
         "--symbols",
-        default=_DEFAULT_SYMBOLS,
-        help=f"Comma-separated ticker symbols (default: {_DEFAULT_SYMBOLS})",
+        default=default_syms_str,
+        help=f"Comma-separated ticker symbols (default: {default_syms_str})",
     )
     parser.add_argument(
         "--cash", type=float, default=50_000.0, help="Starting cash (default: 50000)"
