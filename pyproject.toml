@@ -168,6 +168,8 @@ filterwarnings = [
     "ignore:overflow encountered in matmul:RuntimeWarning:hmmlearn._emissions",
     "ignore:invalid value encountered in matmul:RuntimeWarning:hmmlearn._emissions",
     "ignore:Number of distinct clusters.*found smaller than n_clusters:sklearn.exceptions.ConvergenceWarning:sklearn.base",
+    # websockets v14 deprecated the legacy module; nothing to act on until alpaca-py upgrades
+    "ignore::DeprecationWarning:websockets.legacy",
 ]
 
 # ── Coverage ───────────────────────────────────────────────────────
