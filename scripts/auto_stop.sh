@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ── auto_stop.sh ──────────────────────────────────────────────────────────────
-# Kill the live scanner, backfill EOD data, replay the day, parse results,
-# and send a formatted Telegram daily summary.
+# Kill the live scanner, backfill EOD data, query live signals, replay the day,
+# and send a two-section Telegram summary separating LIVE from BACKTEST results.
 # Called by launchd at 1:05 PM PT (Mon–Fri) or manually.
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -35,6 +35,7 @@ PROJECT_DIR="$HOME/Desktop/I/Projects/spy-signal-platform"
 VENV_DIR="$PROJECT_DIR/.venv"
 LOGS_DIR="$PROJECT_DIR/logs"
 PID_FILE="$LOGS_DIR/scanner.pid"
+DB_PATH="$PROJECT_DIR/data/spy_signals.db"
 TODAY=$(date +%Y-%m-%d)
 LOG_FILE="$LOGS_DIR/stop_${TODAY}.log"
 
@@ -109,7 +110,97 @@ else
     fi
 fi
 
-# ── Replay today's trading day ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: LIVE PAPER TRADES — what actually happened today
+# ══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "[$(date '+%H:%M:%S')] Querying live signals from database..."
+
+LIVE_SECTION=""
+LIVE_SIGNAL_COUNT=0
+LIVE_APPROVED_COUNT=0
+LIVE_TRADE_LINES=""
+
+if [[ -f "$DB_PATH" ]]; then
+    # Count all signals generated today (approved + rejected)
+    LIVE_SIGNAL_COUNT=$(sqlite3 "$DB_PATH" \
+        "SELECT COUNT(*) FROM signals WHERE timestamp >= '${TODAY}T00:00:00';" 2>/dev/null || echo "0")
+
+    # Count approved signals (trades the risk manager allowed)
+    LIVE_APPROVED_COUNT=$(sqlite3 "$DB_PATH" \
+        "SELECT COUNT(*) FROM signals WHERE timestamp >= '${TODAY}T00:00:00' AND approved = 1;" 2>/dev/null || echo "0")
+
+    # Get rejected reasons summary
+    LIVE_REJECTED=$(sqlite3 "$DB_PATH" \
+        "SELECT reject_reason, COUNT(*) as cnt FROM signals
+         WHERE timestamp >= '${TODAY}T00:00:00' AND approved = 0
+         GROUP BY reject_reason ORDER BY cnt DESC LIMIT 5;" 2>/dev/null || echo "")
+
+    # Get approved trade details
+    LIVE_TRADE_LINES=$(sqlite3 -separator '|' "$DB_PATH" \
+        "SELECT direction, entry_price, stop_price, target_price, confidence, reason
+         FROM signals
+         WHERE timestamp >= '${TODAY}T00:00:00' AND approved = 1
+         ORDER BY timestamp;" 2>/dev/null || echo "")
+
+    # Get trades table entries (manually logged P&L from executor)
+    LIVE_PNL_LINES=$(sqlite3 -separator '|' "$DB_PATH" \
+        "SELECT direction, entry_price, target_price, pnl
+         FROM trades
+         WHERE timestamp >= '${TODAY}T00:00:00'
+         ORDER BY timestamp;" 2>/dev/null || echo "")
+
+    echo "  Signals today: $LIVE_SIGNAL_COUNT (approved: $LIVE_APPROVED_COUNT)"
+fi
+
+# Build live section for Telegram
+if [[ "$LIVE_APPROVED_COUNT" -gt 0 ]] && [[ -n "$LIVE_TRADE_LINES" ]]; then
+    LIVE_DETAILS=""
+    while IFS='|' read -r dir entry stop target conf reason; do
+        if [[ "$dir" == "LONG" ]]; then
+            LIVE_DETAILS="${LIVE_DETAILS}  🟢 ${dir} \$${entry} (stop \$${stop}, target \$${target}) ★${conf}"$'\n'
+        else
+            LIVE_DETAILS="${LIVE_DETAILS}  🔴 ${dir} \$${entry} (stop \$${stop}, target \$${target}) ★${conf}"$'\n'
+        fi
+    done <<< "$LIVE_TRADE_LINES"
+
+    # Add realized P&L from trades table if available
+    LIVE_REALIZED_PNL=""
+    if [[ -n "$LIVE_PNL_LINES" ]]; then
+        TOTAL_PNL=$(sqlite3 "$DB_PATH" \
+            "SELECT COALESCE(SUM(CAST(pnl AS REAL)), 0) FROM trades WHERE timestamp >= '${TODAY}T00:00:00';" 2>/dev/null || echo "0")
+        TRADE_COUNT=$(sqlite3 "$DB_PATH" \
+            "SELECT COUNT(*) FROM trades WHERE timestamp >= '${TODAY}T00:00:00';" 2>/dev/null || echo "0")
+        if [[ "$TOTAL_PNL" == *"-"* ]]; then
+            LIVE_REALIZED_PNL="  Realized: \$${TOTAL_PNL} (${TRADE_COUNT} closed)"
+        else
+            LIVE_REALIZED_PNL="  Realized: +\$${TOTAL_PNL} (${TRADE_COUNT} closed)"
+        fi
+    fi
+
+    LIVE_SECTION="✅ *LIVE PAPER TRADES*
+${LIVE_APPROVED_COUNT} signal(s) approved by risk manager
+${LIVE_DETAILS}${LIVE_REALIZED_PNL}"
+else
+    # No live trades — explain why
+    REJECT_SUMMARY=""
+    if [[ "$LIVE_SIGNAL_COUNT" -gt 0 ]] && [[ -n "$LIVE_REJECTED" ]]; then
+        TOP_REASON=$(echo "$LIVE_REJECTED" | head -1 | sed 's/|/ × /')
+        REJECT_SUMMARY="
+${LIVE_SIGNAL_COUNT} signal(s) generated but all rejected:
+  ${TOP_REASON}"
+    elif [[ "$LIVE_SIGNAL_COUNT" -eq 0 ]]; then
+        REJECT_SUMMARY="
+No signals generated (filters active)."
+    fi
+
+    LIVE_SECTION="✅ *LIVE PAPER TRADES*
+No live trades today.${REJECT_SUMMARY}"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: REPLAY BACKTEST — hypothetical results from replay engine
+# ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "[$(date '+%H:%M:%S')] Running replay (this takes 2-3 minutes)..."
 REPLAY_TIMED_OUT=false
@@ -131,41 +222,21 @@ else
     fi
 fi
 
-# ── Parse replay output for Telegram summary ─────────────────────────────────
+# Parse replay output
 if [[ "$REPLAY_TIMED_OUT" == "true" ]]; then
-    # Replay timed out — send a minimal summary
-    SIGNALS="?"
-    WINS="?"
-    LOSSES="?"
-    WIN_RATE="?"
-    NET_PNL="?"
-    DAY_EMOJI="⚠️"
-    TICKER_LINES=""
+    REPLAY_SECTION="📊 *REPLAY BACKTEST* _(hypothetical)_
+⚠️ Replay timed out after 5 minutes.
+Run manually: \`python scripts/replay_day.py --date ${TODAY}\`"
 else
-    # Extract summary stats from the replay output
     SIGNALS=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Signals:' | awk '{print $NF}' || echo "0")
     WINS=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Wins:' | awk '{print $NF}' || echo "0")
     LOSSES=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Losses:' | awk '{print $NF}' || echo "0")
     WIN_RATE=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Win Rate:' | awk '{print $NF}' || echo "0%")
     NET_PNL=$(echo "$REPLAY_OUTPUT" | grep -E '^\s+Net P&L:' | awk '{print $NF}' || echo '+$0.00')
 
-    # Determine day emoji
-    if [[ "$NET_PNL" == *"-"* ]]; then
-        DAY_EMOJI="🔴"
-    elif [[ "$NET_PNL" == '+$0.00' ]] || [[ "$SIGNALS" == "0" ]]; then
-        DAY_EMOJI="⚪"
-    else
-        DAY_EMOJI="🟢"
-    fi
-
-    # Extract per-ticker lines (the numbered trade rows from replay output)
-    # Visual columns: # Entry Exit Ticker Dir Entry$ Stop$ Target$ Exit$ Outcome Dur P&L Shares Position$
-    # Awk fields shift because "$" signs and "N/A" create variable field counts.
-    # Fixed fields:  $4=Ticker  $5=Dir  $7=EntryPrice
-    # NF-relative:   $(NF-7)=ExitPrice  $(NF-6)=Outcome  $(NF-3)=P&L  $(NF-2)=Shares
+    # Extract per-ticker lines
     TICKER_LINES=""
     while IFS= read -r line; do
-        # Match lines like:  1  09:36:00  10:15:00  QQQ   LONG  ...
         if echo "$line" | grep -qE '^\s+[0-9]+\s+[0-9]{2}:[0-9]{2}'; then
             TICKER=$(echo "$line" | awk '{print $4}')
             DIR=$(echo "$line" | awk '{print $5}')
@@ -181,37 +252,45 @@ else
                 T_EMOJI="✅"
             fi
 
-            # Show share count if it looks like a valid number
             if [[ "$SHARES" =~ ^[0-9]+$ ]] && [[ "$SHARES" -gt 0 ]]; then
-                TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} ${SHARES}sh \$${ENTRY_PRICE}→\$${EXIT_PRICE} ${OUTCOME} (\$${PNL})"$'\n'
+                TICKER_LINES="${TICKER_LINES}  ${T_EMOJI} ${TICKER} ${DIR} ${SHARES}sh \$${ENTRY_PRICE}→\$${EXIT_PRICE} ${OUTCOME} (\$${PNL})"$'\n'
             else
-                TICKER_LINES="${TICKER_LINES}${T_EMOJI} ${TICKER} ${DIR} \$${ENTRY_PRICE}→\$${EXIT_PRICE} ${OUTCOME} (\$${PNL})"$'\n'
+                TICKER_LINES="${TICKER_LINES}  ${T_EMOJI} ${TICKER} ${DIR} \$${ENTRY_PRICE}→\$${EXIT_PRICE} ${OUTCOME} (\$${PNL})"$'\n'
             fi
         fi
     done <<< "$REPLAY_OUTPUT"
+
+    if [[ "$SIGNALS" == "0" ]] || [[ -z "$SIGNALS" ]]; then
+        REPLAY_SECTION="📊 *REPLAY BACKTEST* _(hypothetical)_
+No replay signals for ${TODAY}."
+    else
+        REPLAY_SECTION="📊 *REPLAY BACKTEST* _(hypothetical)_
+⚠️ These are backtest results, NOT live trades.
+The replay engine uses different filters than the live scanner.
+
+• Signals: ${SIGNALS} | Wins: ${WINS} | Losses: ${LOSSES}
+• Win Rate: ${WIN_RATE} | Net P&L: ${NET_PNL}
+${TICKER_LINES}"
+    fi
 fi
 
-# ── Build Telegram message ────────────────────────────────────────────────────
+# ── Build final Telegram message ─────────────────────────────────────────────
 DAY_NAME=$(date -j -f "%Y-%m-%d" "$TODAY" "+%A" 2>/dev/null || date -d "$TODAY" "+%A" 2>/dev/null || echo "")
 
-if [[ "$REPLAY_TIMED_OUT" == "true" ]]; then
-    MESSAGE="⚠️ *ORB Daily Summary — ${DAY_NAME} ${TODAY}*
-
-⏱ Replay timed out after 5 minutes.
-Scanner ran today but results could not be computed.
-Run manually: \`python scripts/replay_day.py --date ${TODAY}\`"
+# Overall emoji: based on live trades, not replay
+if [[ "$LIVE_APPROVED_COUNT" -gt 0 ]]; then
+    DAY_EMOJI="📈"
 else
-    MESSAGE="${DAY_EMOJI} *ORB Daily Summary — ${DAY_NAME} ${TODAY}*
-
-📊 *Stats*
-• Signals: ${SIGNALS}
-• Wins: ${WINS} | Losses: ${LOSSES}
-• Win Rate: ${WIN_RATE}
-• Net P&L: ${NET_PNL}
-
-📋 *Trades*
-${TICKER_LINES:-No signals fired today.}"
+    DAY_EMOJI="📋"
 fi
+
+MESSAGE="${DAY_EMOJI} *ORB Daily Report — ${DAY_NAME} ${TODAY}*
+
+${LIVE_SECTION}
+
+─────────────────────────
+
+${REPLAY_SECTION}"
 
 echo ""
 echo "──── Telegram Message ────"

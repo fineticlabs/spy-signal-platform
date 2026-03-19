@@ -390,7 +390,51 @@ def _check_disk_space() -> None:
         _record(False, "Disk space", f"{type(exc).__name__}: {exc}")
 
 
-# ── 11. Tests ────────────────────────────────────────────────────────────────
+# ── 11. Pipeline wiring ──────────────────────────────────────────────────────
+
+
+def _check_pipeline_wiring() -> None:
+    """Run the end-to-end pipeline wiring test (no mocks).
+
+    This feeds synthetic bars through the REAL _build_registry, RegimeDetector,
+    and ORBStrategy.  It catches:
+    - regime.update() not receiving vix/adx
+    - snapshot not recognizing new indicators
+    - signal chain broken by missing wiring
+    """
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "tests/integration/test_pipeline_wiring.py",
+                "-q",
+                "--tb=short",
+                "--no-header",
+                "--override-ini=addopts=",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(_ROOT),
+        )
+        output = result.stdout.strip()
+        last_line = output.splitlines()[-1] if output.splitlines() else ""
+
+        if result.returncode == 0:
+            passed_str = last_line.split(" passed")[0].strip().split()[-1]
+            _record(True, "Pipeline wiring", f"{passed_str} passed (real objects, no mocks)")
+        else:
+            # Show the first failure line for diagnosis
+            fail_lines = [ln for ln in output.splitlines() if "FAILED" in ln]
+            detail = fail_lines[0] if fail_lines else last_line
+            _record(False, "Pipeline wiring", detail)
+    except Exception as exc:
+        _record(False, "Pipeline wiring", f"{type(exc).__name__}: {exc}")
+
+
+# ── 12. Full test suite ─────────────────────────────────────────────────────
 
 
 def _check_tests() -> None:
@@ -418,11 +462,11 @@ def _check_tests() -> None:
         if result.returncode == 0:
             # Extract count from "465 passed in ..."
             passed_str = last_line.split(" passed")[0].strip().split()[-1]
-            _record(True, "Tests", f"{passed_str} passed")
+            _record(True, "Full test suite", f"{passed_str} passed")
         else:
-            _record(False, "Tests", f"Failures detected: {last_line}")
+            _record(False, "Full test suite", f"Failures detected: {last_line}")
     except Exception as exc:
-        _record(False, "Tests", f"{type(exc).__name__}: {exc}")
+        _record(False, "Full test suite", f"{type(exc).__name__}: {exc}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -445,6 +489,7 @@ def main() -> None:
     _check_mac_sleep()
     _check_no_scanner()
     _check_disk_space()
+    _check_pipeline_wiring()
     _check_tests()
 
     # ── summary ──────────────────────────────────────────────────────────────

@@ -154,7 +154,10 @@ class StreamingADX:
         vals = self._indicator.output_values
         if not vals or vals[-1] is None:
             return None
-        return Decimal(str(vals[-1].adx))
+        adx_raw = vals[-1].adx
+        if adx_raw is None:
+            return None
+        return Decimal(str(adx_raw))
 
     @property
     def ready(self) -> bool:
