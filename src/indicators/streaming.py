@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import structlog
-from talipp.indicators import ATR, EMA, MACD, RSI
+from talipp.indicators import ADX, ATR, EMA, MACD, RSI
 from talipp.ohlcv import OHLCV
 
 if TYPE_CHECKING:
@@ -124,6 +124,44 @@ class StreamingATR:
 
     def __repr__(self) -> str:
         return f"StreamingATR(period={self._period}, value={self.value})"
+
+
+class StreamingADX:
+    """Average Directional Index updated one OHLCV bar at a time.
+
+    Args:
+        period: DI and ADX smoothing window (default 14).
+    """
+
+    def __init__(self, period: int = 14) -> None:
+        self._period = period
+        self._indicator: ADX = ADX(di_period=period, adx_period=period)
+
+    def update(self, bar: Bar) -> None:
+        """Feed a completed bar into the ADX."""
+        ohlcv = OHLCV(
+            open=float(bar.open),
+            high=float(bar.high),
+            low=float(bar.low),
+            close=float(bar.close),
+            volume=float(bar.volume),
+        )
+        self._indicator.add(ohlcv)
+
+    @property
+    def value(self) -> Decimal | None:
+        """Current ADX value, or ``None`` if not enough bars have been seen."""
+        vals = self._indicator.output_values
+        if not vals or vals[-1] is None:
+            return None
+        return Decimal(str(vals[-1].adx))
+
+    @property
+    def ready(self) -> bool:
+        return self.value is not None
+
+    def __repr__(self) -> str:
+        return f"StreamingADX(period={self._period}, value={self.value})"
 
 
 class MACDValue:

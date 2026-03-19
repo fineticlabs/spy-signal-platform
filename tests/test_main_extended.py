@@ -87,7 +87,8 @@ class TestProcessBarRegimeUpdate:
         bar = make_bar(symbol="SPY")
         await _process_bar(bar, pipeline, _make_risk(), _make_dispatcher(), _make_db())
 
-        pipeline.regime.update.assert_called_once_with(trending_up=True)
+        pipeline.regime.update.assert_called_once()
+        assert pipeline.regime.update.call_args.kwargs["trending_up"] is True
 
     @pytest.mark.asyncio
     async def test_regime_update_trending_down(self) -> None:
@@ -100,7 +101,8 @@ class TestProcessBarRegimeUpdate:
         bar = make_bar(symbol="SPY")
         await _process_bar(bar, pipeline, _make_risk(), _make_dispatcher(), _make_db())
 
-        pipeline.regime.update.assert_called_once_with(trending_up=False)
+        pipeline.regime.update.assert_called_once()
+        assert pipeline.regime.update.call_args.kwargs["trending_up"] is False
 
     @pytest.mark.asyncio
     async def test_regime_update_ema9_none(self) -> None:
@@ -113,7 +115,8 @@ class TestProcessBarRegimeUpdate:
         bar = make_bar(symbol="SPY")
         await _process_bar(bar, pipeline, _make_risk(), _make_dispatcher(), _make_db())
 
-        pipeline.regime.update.assert_called_once_with(trending_up=None)
+        pipeline.regime.update.assert_called_once()
+        assert pipeline.regime.update.call_args.kwargs["trending_up"] is None
 
     @pytest.mark.asyncio
     async def test_regime_update_ema20_none(self) -> None:
@@ -126,7 +129,8 @@ class TestProcessBarRegimeUpdate:
         bar = make_bar(symbol="SPY")
         await _process_bar(bar, pipeline, _make_risk(), _make_dispatcher(), _make_db())
 
-        pipeline.regime.update.assert_called_once_with(trending_up=None)
+        pipeline.regime.update.assert_called_once()
+        assert pipeline.regime.update.call_args.kwargs["trending_up"] is None
 
     @pytest.mark.asyncio
     async def test_regime_update_both_emas_none(self) -> None:
@@ -139,7 +143,8 @@ class TestProcessBarRegimeUpdate:
         bar = make_bar(symbol="SPY")
         await _process_bar(bar, pipeline, _make_risk(), _make_dispatcher(), _make_db())
 
-        pipeline.regime.update.assert_called_once_with(trending_up=None)
+        pipeline.regime.update.assert_called_once()
+        assert pipeline.regime.update.call_args.kwargs["trending_up"] is None
 
     @pytest.mark.asyncio
     async def test_no_regime_update_when_atr_none(self) -> None:

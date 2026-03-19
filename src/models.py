@@ -88,6 +88,7 @@ class IndicatorSnapshot(BaseModel):
     bb_middle: Decimal | None = Field(default=None, description="Bollinger middle (SMA)")
     bb_lower: Decimal | None = Field(default=None, description="Bollinger lower band")
     atr: Decimal | None = Field(default=None, description="ATR(14) volatility measure")
+    adx: Decimal | None = Field(default=None, description="ADX(14) trend strength (0-100)")
     vwap: Decimal | None = Field(default=None, description="Session VWAP")
 
 

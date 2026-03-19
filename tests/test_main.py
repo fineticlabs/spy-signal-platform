@@ -22,7 +22,7 @@ from src.models import (
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-_EXPECTED_INDICATORS = {"ema9", "ema20", "ema50", "rsi", "macd", "atr"}
+_EXPECTED_INDICATORS = {"ema9", "ema20", "ema50", "rsi", "macd", "atr", "adx"}
 
 
 def _make_raw_trade(**overrides: object) -> dict[str, object]:
@@ -92,13 +92,12 @@ class TestBuildRegistry:
         registry = _build_registry()
         assert isinstance(registry, IndicatorRegistry)
 
-    def test_has_six_indicators(self) -> None:
+    def test_has_seven_indicators(self) -> None:
         registry = _build_registry()
-        snapshot = registry.get_snapshot()
-        # All 6 registered names should exist as fields on the snapshot
-        registered = {name for name in _EXPECTED_INDICATORS}
-        snapshot_fields = set(type(snapshot).model_fields.keys())
-        assert registered.issubset(snapshot_fields)
+        assert len(registry) == 7
+        # All 7 registered names map to IndicatorSnapshot fields
+        snapshot_fields = set(type(registry.get_snapshot()).model_fields.keys())
+        assert _EXPECTED_INDICATORS.issubset(snapshot_fields)
 
     def test_correct_indicator_names(self) -> None:
         registry = _build_registry()

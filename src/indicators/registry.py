@@ -100,6 +100,7 @@ class IndicatorRegistry:
             "bb_middle",
             "bb_lower",
             "atr",
+            "adx",
             "vwap",
         }
 

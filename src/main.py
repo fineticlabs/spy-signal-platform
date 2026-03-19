@@ -55,7 +55,13 @@ from src.config import (
 )
 from src.execution.alpaca_executor import AlpacaExecutor
 from src.indicators.registry import IndicatorRegistry
-from src.indicators.streaming import StreamingATR, StreamingEMA, StreamingMACD, StreamingRSI
+from src.indicators.streaming import (
+    StreamingADX,
+    StreamingATR,
+    StreamingEMA,
+    StreamingMACD,
+    StreamingRSI,
+)
 from src.ingestion.websocket import AlpacaBarStream
 from src.levels import LevelManager
 from src.models import Bar, TimeFrame, TradeResult
@@ -105,7 +111,15 @@ def _build_registry() -> IndicatorRegistry:
     registry.register("rsi", StreamingRSI(14))
     registry.register("macd", StreamingMACD())
     registry.register("atr", StreamingATR(14))
+    registry.register("adx", StreamingADX(14))
     return registry
+
+
+# Fallback VIX when no live VIX feed is available.  20 = long-run median;
+# the ORB strategy only needs VIX < 25 to allow signals, so 20 keeps the
+# gate open while avoiding false confidence during actual high-vol regimes.
+# Replace with a real feed (e.g. from vix_data.download_vix) when available.
+_VIX_FALLBACK = Decimal("20")
 
 
 def _build_pipelines(symbols: list[str], db: BarDatabase) -> dict[str, _SymbolPipeline]:
@@ -159,7 +173,14 @@ async def _process_bar(
         trending_up: bool | None = None
         if e9 is not None and e20 is not None:
             trending_up = e9 > e20
-        pipeline.regime.update(trending_up=trending_up)
+
+        # ADX from the snapshot (StreamingADX registered as "adx")
+        adx_val = indicator_snapshot.adx
+
+        # VIX: use fallback until a real-time feed is wired in
+        vix_val: Decimal | None = pipeline.regime.vix_level or _VIX_FALLBACK
+
+        pipeline.regime.update(vix=vix_val, adx=adx_val, trending_up=trending_up)
 
     # 3. Strategy evaluation
     signal = pipeline.strategy.evaluate(bar, indicator_snapshot, level_snapshot, pipeline.regime)
