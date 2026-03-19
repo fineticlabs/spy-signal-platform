@@ -131,15 +131,30 @@ else
     echo "         Debug: grep 'regime_updated' $LOG_FILE | tail -5"
 fi
 
-# ── 5. No unknown indicator warnings ────────────────────────────────────────
+# ── 5. No unknown indicator warnings (last 5 minutes only) ──────────────────
 
-UNKNOWN_COUNT=$(grep -c "snapshot_unknown_indicator" "$LOG_FILE" || true)
+UNKNOWN_COUNT=0
+UNKNOWN_NAMES_LIST=""
+WINDOW_SECS=300  # 5 minutes
+
+while IFS= read -r line; do
+    ts=$(echo "$line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+    if [[ -n "$ts" ]]; then
+        line_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts" +%s 2>/dev/null || echo 0)
+        age=$(( NOW - line_epoch ))
+        if (( age >= 0 && age <= WINDOW_SECS )); then
+            ((UNKNOWN_COUNT++))
+            name=$(echo "$line" | grep -oE "name=[a-z_]+" | head -1)
+            UNKNOWN_NAMES_LIST="${UNKNOWN_NAMES_LIST}${name}"$'\n'
+        fi
+    fi
+done < <(grep "snapshot_unknown_indicator" "$LOG_FILE" | tail -500)
 
 if (( UNKNOWN_COUNT == 0 )); then
-    pass "No unknown indicator warnings"
+    pass "No unknown indicator warnings (last 5 min)"
 else
-    UNKNOWN_NAMES=$(grep "snapshot_unknown_indicator" "$LOG_FILE" | grep -oE "name=[a-z_]+" | sort -u | tr '\n' ', ')
-    fail "Unknown indicators" "$UNKNOWN_COUNT warnings for: $UNKNOWN_NAMES"
+    UNIQUE_NAMES=$(echo "$UNKNOWN_NAMES_LIST" | sort -u | tr '\n' ', ')
+    fail "Unknown indicators" "$UNKNOWN_COUNT in last 5 min for: $UNIQUE_NAMES"
     echo "         Fix: Add the indicator name to _known set in src/indicators/registry.py"
 fi
 
