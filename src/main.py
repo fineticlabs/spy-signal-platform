@@ -499,8 +499,11 @@ async def _scheduler(
             logger.info("daily_reset", date=str(today), symbols=list(pipelines.keys()))
             risk_cooldown.reset_daily()
             for pipeline in pipelines.values():
-                # Reset all per-symbol level state
-                pipeline.levels._orb.__init__()  # type: ignore[misc]
+                # Reset per-symbol level state — but preserve ORB if already
+                # complete for today (backfill may have populated it).
+                orb = pipeline.levels._orb
+                if not orb.is_complete or orb._session_date != today:
+                    orb.__init__()  # type: ignore[misc]
                 pipeline.levels._vwap.__init__()  # type: ignore[misc]
                 pipeline.levels._day.__init__()  # type: ignore[misc]
                 pipeline.levels._premarket.__init__()  # type: ignore[misc]
