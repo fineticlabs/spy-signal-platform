@@ -22,6 +22,21 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+# ETFs and indices that never have earnings — skip yfinance fetch entirely
+_ETF_SYMBOLS: frozenset[str] = frozenset(
+    {
+        "SPY",
+        "QQQ",
+        "TQQQ",
+        "SOXL",
+        "DIA",
+        "IWM",
+        "XLF",
+        "XLE",
+        "XLK",
+    }
+)
+
 _CACHE_PATH = Path("data/earnings_cache.json")
 
 
@@ -35,6 +50,9 @@ def _fetch_earnings_dates(symbol: str, limit: int = 100) -> list[date]:
     Returns:
         Sorted list of :class:`~datetime.date` objects (ascending).
     """
+    if symbol in _ETF_SYMBOLS:
+        return []
+
     import yfinance as yf
 
     ticker = yf.Ticker(symbol)
@@ -149,6 +167,8 @@ def is_earnings_blackout(symbol: str, d: date) -> bool:
     Returns:
         ``True`` if the ticker should be blocked on this date.
     """
+    if symbol in _ETF_SYMBOLS:
+        return False
     return d in get_earnings_blackout_dates(symbol)
 
 

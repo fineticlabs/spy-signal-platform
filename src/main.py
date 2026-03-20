@@ -70,7 +70,12 @@ from src.models import Bar, TimeFrame, TradeResult
 from src.risk.cooldown import CooldownTracker
 from src.risk.manager import RiskManager
 from src.storage.database import BarDatabase
-from src.storage.queries import ensure_schema, insert_signal
+from src.storage.queries import (
+    ensure_schema,
+    insert_signal,
+    query_recent_signals,
+    query_recent_trades,
+)
 from src.strategies.orb import ORBStrategy
 from src.strategies.regime import RegimeDetector
 
@@ -80,11 +85,16 @@ _ET = ZoneInfo("America/New_York")
 
 # Scheduled ET wall-clock times
 _DAILY_RESET_ET = time(9, 30)
+_ORB_CHECK_ET = time(9, 50)
 _EOD_FLATTEN_ET = time(15, 55)
 _EOD_SUMMARY_ET = time(16, 5)
 
 # How often the scheduler wakes (seconds)
 _SCHEDULER_INTERVAL = 30
+
+# ── regime warmup progress tracking ──────────────────────────────────────────
+_regime_warmup_bar_counts: dict[str, int] = {}
+_regime_first_populated: set[str] = set()
 
 
 # ── per-symbol pipeline container ─────────────────────────────────────────────
@@ -267,6 +277,20 @@ async def _process_bar(
     pipeline.registry.update_all(bar)
     indicator_snapshot = pipeline.registry.get_snapshot()
 
+    # Track regime warmup progress
+    symbol = bar.symbol
+    _regime_warmup_bar_counts[symbol] = _regime_warmup_bar_counts.get(symbol, 0) + 1
+    bar_count = _regime_warmup_bar_counts[symbol]
+
+    if bar_count % 5 == 0 and indicator_snapshot.adx is None:
+        logger.info(
+            "regime_warmup_progress",
+            symbol=symbol,
+            bars=bar_count,
+            adx_ready=indicator_snapshot.adx is not None,
+            atr_ready=indicator_snapshot.atr is not None,
+        )
+
     # 2. Levels
     pipeline.levels.update(bar)
     level_snapshot = pipeline.levels.get_levels()
@@ -287,6 +311,22 @@ async def _process_bar(
         vix_val: Decimal | None = pipeline.regime.vix_level or _VIX_FALLBACK
 
         pipeline.regime.update(vix=vix_val, adx=adx_val, trending_up=trending_up)
+
+    # Log when regime first populates for this symbol
+    if (
+        symbol not in _regime_first_populated
+        and pipeline.regime.vix_level is not None
+        and pipeline.regime.adx_value is not None
+    ):
+        _regime_first_populated.add(symbol)
+        logger.info(
+            "regime_first_update",
+            symbol=symbol,
+            vix=str(pipeline.regime.vix_level),
+            adx=str(pipeline.regime.adx_value),
+            regime=str(pipeline.regime.current_regime),
+            bars_to_warmup=bar_count,
+        )
 
     # 3. Strategy evaluation
     signal = pipeline.strategy.evaluate(bar, indicator_snapshot, level_snapshot, pipeline.regime)
@@ -342,6 +382,61 @@ async def _process_bar(
         )
 
 
+# ── EOD status report ─────────────────────────────────────────────────────────
+
+
+async def _send_eod_status(
+    dispatcher: AlertDispatcher,
+    db: BarDatabase,
+    pipelines: dict[str, _SymbolPipeline],
+    cooldown: CooldownTracker,
+) -> None:
+    """Send detailed end-of-day status via Telegram."""
+    since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    signals = query_recent_signals(db.conn, since=since, limit=1000)
+    trades = query_recent_trades(db.conn, since=since, limit=500)
+
+    total_signals = len(signals)
+    approved = sum(1 for s in signals if s.get("approved") == 1)
+    rejected = total_signals - approved
+
+    # Group rejection reasons
+    reasons: dict[str, int] = {}
+    for s in signals:
+        if s.get("approved") == 0:
+            reason = str(s.get("reject_reason", "unknown"))
+            reasons[reason] = reasons.get(reason, 0) + 1
+
+    # P&L from trades
+    total_pnl = sum(float(t.get("pnl", 0)) for t in trades)
+
+    # ORB completions
+    orb_count = sum(1 for p in pipelines.values() if p.levels._orb.is_complete)
+    total_tickers = len(pipelines)
+
+    lines = [f"📋 *End of Day Report — {datetime.now(_ET).strftime('%A %Y-%m-%d')}*", ""]
+
+    if total_signals == 0:
+        lines.append("⚠️ Zero signals generated. Review filters or market conditions.")
+        lines.append("")
+
+    lines.append(f"Signals: {total_signals} (approved: {approved}, rejected: {rejected})")
+    lines.append(f"Trades: {len(trades)} | Net P&L: ${total_pnl:+.2f}")
+    lines.append(f"ORB formed: {orb_count}/{total_tickers} tickers")
+    lines.append(
+        f"Daily trades: {cooldown.daily_trade_count} | Losses: {cooldown.consecutive_losses}"
+    )
+
+    if reasons:
+        lines.append("")
+        lines.append("*Rejection reasons:*")
+        for reason_text, count in sorted(reasons.items(), key=lambda x: -x[1])[:5]:
+            lines.append(f"  {reason_text}: {count}")
+
+    await dispatcher.dispatch_status("\n".join(lines))
+
+
 # ── bar ingestion loop ─────────────────────────────────────────────────────────
 
 
@@ -386,8 +481,9 @@ async def _scheduler(
     executor: AlpacaExecutor | None = None,
     stream: AlpacaBarStream | None = None,
 ) -> None:
-    """Fire periodic events: daily reset, EOD flatten, EOD summary, websocket watchdog."""
+    """Fire periodic events: daily reset, ORB check, EOD flatten, EOD summary, websocket watchdog."""
     last_reset_date: datetime | None = None
+    last_orb_check_date: datetime | None = None
     last_flatten_date: datetime | None = None
     last_eod_date: datetime | None = None
 
@@ -410,6 +506,26 @@ async def _scheduler(
                 pipeline.levels._premarket.__init__()  # type: ignore[misc]
                 pipeline.levels._last_date = None
             last_reset_date = now_et
+
+        # ── ORB formation watchdog at 9:50 ET ────────────────────────────────
+        if now_et.time() >= _ORB_CHECK_ET and (
+            last_orb_check_date is None or last_orb_check_date.date() < today
+        ):
+            orb_count = sum(1 for p in pipelines.values() if p.levels._orb.is_complete)
+            total = len(pipelines)
+            logger.info("orb_formation_check", complete=orb_count, total=total)
+
+            if orb_count == 0:
+                with contextlib.suppress(Exception):
+                    await dispatcher.dispatch_risk_warning(
+                        f"🚨 No ORB ranges formed by 9:50 ET ({total} tickers). Check data feed."
+                    )
+            elif orb_count < total // 2:
+                with contextlib.suppress(Exception):
+                    await dispatcher.dispatch_status(
+                        f"⚠️ Only {orb_count}/{total} ORB ranges formed by 9:50 ET."
+                    )
+            last_orb_check_date = now_et
 
         # ── EOD flatten at 15:55 ET ──────────────────────────────────────────
         if (
@@ -437,12 +553,14 @@ async def _scheduler(
             logger.info("eod_summary", date=str(today))
             try:
                 since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-                from src.storage.queries import query_recent_trades
-
                 raw_trades = query_recent_trades(db.conn, since=since, limit=500)
                 await dispatcher.dispatch_daily_summary(cast_trades(raw_trades))
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover — DB/Telegram errors at 16:05 ET
                 logger.error("eod_summary_failed", error=str(exc))
+            try:  # pragma: no cover — fires at 16:05 ET during live session
+                await _send_eod_status(dispatcher, db, pipelines, risk_cooldown)
+            except Exception as exc:  # pragma: no cover — defensive catch for DB/Telegram errors
+                logger.error("eod_status_failed", error=str(exc))
             last_eod_date = now_et
 
         # ── websocket watchdog: alert if no bars in 90s during market hours ──
@@ -694,6 +812,8 @@ async def run() -> None:
             logger.error("platform_error", error=str(exc))
     finally:
         await stream.stop()
+        with contextlib.suppress(Exception):
+            await dispatcher.dispatch_status("Scanner stopped.")
         db.close()
         logger.info("platform_stopped")
 

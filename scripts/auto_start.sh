@@ -20,18 +20,22 @@ echo "============================================================"
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] auto_start.sh BEGIN"
 echo "============================================================"
 
-# ── Kill ALL existing scanner processes (not just the PID file) ─────────────
+# ── Stop existing scanner gracefully via stop.sh ──────────────────────────
 echo "Cleaning up any existing scanner processes..."
-# Kill by PID file first
-if [[ -f "$PID_FILE" ]]; then
-    OLD_PID=$(cat "$PID_FILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "Killing scanner PID $OLD_PID..."
-        kill "$OLD_PID" 2>/dev/null || true
-        sleep 2
-        kill -9 "$OLD_PID" 2>/dev/null || true
+if [[ -f "$PROJECT_DIR/scripts/stop.sh" ]]; then
+    bash "$PROJECT_DIR/scripts/stop.sh"
+else
+    # Fallback: kill by PID file
+    if [[ -f "$PID_FILE" ]]; then
+        OLD_PID=$(cat "$PID_FILE")
+        if kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "Killing scanner PID $OLD_PID..."
+            kill "$OLD_PID" 2>/dev/null || true
+            sleep 2
+            kill -9 "$OLD_PID" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
     fi
-    rm -f "$PID_FILE"
 fi
 
 # Kill any orphaned python processes running src.main

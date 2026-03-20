@@ -18,7 +18,10 @@ from src.main import (
     _bar_loop,
     _install_signal_handlers,
     _process_bar,
+    _regime_first_populated,
+    _regime_warmup_bar_counts,
     _scheduler,
+    _send_eod_status,
     _start_api,
     _SymbolPipeline,
 )
@@ -766,3 +769,299 @@ class TestMain:
             and node.func.attr == "run"
         ]
         assert len(calls) >= 1, "main() must call asyncio.run(...)"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# _send_eod_status
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TestSendEodStatus:
+    """Tests for _send_eod_status()."""
+
+    @pytest.mark.asyncio
+    async def test_zero_signals_includes_warning(self) -> None:
+        """When no signals today, the message contains a zero-signal warning."""
+        dispatcher = AsyncMock()
+        db = MagicMock()
+        cooldown = MagicMock()
+        cooldown.daily_trade_count = 0
+        cooldown.consecutive_losses = 0
+
+        pipeline = _make_pipeline(symbol="SPY")
+        pipeline.levels._orb.is_complete = False
+        pipelines = {"SPY": pipeline}
+
+        with (
+            patch("src.main.query_recent_signals", return_value=[]),
+            patch("src.main.query_recent_trades", return_value=[]),
+        ):
+            await _send_eod_status(dispatcher, db, pipelines, cooldown)
+
+        dispatcher.dispatch_status.assert_awaited_once()
+        msg = dispatcher.dispatch_status.call_args[0][0]
+        assert "Zero signals generated" in msg
+
+    @pytest.mark.asyncio
+    async def test_with_signals_and_trades(self) -> None:
+        """When signals and trades exist, message includes counts and P&L."""
+        dispatcher = AsyncMock()
+        db = MagicMock()
+        cooldown = MagicMock()
+        cooldown.daily_trade_count = 3
+        cooldown.consecutive_losses = 1
+
+        pipeline = _make_pipeline(symbol="SPY")
+        pipeline.levels._orb.is_complete = True
+        pipelines = {"SPY": pipeline}
+
+        signals = [
+            {"approved": 1, "reject_reason": ""},
+            {"approved": 0, "reject_reason": "cooldown"},
+            {"approved": 0, "reject_reason": "cooldown"},
+        ]
+        trades = [{"pnl": "150.00"}, {"pnl": "-50.00"}]
+
+        with (
+            patch("src.main.query_recent_signals", return_value=signals),
+            patch("src.main.query_recent_trades", return_value=trades),
+        ):
+            await _send_eod_status(dispatcher, db, pipelines, cooldown)
+
+        dispatcher.dispatch_status.assert_awaited_once()
+        msg = dispatcher.dispatch_status.call_args[0][0]
+        assert "Signals: 3" in msg
+        assert "approved: 1" in msg
+        assert "rejected: 2" in msg
+        assert "$+100.00" in msg
+        assert "cooldown: 2" in msg
+
+    @pytest.mark.asyncio
+    async def test_orb_count_in_message(self) -> None:
+        """ORB completion count is reported correctly."""
+        dispatcher = AsyncMock()
+        db = MagicMock()
+        cooldown = MagicMock()
+        cooldown.daily_trade_count = 0
+        cooldown.consecutive_losses = 0
+
+        p1 = _make_pipeline(symbol="SPY")
+        p1.levels._orb.is_complete = True
+        p2 = _make_pipeline(symbol="QQQ")
+        p2.levels._orb.is_complete = False
+        pipelines = {"SPY": p1, "QQQ": p2}
+
+        with (
+            patch("src.main.query_recent_signals", return_value=[]),
+            patch("src.main.query_recent_trades", return_value=[]),
+        ):
+            await _send_eod_status(dispatcher, db, pipelines, cooldown)
+
+        msg = dispatcher.dispatch_status.call_args[0][0]
+        assert "ORB formed: 1/2" in msg
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# _scheduler — ORB check at 9:50 ET
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TestSchedulerOrbCheck:
+    """Tests for the ORB formation watchdog at 9:50 ET."""
+
+    @pytest.mark.asyncio
+    async def test_orb_check_no_orbs_sends_risk_warning(self) -> None:
+        """At 9:51 ET with zero ORBs, a risk warning fires."""
+        mock_now = datetime(2024, 1, 15, 9, 51, tzinfo=_ET)
+
+        pipeline = _make_pipeline(symbol="SPY")
+        pipeline.levels = MagicMock()
+        pipeline.levels._orb.is_complete = False
+        pipelines = {"SPY": pipeline}
+        cooldown = MagicMock()
+        dispatcher = AsyncMock()
+
+        sleep_calls = 0
+
+        async def _fake_sleep(_sec: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                raise asyncio.CancelledError
+
+        with (
+            patch("src.main.asyncio.sleep", side_effect=_fake_sleep),
+            patch("src.main.datetime") as mock_dt,
+        ):
+            mock_dt.now.return_value = mock_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            with suppress(asyncio.CancelledError):
+                await _scheduler(pipelines, cooldown, dispatcher, _make_db())
+
+        dispatcher.dispatch_risk_warning.assert_called_once()
+        msg = dispatcher.dispatch_risk_warning.call_args[0][0]
+        assert "No ORB ranges formed" in msg
+
+    @pytest.mark.asyncio
+    async def test_orb_check_partial_sends_status(self) -> None:
+        """At 9:51 ET with < half ORBs, a status warning fires."""
+        mock_now = datetime(2024, 1, 15, 9, 51, tzinfo=_ET)
+
+        # 1 out of 4 complete → 1 < 4 // 2 (=2) → triggers partial warning
+        p1 = _make_pipeline(symbol="SPY")
+        p1.levels = MagicMock()
+        p1.levels._orb.is_complete = True
+        p2 = _make_pipeline(symbol="QQQ")
+        p2.levels = MagicMock()
+        p2.levels._orb.is_complete = False
+        p3 = _make_pipeline(symbol="AAPL")
+        p3.levels = MagicMock()
+        p3.levels._orb.is_complete = False
+        p4 = _make_pipeline(symbol="MSFT")
+        p4.levels = MagicMock()
+        p4.levels._orb.is_complete = False
+        pipelines = {"SPY": p1, "QQQ": p2, "AAPL": p3, "MSFT": p4}
+        cooldown = MagicMock()
+        dispatcher = AsyncMock()
+
+        sleep_calls = 0
+
+        async def _fake_sleep(_sec: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                raise asyncio.CancelledError
+
+        with (
+            patch("src.main.asyncio.sleep", side_effect=_fake_sleep),
+            patch("src.main.datetime") as mock_dt,
+        ):
+            mock_dt.now.return_value = mock_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            with suppress(asyncio.CancelledError):
+                await _scheduler(pipelines, cooldown, dispatcher, _make_db())
+
+        dispatcher.dispatch_status.assert_called()
+        # Find the ORB-related call
+        orb_calls = [
+            c for c in dispatcher.dispatch_status.call_args_list if "ORB ranges formed" in str(c)
+        ]
+        assert len(orb_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_orb_check_all_complete_no_alert(self) -> None:
+        """At 9:51 ET with all ORBs complete, no alert fires."""
+        mock_now = datetime(2024, 1, 15, 9, 51, tzinfo=_ET)
+
+        pipeline = _make_pipeline(symbol="SPY")
+        pipeline.levels = MagicMock()
+        pipeline.levels._orb.is_complete = True
+        pipelines = {"SPY": pipeline}
+        cooldown = MagicMock()
+        dispatcher = AsyncMock()
+
+        sleep_calls = 0
+
+        async def _fake_sleep(_sec: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                raise asyncio.CancelledError
+
+        with (
+            patch("src.main.asyncio.sleep", side_effect=_fake_sleep),
+            patch("src.main.datetime") as mock_dt,
+        ):
+            mock_dt.now.return_value = mock_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            with suppress(asyncio.CancelledError):
+                await _scheduler(pipelines, cooldown, dispatcher, _make_db())
+
+        dispatcher.dispatch_risk_warning.assert_not_called()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# _scheduler — EOD status called after daily summary
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TestSchedulerEodStatus:
+    """Tests that _send_eod_status is called during EOD summary."""
+
+    @pytest.mark.asyncio
+    async def test_eod_status_called_at_summary_time(self) -> None:
+        """At 16:06 ET, both dispatch_daily_summary and _send_eod_status fire."""
+        mock_now = datetime(2024, 1, 15, 16, 6, tzinfo=_ET)
+
+        pipeline = _make_pipeline(symbol="SPY")
+        pipeline.levels = MagicMock()
+        pipelines = {"SPY": pipeline}
+        cooldown = MagicMock()
+        cooldown.daily_trade_count = 0
+        cooldown.consecutive_losses = 0
+        dispatcher = AsyncMock()
+        db = _make_db()
+
+        sleep_calls = 0
+
+        async def _fake_sleep(_sec: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                raise asyncio.CancelledError
+
+        with (
+            patch("src.main.asyncio.sleep", side_effect=_fake_sleep),
+            patch("src.main.datetime") as mock_dt,
+            patch("src.main.query_recent_trades", return_value=[]),
+            patch("src.main.query_recent_signals", return_value=[]),
+        ):
+            mock_dt.now.return_value = mock_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            with suppress(asyncio.CancelledError):
+                await _scheduler(pipelines, cooldown, dispatcher, db)
+
+        dispatcher.dispatch_daily_summary.assert_called_once()
+        # _send_eod_status calls dispatch_status
+        dispatcher.dispatch_status.assert_called()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Regime warmup tracking
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TestRegimeWarmupTracking:
+    """Tests for _regime_warmup_bar_counts and _regime_first_populated."""
+
+    @pytest.mark.asyncio
+    async def test_bar_count_increments(self) -> None:
+        """Each call to _process_bar increments the per-symbol bar count."""
+        # Clear module-level state
+        _regime_warmup_bar_counts.clear()
+        _regime_first_populated.clear()
+
+        pipeline = _make_pipeline(atr=Decimal("2.5"), ema9=Decimal("485"), ema20=Decimal("480"))
+        bar = make_bar(symbol="TEST_WU")
+        await _process_bar(bar, pipeline, _make_risk(), _make_dispatcher(), _make_db())
+
+        assert _regime_warmup_bar_counts.get("TEST_WU") == 1
+
+        await _process_bar(bar, pipeline, _make_risk(), _make_dispatcher(), _make_db())
+        assert _regime_warmup_bar_counts.get("TEST_WU") == 2
+
+    @pytest.mark.asyncio
+    async def test_regime_first_populated_logged(self) -> None:
+        """When regime gets vix + adx, symbol is added to _regime_first_populated."""
+        _regime_warmup_bar_counts.clear()
+        _regime_first_populated.clear()
+
+        pipeline = _make_pipeline(atr=Decimal("2.5"), ema9=Decimal("485"), ema20=Decimal("480"))
+        pipeline.regime.vix_level = Decimal("20")
+        pipeline.regime.adx_value = Decimal("25")
+        pipeline.regime.current_regime = "TRENDING_UP"
+
+        bar = make_bar(symbol="TEST_FP")
+        await _process_bar(bar, pipeline, _make_risk(), _make_dispatcher(), _make_db())
+
+        assert "TEST_FP" in _regime_first_populated

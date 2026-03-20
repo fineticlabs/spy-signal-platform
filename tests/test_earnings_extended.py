@@ -204,3 +204,36 @@ class TestPrefetchEarningsCache:
         assert len(saved) == 1
         assert "GOOG" in saved[0]
         assert "META" in saved[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ETF exclusion list
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestEtfExclusion:
+    """ETF symbols should skip yfinance fetch and never be in blackout."""
+
+    def test_fetch_earnings_returns_empty_for_etf(self, mock_yf: MagicMock) -> None:
+        """_fetch_earnings_dates returns [] for ETF symbols without calling yfinance."""
+        from src.filters.earnings_calendar import _fetch_earnings_dates
+
+        result = _fetch_earnings_dates("SPY")
+        assert result == []
+        mock_yf.Ticker.assert_not_called()
+
+    def test_is_earnings_blackout_false_for_etf(self) -> None:
+        """is_earnings_blackout returns False for ETF symbols."""
+        from src.filters.earnings_calendar import is_earnings_blackout
+
+        assert is_earnings_blackout("SPY", date(2024, 1, 15)) is False
+        assert is_earnings_blackout("QQQ", date(2024, 1, 15)) is False
+        assert is_earnings_blackout("TQQQ", date(2024, 1, 15)) is False
+        assert is_earnings_blackout("SOXL", date(2024, 1, 15)) is False
+
+    def test_etf_symbols_frozenset_contains_expected(self) -> None:
+        """The _ETF_SYMBOLS set contains the expected tickers."""
+        from src.filters.earnings_calendar import _ETF_SYMBOLS
+
+        for sym in ("SPY", "QQQ", "TQQQ", "SOXL", "DIA", "IWM", "XLF", "XLE", "XLK"):
+            assert sym in _ETF_SYMBOLS
