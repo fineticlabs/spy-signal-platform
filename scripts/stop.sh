@@ -19,7 +19,7 @@ fi
 echo "Sending SIGTERM to scanner (PID $PID)..."
 kill "$PID"
 
-for i in $(seq 1 10); do
+for i in $(seq 1 15); do
     if ! kill -0 "$PID" 2>/dev/null; then
         echo "Scanner stopped gracefully after ${i}s."
         rm -f "$PID_FILE"

@@ -397,6 +397,8 @@ async def _send_eod_status(
     db: BarDatabase,
     pipelines: dict[str, _SymbolPipeline],
     cooldown: CooldownTracker,
+    *,
+    skip_rest_fetch: bool = False,
 ) -> None:
     """Send detailed end-of-day status via Telegram."""
     if db.conn is None:  # pragma: no cover — only when DB never connected
@@ -452,8 +454,19 @@ async def _send_eod_status(
         else:
             lines += ["", "⚠️ No signals today — no breakout conditions met."]
 
-    # Signal quality analysis
-    outcomes = _evaluate_signal_outcomes(db, pipelines)
+    # Signal quality analysis — wrapped in try/except so a slow REST fetch
+    # or DB error doesn't prevent the rest of the EOD report from sending.
+    try:
+        outcomes = _evaluate_signal_outcomes(db, pipelines, skip_rest_fetch=skip_rest_fetch)
+    except Exception as exc:  # pragma: no cover — DB or REST failure during analysis
+        logger.warning("signal_analysis_failed", error=str(exc))
+        outcomes = None
+
+    if outcomes is None:  # pragma: no cover — only when analysis fails
+        lines += ["", "📈 Signal Quality", "Analysis failed (see logs)"]
+        await dispatcher.dispatch_status("\n".join(lines))
+        return
+
     n_winners = len(outcomes["winners"])
     n_losers = len(outcomes["losers"])
     n_open = len(outcomes["open"])
@@ -461,22 +474,28 @@ async def _send_eod_status(
     n_evaluated = n_winners + n_losers + n_open + n_no_data
 
     if n_evaluated > 0:
-        theoretical_pnl = sum(
-            float(s["theoretical_pnl"])
-            for s in outcomes["winners"] + outcomes["losers"] + outcomes["open"]
-        )
-        win_rate = n_winners / (n_winners + n_losers) * 100 if (n_winners + n_losers) > 0 else 0
+        all_evaluated = outcomes["winners"] + outcomes["losers"] + outcomes["open"]
+        theoretical_pnl = sum(float(s["theoretical_pnl"]) for s in all_evaluated)
+        decided = n_winners + n_losers
+        win_rate = n_winners / decided * 100 if decided > 0 else 0
+
+        # Direction breakdown
+        n_long = sum(1 for s in all_evaluated if s.get("direction") == "LONG")
+        n_short = sum(1 for s in all_evaluated if s.get("direction") == "SHORT")
 
         lines += [
             "",
             "📈 Signal Quality",
-            f"Win rate: {win_rate:.0f}% ({n_winners}/{n_winners + n_losers})",
+            f"Win rate: {win_rate:.0f}% ({n_winners}/{decided})",
             f"Theoretical P&L: ${theoretical_pnl:+.2f}",
+            f"Direction: LONG {n_long} | SHORT {n_short}",
         ]
         if n_open > 0:
             lines.append(f"Still open at close: {n_open}")
         if n_no_data > 0:
             lines.append(f"No data: {n_no_data} (cache empty after restart)")
+        if win_rate == 0 and decided >= 5:
+            lines.append("⚠️ All signals lost — review strategy conditions for this session")
 
     # Execution comparison
     executed = len(trades)
@@ -500,6 +519,8 @@ async def _send_eod_status(
 def _evaluate_signal_outcomes(
     db: BarDatabase,
     pipelines: dict[str, _SymbolPipeline],
+    *,
+    skip_rest_fetch: bool = False,
 ) -> dict[str, list[dict[str, object]]]:
     """Evaluate today's approved signals against cached bar data.
 
@@ -548,8 +569,9 @@ def _evaluate_signal_outcomes(
 
         bars_after = [b for b in pipeline.bar_cache if b.timestamp.isoformat() > signal_ts]
 
-        # If cache is empty (e.g. after restart), try REST fetch
-        if not bars_after:
+        # If cache is empty (e.g. after restart), try REST fetch —
+        # but skip during shutdown to avoid blocking the event loop.
+        if not bars_after and not skip_rest_fetch:
             bars_after = _fetch_bars_for_signal(symbol, signal_ts)
 
         # If still no bars, mark as no_data instead of misleading "open"
@@ -809,6 +831,8 @@ async def _scheduler(
                 logger.error("eod_summary_failed", error=str(exc))
             try:  # pragma: no cover — fires at 16:05 ET during live session
                 await _send_eod_status(dispatcher, db, pipelines, risk_cooldown)
+                global _eod_sent_today
+                _eod_sent_today = True
             except Exception as exc:  # pragma: no cover — defensive catch for DB/Telegram errors
                 logger.error("eod_status_failed", error=str(exc))
             last_eod_date = now_et
@@ -936,16 +960,39 @@ async def _notify_readiness(
 # ── graceful shutdown ──────────────────────────────────────────────────────────
 
 
+_shutdown_event: asyncio.Event | None = None
+_eod_sent_today: bool = False
+
+
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
-    """Register SIGINT / SIGTERM to cancel all running tasks."""
+    """Register SIGINT / SIGTERM to set the shutdown event.
+
+    Instead of cancelling all tasks (which cancels the ``run()`` task itself
+    and prevents its ``finally`` block from executing), we set an event that
+    a watcher task inside the TaskGroup picks up.  The watcher then cancels
+    only the sibling tasks, allowing the TaskGroup to exit normally so the
+    ``finally`` block runs.
+    """
+    global _shutdown_event
+    _shutdown_event = asyncio.Event()
 
     def _handle(sig: int) -> None:
         logger.info("shutdown_signal_received", signal=sig)
-        for task in asyncio.all_tasks(loop):
-            task.cancel()
+        if _shutdown_event is not None:
+            _shutdown_event.set()
 
     for sig in (_signal.SIGINT, _signal.SIGTERM):
         loop.add_signal_handler(sig, _handle, sig)
+
+
+async def _shutdown_watcher(tg_tasks: list[asyncio.Task[None]]) -> None:
+    """Wait for the shutdown event, then cancel all sibling tasks."""
+    if _shutdown_event is None:
+        return  # pragma: no cover — only if signal handlers not installed
+    await _shutdown_event.wait()
+    logger.info("shutdown_watcher_triggered")
+    for task in tg_tasks:
+        task.cancel()
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
@@ -1040,20 +1087,25 @@ async def run() -> None:
 
     try:
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(_start_api(), name="api_server")
-            tg.create_task(stream.start(), name="websocket_stream")
-            tg.create_task(
-                _bar_loop(queue, pipelines, risk, dispatcher, db, executor=executor),
-                name="bar_loop",
-            )
-            tg.create_task(
-                _scheduler(pipelines, cooldown, dispatcher, db, executor=executor, stream=stream),
-                name="scheduler",
-            )
-            tg.create_task(
-                _notify_readiness(stream, dispatcher, len(symbols)),
-                name="readiness_monitor",
-            )
+            tasks: list[asyncio.Task[None]] = [
+                tg.create_task(_start_api(), name="api_server"),
+                tg.create_task(stream.start(), name="websocket_stream"),
+                tg.create_task(
+                    _bar_loop(queue, pipelines, risk, dispatcher, db, executor=executor),
+                    name="bar_loop",
+                ),
+                tg.create_task(
+                    _scheduler(
+                        pipelines, cooldown, dispatcher, db, executor=executor, stream=stream
+                    ),
+                    name="scheduler",
+                ),
+                tg.create_task(
+                    _notify_readiness(stream, dispatcher, len(symbols)),
+                    name="readiness_monitor",
+                ),
+            ]
+            tg.create_task(_shutdown_watcher(tasks), name="shutdown_watcher")
     except* (
         asyncio.CancelledError
     ):  # pragma: no cover — coverage.py cannot trace except* (ExceptionGroup syntax)
@@ -1062,11 +1114,20 @@ async def run() -> None:
         for exc in eg.exceptions:
             logger.error("platform_error", error=str(exc))
     finally:
+        logger.info("finally_block_entered")
         await stream.stop()
-        try:
-            await _send_eod_status(dispatcher, db, pipelines, cooldown)
-        except Exception as exc:
-            logger.error("eod_summary_failed_on_shutdown", error=str(exc))
+        if not _eod_sent_today:  # pragma: no cover — shutdown-only path
+            try:
+                await asyncio.wait_for(
+                    _send_eod_status(dispatcher, db, pipelines, cooldown, skip_rest_fetch=True),
+                    timeout=10.0,
+                )
+            except TimeoutError:
+                logger.error("eod_summary_timed_out_on_shutdown")
+            except Exception as exc:
+                logger.error("eod_summary_failed_on_shutdown", error=str(exc))
+        else:  # pragma: no cover — only when 16:05 ET EOD already fired
+            logger.info("eod_skipped_on_shutdown", reason="already sent at 16:05 ET")
         with contextlib.suppress(Exception):
             await dispatcher.dispatch_status("\U0001f6d1 Scanner stopped gracefully.")
         db.close()

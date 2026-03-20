@@ -481,6 +481,38 @@ class TestEodStatusIncludesSignalQuality:
         assert "No data: 2" in msg
         assert "cache empty after restart" in msg
 
+    @pytest.mark.asyncio
+    async def test_eod_all_losers_warning(self) -> None:
+        """5+ losers at 0% WR shows strategy review warning."""
+        dispatcher = AsyncMock()
+        db = MagicMock()
+        cooldown = MagicMock()
+
+        pipeline = MagicMock()
+        pipeline.levels._orb.is_complete = True
+        pipelines = {"SPY": pipeline}
+
+        signals = [{"approved": 1, "reject_reason": ""} for _ in range(5)]
+        losers = [{"theoretical_pnl": -100.0, "direction": "SHORT"} for _ in range(5)]
+
+        outcomes = {
+            "winners": [],
+            "losers": losers,
+            "open": [],
+            "no_data": [],
+        }
+
+        with (
+            patch("src.main.query_recent_signals", return_value=signals),
+            patch("src.main.query_recent_trades", return_value=[]),
+            patch("src.main._evaluate_signal_outcomes", return_value=outcomes),
+        ):
+            await _send_eod_status(dispatcher, db, pipelines, cooldown)
+
+        msg = dispatcher.dispatch_status.call_args[0][0]
+        assert "All signals lost" in msg
+        assert "Direction: LONG 0 | SHORT 5" in msg
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Bar cache trimming

@@ -553,18 +553,41 @@ class TestInstallSignalHandlers:
         registered_signals = {call.args[0] for call in mock_loop.add_signal_handler.call_args_list}
         assert registered_signals == {_signal.SIGINT, _signal.SIGTERM}
 
-    def test_handler_cancels_tasks(self) -> None:
-        """The registered handler cancels all running tasks."""
+    def test_handler_sets_shutdown_event(self) -> None:
+        """The registered handler sets the shutdown event."""
+
         mock_loop = MagicMock()
         _install_signal_handlers(mock_loop)
+
+        from src.main import _shutdown_event as event
+
+        assert event is not None
+        assert not event.is_set()
 
         # Extract the handler function from the first call
         handler_fn = mock_loop.add_signal_handler.call_args_list[0].args[1]
         sig_value = mock_loop.add_signal_handler.call_args_list[0].args[2]
+        handler_fn(sig_value)
+
+        assert event.is_set()
+
+
+class TestShutdownWatcher:
+    """Tests for _shutdown_watcher — cancels sibling tasks on shutdown event."""
+
+    @pytest.mark.asyncio
+    async def test_cancels_tasks_when_event_set(self) -> None:
+        import src.main as main_mod
+        from src.main import _shutdown_watcher
+
+        event = asyncio.Event()
+        main_mod._shutdown_event = event
 
         mock_task = MagicMock()
-        with patch("asyncio.all_tasks", return_value={mock_task}):
-            handler_fn(sig_value)
+
+        # Set event immediately so watcher doesn't block
+        event.set()
+        await _shutdown_watcher([mock_task])
 
         mock_task.cancel.assert_called_once()
 
