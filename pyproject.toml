@@ -104,6 +104,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["ANN", "S101"]
 "scripts/**/*.py" = ["ANN", "S603", "S607"]
+# One-time startup poll — not a hot loop, Event not feasible (different object)
+"src/main.py" = ["ASYNC110"]
 
 [tool.ruff.format]
 quote-style = "double"

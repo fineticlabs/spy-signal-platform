@@ -88,10 +88,13 @@ class AlpacaExecutor:
     ) -> Order | None:
         """Submit a bracket order (market entry + stop-loss + take-profit).
 
+        Position size is capped to 50% of available buying power.  Stop and
+        target prices are rounded to 2 decimal places for Alpaca compliance.
+
         Args:
             symbol:       Ticker symbol (e.g. ``"SPY"``).
             direction:    ``Direction.LONG`` or ``Direction.SHORT``.
-            qty:          Number of shares.
+            qty:          Number of shares (from risk sizer, before BP cap).
             stop_price:   Stop-loss price.
             target_price: Take-profit limit price.
 
@@ -104,13 +107,19 @@ class AlpacaExecutor:
             logger.warning("order_rejected_market_closed", symbol=symbol)
             return None
 
-        if not self._check_buying_power(qty, stop_price):
-            logger.warning("order_rejected_buying_power", symbol=symbol, qty=qty)
-            return None
-
         if self._paper and not self._assert_paper_account():
             logger.error("order_rejected_not_paper", symbol=symbol)
             return None
+
+        # ── cap position to 50% of buying power ──────────────────────────
+        qty = self._cap_to_buying_power(symbol, qty, stop_price)
+        if qty < 1:
+            logger.warning("order_skipped_insufficient_size", symbol=symbol)
+            return None
+
+        # ── round prices to 2 decimals for Alpaca compliance ─────────────
+        rounded_stop = round(float(stop_price), 2)
+        rounded_target = round(float(target_price), 2)
 
         # ── build bracket order ───────────────────────────────────────────
         side = OrderSide.BUY if direction == Direction.LONG else OrderSide.SELL
@@ -120,8 +129,8 @@ class AlpacaExecutor:
             side=side,
             time_in_force=TimeInForce.DAY,
             order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=float(target_price)),
-            stop_loss=StopLossRequest(stop_price=float(stop_price)),
+            take_profit=TakeProfitRequest(limit_price=rounded_target),
+            stop_loss=StopLossRequest(stop_price=rounded_stop),
         )
 
         try:
@@ -224,23 +233,56 @@ class AlpacaExecutor:
         now_et = self._now_et_time()
         return _MARKET_OPEN <= now_et < _MARKET_CLOSE
 
-    def _check_buying_power(self, qty: int, reference_price: Decimal) -> bool:
-        """Return ``True`` if account has enough buying power for the order."""
+    def _cap_to_buying_power(self, symbol: str, qty: int, entry_price: Decimal) -> int:
+        """Cap position size to 50% of available buying power.
+
+        This ensures no single trade consumes all buying power, leaving room
+        for concurrent positions.  Returns 0 if buying power is insufficient
+        for even 1 share.
+
+        Args:
+            symbol:      Ticker symbol (for logging).
+            qty:         Desired quantity from risk sizer.
+            entry_price: Approximate entry price for position value calc.
+
+        Returns:
+            Adjusted quantity (may be less than *qty*), or 0 if infeasible.
+        """
         try:
             account = self._client.get_account()
             buying_power = Decimal(str(account.buying_power))
-            required = Decimal(str(qty)) * reference_price
-            if buying_power < max(required, _MIN_BUYING_POWER):
-                logger.warning(
-                    "insufficient_buying_power",
-                    buying_power=str(buying_power),
-                    required=str(required),
-                )
-                return False
-            return True
         except APIError as exc:
             logger.error("buying_power_check_failed", error=str(exc))
-            return False
+            return 0
+
+        if buying_power < _MIN_BUYING_POWER:
+            logger.warning(
+                "insufficient_buying_power",
+                buying_power=str(buying_power),
+                min_required=str(_MIN_BUYING_POWER),
+            )
+            return 0
+
+        if entry_price <= 0:  # pragma: no cover — defensive guard; prices are always positive
+            return 0
+
+        # Max shares that fit in 50% of buying power
+        half_bp = buying_power / 2
+        max_qty = int(half_bp / entry_price)
+        if qty <= max_qty:
+            return qty
+
+        adjusted = max_qty
+        logger.info(
+            "position_downsized",
+            symbol=symbol,
+            original_qty=qty,
+            max_qty=max_qty,
+            adjusted_qty=adjusted,
+            buying_power=str(buying_power),
+            reason="buying_power_cap",
+        )
+        return adjusted
 
     def _assert_paper_account(self) -> bool:
         """Verify the connected account is a paper account.

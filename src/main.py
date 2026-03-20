@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal as _signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, time
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -75,6 +75,7 @@ from src.storage.queries import (
     insert_signal,
     query_recent_signals,
     query_recent_trades,
+    update_signal_outcome,
 )
 from src.strategies.orb import ORBStrategy
 from src.strategies.regime import RegimeDetector
@@ -99,6 +100,8 @@ _regime_first_populated: set[str] = set()
 
 # ── per-symbol pipeline container ─────────────────────────────────────────────
 
+_BAR_CACHE_MAX = 400  # slightly more than a full day of 390 bars
+
 
 @dataclass
 class _SymbolPipeline:
@@ -109,6 +112,7 @@ class _SymbolPipeline:
     levels: LevelManager
     regime: RegimeDetector
     strategy: ORBStrategy
+    bar_cache: list[Bar] = field(default_factory=list)
 
 
 # ── pipeline wiring ────────────────────────────────────────────────────────────
@@ -254,7 +258,7 @@ async def _backfill_orb_bars(
                     bars=count,
                     orb_complete=pipelines[symbol].levels._orb.is_complete,
                 )
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover — Alpaca REST call failures
                 logger.warning("orb_backfill_failed", symbol=symbol, error=str(exc))
 
     except Exception as exc:  # pragma: no cover — catches Alpaca SDK import/auth failures
@@ -275,6 +279,9 @@ async def _process_bar(
     """Run a single bar through the full pipeline for its symbol."""
     # 1. Indicators
     pipeline.registry.update_all(bar)
+    pipeline.bar_cache.append(bar)
+    if len(pipeline.bar_cache) > _BAR_CACHE_MAX:
+        pipeline.bar_cache = pipeline.bar_cache[-_BAR_CACHE_MAX:]
     indicator_snapshot = pipeline.registry.get_snapshot()
 
     # Track regime warmup progress
@@ -445,7 +452,235 @@ async def _send_eod_status(
         else:
             lines += ["", "⚠️ No signals today — no breakout conditions met."]
 
+    # Signal quality analysis
+    outcomes = _evaluate_signal_outcomes(db, pipelines)
+    n_winners = len(outcomes["winners"])
+    n_losers = len(outcomes["losers"])
+    n_open = len(outcomes["open"])
+    n_no_data = len(outcomes["no_data"])
+    n_evaluated = n_winners + n_losers + n_open + n_no_data
+
+    if n_evaluated > 0:
+        theoretical_pnl = sum(
+            float(s["theoretical_pnl"])
+            for s in outcomes["winners"] + outcomes["losers"] + outcomes["open"]
+        )
+        win_rate = n_winners / (n_winners + n_losers) * 100 if (n_winners + n_losers) > 0 else 0
+
+        lines += [
+            "",
+            "📈 Signal Quality",
+            f"Win rate: {win_rate:.0f}% ({n_winners}/{n_winners + n_losers})",
+            f"Theoretical P&L: ${theoretical_pnl:+.2f}",
+        ]
+        if n_open > 0:
+            lines.append(f"Still open at close: {n_open}")
+        if n_no_data > 0:
+            lines.append(f"No data: {n_no_data} (cache empty after restart)")
+
+    # Execution comparison
+    executed = len(trades)
+    skipped = approved - executed
+    if approved > 0:
+        lines += [
+            "",
+            "💰 Execution",
+            f"Executed: {executed}/{approved} signals",
+        ]
+        if skipped > 0:
+            lines.append(f"Skipped: {skipped}")
+        lines.append(f"Actual P&L: ${total_pnl:+.2f}")
+
     await dispatcher.dispatch_status("\n".join(lines))
+
+
+# ── signal outcome evaluation ──────────────────────────────────────────────────
+
+
+def _evaluate_signal_outcomes(
+    db: BarDatabase,
+    pipelines: dict[str, _SymbolPipeline],
+) -> dict[str, list[dict[str, object]]]:
+    """Evaluate today's approved signals against cached bar data.
+
+    For each approved signal, scan post-signal bars to determine if target
+    or stop was hit first.
+
+    Returns:
+        Dict with keys ``'winners'``, ``'losers'``, ``'open'`` — each a list
+        of signal dicts enriched with ``outcome``, ``theoretical_pnl``, and
+        ``exit_price``.
+    """
+    if db.conn is None:  # pragma: no cover — only when DB never connected
+        return {"winners": [], "losers": [], "open": [], "no_data": []}
+
+    since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    signals = query_recent_signals(db.conn, since=since, limit=1000)
+    approved_signals = [s for s in signals if s.get("approved") == 1]
+
+    results: dict[str, list[dict[str, object]]] = {
+        "winners": [],
+        "losers": [],
+        "open": [],
+        "no_data": [],
+    }
+
+    for sig in approved_signals:
+        symbol = str(sig.get("symbol", "SPY"))
+        direction = str(sig.get("direction", ""))
+        entry = float(sig.get("entry_price", 0))
+        stop = float(sig.get("stop_price", 0))
+        target = float(sig.get("target_price", 0))
+        position_size = int(sig.get("position_size", 0))
+        signal_ts = str(sig.get("timestamp", ""))
+        signal_id = int(sig.get("id", 0))
+
+        if entry <= 0 or stop <= 0 or target <= 0:
+            continue
+
+        # Get cached bars for this symbol after signal time
+        pipeline = pipelines.get(symbol)
+        if pipeline is None:
+            # Try first pipeline as default (signals table might not have symbol)
+            pipeline = next(iter(pipelines.values()), None)
+        if pipeline is None:
+            continue
+
+        bars_after = [b for b in pipeline.bar_cache if b.timestamp.isoformat() > signal_ts]
+
+        # If cache is empty (e.g. after restart), try REST fetch
+        if not bars_after:
+            bars_after = _fetch_bars_for_signal(symbol, signal_ts)
+
+        # If still no bars, mark as no_data instead of misleading "open"
+        if not bars_after:
+            no_data_result: dict[str, object] = {
+                **sig,
+                "outcome": "no_data",
+                "theoretical_pnl": 0.0,
+                "exit_price": entry,
+            }
+            results["no_data"].append(no_data_result)
+            if signal_id > 0:
+                with contextlib.suppress(Exception):
+                    update_signal_outcome(db.conn, signal_id, "no_data")
+            continue
+
+        outcome = "open"
+        exit_price = entry  # default if still open
+
+        for bar in bars_after:
+            bar_high = float(bar.high)
+            bar_low = float(bar.low)
+
+            if direction == "LONG":
+                if bar_high >= target:
+                    outcome = "winner"
+                    exit_price = target
+                    break
+                if bar_low <= stop:
+                    outcome = "loser"
+                    exit_price = stop
+                    break
+            elif direction == "SHORT":
+                if bar_low <= target:
+                    outcome = "winner"
+                    exit_price = target
+                    break
+                if bar_high >= stop:
+                    outcome = "loser"
+                    exit_price = stop
+                    break
+
+        # Calculate P&L
+        if direction == "LONG":
+            pnl = (exit_price - entry) * position_size
+        else:
+            pnl = (entry - exit_price) * position_size
+
+        sig_result: dict[str, object] = {
+            **sig,
+            "outcome": outcome,
+            "theoretical_pnl": round(pnl, 2),
+            "exit_price": exit_price,
+        }
+        # Map singular outcome to plural dict key
+        bucket = {"winner": "winners", "loser": "losers", "open": "open"}[outcome]
+        results[bucket].append(sig_result)
+
+        # Update DB
+        if signal_id > 0:
+            with contextlib.suppress(Exception):
+                update_signal_outcome(db.conn, signal_id, outcome)
+
+    return results
+
+
+def _fetch_bars_for_signal(
+    symbol: str, signal_ts: str
+) -> list[Bar]:  # pragma: no cover — Alpaca REST
+    """Fetch post-signal bars from Alpaca REST API as a cache-miss fallback.
+
+    Used when the bar cache is empty (e.g. after a restart) so signal
+    outcomes can still be evaluated.  Returns an empty list on failure.
+    """
+    try:
+        settings = get_alpaca_settings()
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame as AlpacaTimeFrame
+
+        client = StockHistoricalDataClient(
+            api_key=settings.api_key,
+            secret_key=settings.secret_key,
+        )
+
+        start = datetime.fromisoformat(signal_ts)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=AlpacaTimeFrame.Minute,
+            start=start,
+            end=datetime.now(UTC),
+            feed=_FEED_MAP.get(settings.feed, DataFeed.IEX),
+        )
+
+        response = client.get_stock_bars(request)
+        raw_bars = (
+            response.data.get(symbol, []) if hasattr(response, "data") else response.get(symbol, [])
+        )
+
+        bars: list[Bar] = []
+        for raw in raw_bars:
+            if any(getattr(raw, f) <= 0 for f in ("open", "high", "low", "close")):
+                continue
+            ts = raw.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+            bars.append(
+                Bar(
+                    symbol=symbol,
+                    timeframe=TimeFrame.ONE_MIN,
+                    timestamp=ts,
+                    open=Decimal(str(raw.open)),
+                    high=Decimal(str(raw.high)),
+                    low=Decimal(str(raw.low)),
+                    close=Decimal(str(raw.close)),
+                    volume=int(raw.volume),
+                    vwap=Decimal(str(raw.vwap))
+                    if raw.vwap is not None
+                    else Decimal(str(raw.close)),
+                )
+            )
+
+        logger.info("signal_bars_fetched", symbol=symbol, bars=len(bars))
+        return bars
+
+    except Exception as exc:  # pragma: no cover — Alpaca REST failure
+        logger.warning("signal_bars_fetch_failed", symbol=symbol, error=str(exc))
+        return []
 
 
 # ── bar ingestion loop ─────────────────────────────────────────────────────────
@@ -521,8 +756,8 @@ async def _scheduler(
                 pipeline.levels._last_date = None
             last_reset_date = now_et
 
-        # ── ORB formation watchdog at 9:50 ET ────────────────────────────────
-        if now_et.time() >= _ORB_CHECK_ET and (
+        # ── ORB formation watchdog at 9:50 ET (market hours only) ─────────────
+        if _ORB_CHECK_ET <= now_et.time() <= time(16, 0) and (
             last_orb_check_date is None or last_orb_check_date.date() < today
         ):
             orb_count = sum(1 for p in pipelines.values() if p.levels._orb.is_complete)

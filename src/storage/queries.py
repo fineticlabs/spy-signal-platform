@@ -8,6 +8,7 @@ Schema (created here alongside the existing bars table):
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -73,6 +74,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(_CREATE_TRADES_TABLE)
         conn.execute(_CREATE_SIGNALS_INDEX)
         conn.execute(_CREATE_TRADES_INDEX)
+
+    # Migrate: add outcome column if it doesn't exist
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE signals ADD COLUMN outcome TEXT DEFAULT NULL")
+
+    # Migrate: add symbol column if it doesn't exist
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE signals ADD COLUMN symbol TEXT DEFAULT 'SPY'")
+
     logger.debug("signal_trade_schema_ensured")
 
 
@@ -91,8 +101,8 @@ def insert_signal(
             INSERT INTO signals
                 (timestamp, strategy_name, direction, entry_price, stop_price,
                  target_price, risk_reward, confidence, reason, timeframe, regime,
-                 vix, adx, approved, position_size, reject_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 vix, adx, approved, position_size, reject_reason, symbol)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.timestamp.astimezone(UTC).isoformat(),
@@ -111,6 +121,7 @@ def insert_signal(
                 1 if decision.approved else 0,
                 decision.position_size,
                 decision.reason,
+                signal.symbol,
             ),
         )
     row_id: int = cursor.lastrowid or 0
@@ -181,3 +192,15 @@ def query_recent_trades(
         (since.astimezone(UTC).isoformat(), limit),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def update_signal_outcome(conn: sqlite3.Connection, signal_id: int, outcome: str) -> None:
+    """Update the outcome for a signal.
+
+    Args:
+        conn: Active SQLite connection.
+        signal_id: Primary key of the signal row.
+        outcome: One of ``'winner'``, ``'loser'``, ``'open'``, ``'skipped'``.
+    """
+    with conn:
+        conn.execute("UPDATE signals SET outcome = ? WHERE id = ?", (outcome, signal_id))

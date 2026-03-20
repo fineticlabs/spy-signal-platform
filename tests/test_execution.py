@@ -165,7 +165,7 @@ class TestSubmitBracketOrder:
 
         with (
             patch.object(executor, "_check_market_hours", return_value=True),
-            patch.object(executor, "_check_buying_power", return_value=True),
+            patch.object(executor, "_cap_to_buying_power", return_value=100),
         ):
             order = executor.submit_bracket_order(
                 symbol="SPY",
@@ -313,27 +313,32 @@ class TestSafetyChecks:
         with patch.object(executor, "_now_et_time", return_value=time(16, 1)):
             assert executor._check_market_hours() is False
 
-    def test_buying_power_sufficient(self) -> None:
-        """Buying power check passes with enough funds."""
+    def test_buying_power_sufficient_no_downsize(self) -> None:
+        """When buying power is ample, qty is returned unchanged."""
+        executor = _make_executor()
+        executor._client.get_account.return_value = _mock_account(buying_power="200000")
+
+        # 100 shares * $480 = $48K, half BP = $100K → fits
+        result = executor._cap_to_buying_power("SPY", qty=100, entry_price=Decimal("480.00"))
+        assert result == 100
+
+    def test_buying_power_downsizes_to_half(self) -> None:
+        """When qty exceeds 50% BP, it's capped to half of buying power."""
         executor = _make_executor()
         executor._client.get_account.return_value = _mock_account(buying_power="100000")
 
-        assert executor._check_buying_power(qty=100, reference_price=Decimal("480.00")) is True
+        # 873 shares * $645 = $563K >> $50K (half of $100K) → downsized
+        result = executor._cap_to_buying_power("SPY", qty=873, entry_price=Decimal("645.00"))
+        # max_qty = floor(50000 / 645) = 77
+        assert result == 77
 
-    def test_buying_power_insufficient(self) -> None:
-        """Buying power check fails when funds are too low."""
+    def test_buying_power_below_minimum_returns_zero(self) -> None:
+        """Below _MIN_BUYING_POWER ($1000), returns 0."""
         executor = _make_executor()
         executor._client.get_account.return_value = _mock_account(buying_power="500")
 
-        assert executor._check_buying_power(qty=100, reference_price=Decimal("480.00")) is False
-
-    def test_buying_power_minimum_threshold(self) -> None:
-        """Buying power must meet _MIN_BUYING_POWER even for small orders."""
-        executor = _make_executor()
-        executor._client.get_account.return_value = _mock_account(buying_power="500")
-
-        # Order value is only $50, but min buying power is $1000
-        assert executor._check_buying_power(qty=1, reference_price=Decimal("50.00")) is False
+        result = executor._cap_to_buying_power("SPY", qty=1, entry_price=Decimal("50.00"))
+        assert result == 0
 
     def test_paper_account_assertion_passes(self) -> None:
         """Paper assertion passes for PA-prefixed accounts."""

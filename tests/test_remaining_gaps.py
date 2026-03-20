@@ -733,14 +733,14 @@ class TestAlpacaExecutor:
         t = executor._now_et_time()
         assert t is not None
 
-    def test_check_buying_power_api_error(self) -> None:
+    def test_cap_buying_power_api_error_returns_zero(self) -> None:
         from alpaca.common.exceptions import APIError
 
         executor = self._make_executor()
         executor._client.get_account.side_effect = APIError({"message": "fail"})
 
-        result = executor._check_buying_power(10, Decimal("100.00"))
-        assert result is False
+        result = executor._cap_to_buying_power("SPY", 10, Decimal("100.00"))
+        assert result == 0
 
     def test_assert_paper_account_api_error(self) -> None:
         from alpaca.common.exceptions import APIError
