@@ -412,31 +412,38 @@ async def _send_eod_status(
             reason = str(s.get("reject_reason", "unknown"))
             reasons[reason] = reasons.get(reason, 0) + 1
 
-    # P&L from trades
     total_pnl = sum(float(t.get("pnl", 0)) for t in trades)
-
-    # ORB completions
     orb_count = sum(1 for p in pipelines.values() if p.levels._orb.is_complete)
     total_tickers = len(pipelines)
+    date_str = datetime.now(_ET).strftime("%A, %B %d %Y")
 
-    lines = [f"📋 *End of Day Report — {datetime.now(_ET).strftime('%A %Y-%m-%d')}*", ""]
-
-    if total_signals == 0:
-        lines.append("⚠️ Zero signals generated. Review filters or market conditions.")
-        lines.append("")
-
-    lines.append(f"Signals: {total_signals} (approved: {approved}, rejected: {rejected})")
-    lines.append(f"Trades: {len(trades)} | Net P&L: ${total_pnl:+.2f}")
-    lines.append(f"ORB formed: {orb_count}/{total_tickers} tickers")
-    lines.append(
-        f"Daily trades: {cooldown.daily_trade_count} | Losses: {cooldown.consecutive_losses}"
-    )
+    lines = [
+        "📋 *End of Day Report*",
+        date_str,
+        "",
+        "📊 *Signals*",
+        f"Generated: {total_signals} | Approved: {approved} | Rejected: {rejected}",
+        "",
+        "💰 *Trading*",
+        f"Trades: {len(trades)} | P&L: ${total_pnl:+.2f}",
+        "",
+        "🎯 *ORB Status*",
+        f"Formed: {orb_count}/{total_tickers} tickers",
+    ]
 
     if reasons:
-        lines.append("")
-        lines.append("*Rejection reasons:*")
+        lines += ["", "🔍 *Filter Breakdown*"]
         for reason_text, count in sorted(reasons.items(), key=lambda x: -x[1])[:5]:
             lines.append(f"  {reason_text}: {count}")
+
+    if approved == 0:
+        top_reason = (
+            next(iter(sorted(reasons, key=reasons.get, reverse=True)), None) if reasons else None
+        )  # type: ignore[arg-type]
+        if top_reason:
+            lines += ["", f"⚠️ No trades today — top filter: {top_reason}."]
+        else:
+            lines += ["", "⚠️ No signals today — no breakout conditions met."]
 
     await dispatcher.dispatch_status("\n".join(lines))
 
@@ -525,12 +532,14 @@ async def _scheduler(
             if orb_count == 0:
                 with contextlib.suppress(Exception):
                     await dispatcher.dispatch_risk_warning(
-                        f"🚨 No ORB ranges formed by 9:50 ET ({total} tickers). Check data feed."
+                        f"🚨 *No ORB Ranges*\n"
+                        f"0/{total} tickers formed an ORB by 9:50 ET.\n"
+                        f"Action: Check data feed and websocket."
                     )
             elif orb_count < total // 2:
                 with contextlib.suppress(Exception):
                     await dispatcher.dispatch_status(
-                        f"⚠️ Only {orb_count}/{total} ORB ranges formed by 9:50 ET."
+                        f"⚠️ *Partial ORB*\n" f"{orb_count}/{total} tickers formed ORB by 9:50 ET."
                     )
             last_orb_check_date = now_et
 
@@ -583,7 +592,8 @@ async def _scheduler(
             )
             with contextlib.suppress(Exception):  # pragma: no cover
                 await dispatcher.dispatch_risk_warning(
-                    f"⚠️ No bars received for {int(stream.seconds_since_last_bar)}s — websocket may be down"
+                    f"🚨 *Websocket Stale*\n"
+                    f"No bars received in {int(stream.seconds_since_last_bar)}s during market hours."
                 )
 
 
@@ -660,8 +670,9 @@ async def _notify_readiness(
         )
         with contextlib.suppress(Exception):
             await dispatcher.dispatch_risk_warning(
-                f"🚨 STARTUP FAILED: Websocket did not connect after {_WS_CONNECT_TIMEOUT}s. "
-                "Fix before market open."
+                f"🚨 *STARTUP FAILED*\n"
+                f"Websocket did not connect after {_WS_CONNECT_TIMEOUT}s.\n"
+                f"Action: Check Alpaca keys and network."
             )
         return
 
@@ -669,8 +680,9 @@ async def _notify_readiness(
     logger.info("scanner_ready", symbols=n_symbols)
     with contextlib.suppress(Exception):
         await dispatcher.dispatch_status(
-            f"✅ Scanner ready. Websocket connected. "
-            f"Monitoring {n_symbols} symbols. Waiting for market open at 9:30 ET."
+            f"✅ *Scanner Ready*\n"
+            f"Websocket connected | {n_symbols} symbols\n"
+            f"Waiting for market open at 9:30 ET"
         )
 
     # Wait for first bar — poll until a bar arrives or task is cancelled.
@@ -824,7 +836,7 @@ async def run() -> None:
         except Exception as exc:
             logger.error("eod_summary_failed_on_shutdown", error=str(exc))
         with contextlib.suppress(Exception):
-            await dispatcher.dispatch_status("Scanner stopped.")
+            await dispatcher.dispatch_status("\U0001f6d1 Scanner stopped gracefully.")
         db.close()
         logger.info("platform_stopped")
 

@@ -202,6 +202,4 @@ class TestOrbSurvivesDailyReset:
 
         # No "No ORB ranges formed" risk warning
         for call in dispatcher.dispatch_risk_warning.call_args_list:
-            assert "No ORB ranges formed" not in str(
-                call
-            ), f"False positive ORB alert fired: {call}"
+            assert "No ORB Ranges" not in str(call), f"False positive ORB alert fired: {call}"

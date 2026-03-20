@@ -216,7 +216,7 @@ class TestReadinessNotifications:
         assert dispatcher.dispatch_status.call_count == 2
         first_msg = dispatcher.dispatch_status.call_args_list[0][0][0]
         second_msg = dispatcher.dispatch_status.call_args_list[1][0][0]
-        assert "Scanner ready" in first_msg
+        assert "Scanner Ready" in first_msg
         assert "26 symbols" in first_msg
         assert "System GO" in second_msg
 

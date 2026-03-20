@@ -800,7 +800,7 @@ class TestSendEodStatus:
 
         dispatcher.dispatch_status.assert_awaited_once()
         msg = dispatcher.dispatch_status.call_args[0][0]
-        assert "Zero signals generated" in msg
+        assert "No signals today" in msg or "No trades today" in msg
 
     @pytest.mark.asyncio
     async def test_with_signals_and_trades(self) -> None:
@@ -830,9 +830,9 @@ class TestSendEodStatus:
 
         dispatcher.dispatch_status.assert_awaited_once()
         msg = dispatcher.dispatch_status.call_args[0][0]
-        assert "Signals: 3" in msg
-        assert "approved: 1" in msg
-        assert "rejected: 2" in msg
+        assert "Generated: 3" in msg
+        assert "Approved: 1" in msg
+        assert "Rejected: 2" in msg
         assert "$+100.00" in msg
         assert "cooldown: 2" in msg
 
@@ -858,7 +858,36 @@ class TestSendEodStatus:
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
 
         msg = dispatcher.dispatch_status.call_args[0][0]
-        assert "ORB formed: 1/2" in msg
+        assert "Formed: 1/2" in msg
+
+    @pytest.mark.asyncio
+    async def test_all_rejected_shows_top_filter(self) -> None:
+        """When signals exist but all rejected, message names the top filter."""
+        dispatcher = AsyncMock()
+        db = MagicMock()
+        cooldown = MagicMock()
+        cooldown.daily_trade_count = 0
+        cooldown.consecutive_losses = 0
+
+        pipeline = _make_pipeline(symbol="SPY")
+        pipeline.levels._orb.is_complete = True
+        pipelines = {"SPY": pipeline}
+
+        signals = [
+            {"approved": 0, "reject_reason": "regime_gate"},
+            {"approved": 0, "reject_reason": "regime_gate"},
+            {"approved": 0, "reject_reason": "lunch_chop"},
+        ]
+
+        with (
+            patch("src.main.query_recent_signals", return_value=signals),
+            patch("src.main.query_recent_trades", return_value=[]),
+        ):
+            await _send_eod_status(dispatcher, db, pipelines, cooldown)
+
+        msg = dispatcher.dispatch_status.call_args[0][0]
+        assert "No trades today" in msg
+        assert "regime_gate" in msg
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -900,7 +929,7 @@ class TestSchedulerOrbCheck:
 
         dispatcher.dispatch_risk_warning.assert_called_once()
         msg = dispatcher.dispatch_risk_warning.call_args[0][0]
-        assert "No ORB ranges formed" in msg
+        assert "No ORB Ranges" in msg
 
     @pytest.mark.asyncio
     async def test_orb_check_partial_sends_status(self) -> None:
@@ -944,7 +973,7 @@ class TestSchedulerOrbCheck:
         dispatcher.dispatch_status.assert_called()
         # Find the ORB-related call
         orb_calls = [
-            c for c in dispatcher.dispatch_status.call_args_list if "ORB ranges formed" in str(c)
+            c for c in dispatcher.dispatch_status.call_args_list if "Partial ORB" in str(c)
         ]
         assert len(orb_calls) == 1
 
