@@ -74,13 +74,16 @@ class TelegramAlerter:
         return await self._send(text)
 
     async def send_status(self, message: str) -> bool:
-        """Send a system status notification (not a warning).
+        """Send a system status notification as plain text (no Markdown parsing).
+
+        Status messages use emoji for visual structure and don't need bold/italic.
+        Sending as plain text avoids MarkdownV2 escaping issues with characters
+        like ``|``, ``+``, ``(``, ``)`` that appear in stats.
 
         Returns:
             ``True`` if delivered successfully, ``False`` if all retries failed.
         """
-        text = format_risk_alert(message, header="\u2139\ufe0f *System Status*")
-        return await self._send(text)
+        return await self._send(f"\u2139\ufe0f System Status\n\n{message}", parse_mode=None)
 
     async def send_daily_summary(self, trades: list[TradeResult]) -> bool:
         """Send the end-of-day trade summary.
@@ -93,15 +96,20 @@ class TelegramAlerter:
 
     # ── internal ───────────────────────────────────────────────────────────────
 
-    async def _send(self, text: str) -> bool:
-        """Send *text* with up to ``_MAX_ATTEMPTS`` retries and exponential backoff."""
+    async def _send(self, text: str, parse_mode: str | None = "MarkdownV2") -> bool:
+        """Send *text* with up to ``_MAX_ATTEMPTS`` retries and exponential backoff.
+
+        Args:
+            text:       Message body.
+            parse_mode: Telegram parse mode (``"MarkdownV2"``, ``"HTML"``, or
+                        ``None`` for plain text).  Defaults to MarkdownV2.
+        """
+        kwargs: dict[str, object] = {"chat_id": self._chat_id, "text": text}
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
         for attempt in range(_MAX_ATTEMPTS):
             try:
-                await self._bot.send_message(
-                    chat_id=self._chat_id,
-                    text=text,
-                    parse_mode="MarkdownV2",
-                )
+                await self._bot.send_message(**kwargs)
                 logger.info("telegram_sent", attempt=attempt + 1, length=len(text))
                 return True
             except TelegramError as exc:

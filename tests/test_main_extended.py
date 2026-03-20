@@ -929,7 +929,7 @@ class TestSchedulerOrbCheck:
 
         dispatcher.dispatch_risk_warning.assert_called_once()
         msg = dispatcher.dispatch_risk_warning.call_args[0][0]
-        assert "No ORB Ranges" in msg
+        assert "No ORB ranges formed" in msg
 
     @pytest.mark.asyncio
     async def test_orb_check_partial_sends_status(self) -> None:
@@ -973,7 +973,9 @@ class TestSchedulerOrbCheck:
         dispatcher.dispatch_status.assert_called()
         # Find the ORB-related call
         orb_calls = [
-            c for c in dispatcher.dispatch_status.call_args_list if "Partial ORB" in str(c)
+            c
+            for c in dispatcher.dispatch_status.call_args_list
+            if "Partial ORB" in str(c) or "formed ORB" in str(c)
         ]
         assert len(orb_calls) == 1
 

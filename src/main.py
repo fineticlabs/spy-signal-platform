@@ -418,21 +418,21 @@ async def _send_eod_status(
     date_str = datetime.now(_ET).strftime("%A, %B %d %Y")
 
     lines = [
-        "📋 *End of Day Report*",
+        "📋 End of Day Report",
         date_str,
         "",
-        "📊 *Signals*",
+        "📊 Signals",
         f"Generated: {total_signals} | Approved: {approved} | Rejected: {rejected}",
         "",
-        "💰 *Trading*",
+        "💰 Trading",
         f"Trades: {len(trades)} | P&L: ${total_pnl:+.2f}",
         "",
-        "🎯 *ORB Status*",
+        "🎯 ORB Status",
         f"Formed: {orb_count}/{total_tickers} tickers",
     ]
 
     if reasons:
-        lines += ["", "🔍 *Filter Breakdown*"]
+        lines += ["", "🔍 Filter Breakdown"]
         for reason_text, count in sorted(reasons.items(), key=lambda x: -x[1])[:5]:
             lines.append(f"  {reason_text}: {count}")
 
@@ -532,14 +532,13 @@ async def _scheduler(
             if orb_count == 0:
                 with contextlib.suppress(Exception):
                     await dispatcher.dispatch_risk_warning(
-                        f"🚨 *No ORB Ranges*\n"
-                        f"0/{total} tickers formed an ORB by 9:50 ET.\n"
-                        f"Action: Check data feed and websocket."
+                        f"No ORB ranges formed: 0/{total} tickers by 9:50 ET. "
+                        f"Check data feed and websocket."
                     )
             elif orb_count < total // 2:
                 with contextlib.suppress(Exception):
                     await dispatcher.dispatch_status(
-                        f"⚠️ *Partial ORB*\n" f"{orb_count}/{total} tickers formed ORB by 9:50 ET."
+                        f"⚠️ Partial ORB\n{orb_count}/{total} tickers formed ORB by 9:50 ET."
                     )
             last_orb_check_date = now_et
 
@@ -592,8 +591,7 @@ async def _scheduler(
             )
             with contextlib.suppress(Exception):  # pragma: no cover
                 await dispatcher.dispatch_risk_warning(
-                    f"🚨 *Websocket Stale*\n"
-                    f"No bars received in {int(stream.seconds_since_last_bar)}s during market hours."
+                    f"Websocket stale: no bars received in {int(stream.seconds_since_last_bar)}s during market hours."
                 )
 
 
@@ -670,9 +668,8 @@ async def _notify_readiness(
         )
         with contextlib.suppress(Exception):
             await dispatcher.dispatch_risk_warning(
-                f"🚨 *STARTUP FAILED*\n"
-                f"Websocket did not connect after {_WS_CONNECT_TIMEOUT}s.\n"
-                f"Action: Check Alpaca keys and network."
+                f"STARTUP FAILED: Websocket did not connect after {_WS_CONNECT_TIMEOUT}s. "
+                f"Check Alpaca keys and network."
             )
         return
 
@@ -680,7 +677,7 @@ async def _notify_readiness(
     logger.info("scanner_ready", symbols=n_symbols)
     with contextlib.suppress(Exception):
         await dispatcher.dispatch_status(
-            f"✅ *Scanner Ready*\n"
+            f"✅ Scanner Ready\n"
             f"Websocket connected | {n_symbols} symbols\n"
             f"Waiting for market open at 9:30 ET"
         )
@@ -690,7 +687,7 @@ async def _notify_readiness(
     # every 5s is fine for a one-time startup check.
     try:
         while stream.seconds_since_last_bar is None:
-            await asyncio.sleep(5)  # one-time startup poll, not a hot loop
+            await asyncio.sleep(5)
     except (
         asyncio.CancelledError
     ):  # pragma: no cover — fires when scanner shuts down during startup

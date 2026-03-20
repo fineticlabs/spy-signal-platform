@@ -255,11 +255,13 @@ class TestSendStatus:
     ) -> None:
         result = await alerter.send_status("Scanner ready")
         assert result is True
-        call_text = mock_bot.send_message.call_args.kwargs["text"]
-        assert "System Status" in call_text
-        assert "Scanner ready" in call_text
+        kwargs = mock_bot.send_message.call_args.kwargs
+        assert "System Status" in kwargs["text"]
+        assert "Scanner ready" in kwargs["text"]
         # Must NOT contain "Risk Warning"
-        assert "Risk Warning" not in call_text
+        assert "Risk Warning" not in kwargs["text"]
+        # Status messages sent as plain text (no parse_mode)
+        assert "parse_mode" not in kwargs
 
 
 # ── Rate limiting NOT in TelegramAlerter ────────────────────────────────────
