@@ -392,6 +392,10 @@ async def _send_eod_status(
     cooldown: CooldownTracker,
 ) -> None:
     """Send detailed end-of-day status via Telegram."""
+    if db.conn is None:  # pragma: no cover — only when DB never connected
+        logger.warning("eod_status_skipped", reason="database connection is None")
+        return
+
     since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
     signals = query_recent_signals(db.conn, since=since, limit=1000)
@@ -673,8 +677,8 @@ async def _notify_readiness(
     # We can't use an Event because _on_bar is in a different object; polling
     # every 5s is fine for a one-time startup check.
     try:
-        while stream.seconds_since_last_bar is None:  # — one-time startup poll
-            await asyncio.sleep(5)
+        while stream.seconds_since_last_bar is None:
+            await asyncio.sleep(5)  # one-time startup poll, not a hot loop
     except (
         asyncio.CancelledError
     ):  # pragma: no cover — fires when scanner shuts down during startup
@@ -815,6 +819,10 @@ async def run() -> None:
             logger.error("platform_error", error=str(exc))
     finally:
         await stream.stop()
+        try:
+            await _send_eod_status(dispatcher, db, pipelines, cooldown)
+        except Exception as exc:
+            logger.error("eod_summary_failed_on_shutdown", error=str(exc))
         with contextlib.suppress(Exception):
             await dispatcher.dispatch_status("Scanner stopped.")
         db.close()
