@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +46,7 @@ class AlpacaBarStream:
         self._queue = queue
         self._timeframe = timeframe
         self._client: StockDataStream | None = None
+        self._last_bar_time: datetime | None = None
 
     async def _on_bar(self, bar: AlpacaBar | dict[Any, Any]) -> None:
         """Callback invoked by the Alpaca SDK for every incoming bar."""
@@ -70,6 +71,7 @@ class AlpacaBarStream:
                 vwap=Decimal(str(bar.vwap)) if bar.vwap is not None else Decimal(str(bar.close)),
             )
             await self._queue.put(converted)
+            self._last_bar_time = datetime.now(UTC)
             logger.debug(
                 "bar_received",
                 symbol=bar.symbol,
@@ -78,6 +80,13 @@ class AlpacaBarStream:
             )
         except Exception as exc:
             logger.error("bar_conversion_failed", error=str(exc), raw=repr(bar))
+
+    @property
+    def seconds_since_last_bar(self) -> float | None:
+        """Seconds since the last bar was received, or None if no bars yet."""
+        if self._last_bar_time is None:
+            return None
+        return (datetime.now(UTC) - self._last_bar_time).total_seconds()
 
     async def start(self) -> None:
         """Connect to Alpaca WebSocket and stream bars indefinitely.

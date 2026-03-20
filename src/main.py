@@ -36,6 +36,7 @@ flush pending state and close the DB connection.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal as _signal
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
@@ -44,6 +45,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 import uvicorn
+from alpaca.data.enums import DataFeed
 
 from src.alerts.dispatcher import AlertDispatcher
 from src.alerts.telegram import TelegramAlerter
@@ -62,7 +64,7 @@ from src.indicators.streaming import (
     StreamingMACD,
     StreamingRSI,
 )
-from src.ingestion.websocket import AlpacaBarStream
+from src.ingestion.websocket import _FEED_MAP, AlpacaBarStream
 from src.levels import LevelManager
 from src.models import Bar, TimeFrame, TradeResult
 from src.risk.cooldown import CooldownTracker
@@ -143,6 +145,110 @@ def _build_pipelines(symbols: list[str], db: BarDatabase) -> dict[str, _SymbolPi
         )
         logger.info("pipeline_built", symbol=symbol)
     return pipelines
+
+
+# ── ORB backfill on late start ─────────────────────────────────────────────
+
+
+async def _backfill_orb_bars(
+    pipelines: dict[str, _SymbolPipeline],
+) -> None:
+    """Backfill missed ORB bars from Alpaca REST API on late start.
+
+    If the scanner starts after 9:35 ET, the 5-min ORB window (9:30-9:34)
+    was missed on the websocket.  This fetches those bars via REST and feeds
+    them into each pipeline's level tracker so the ORB can still form.
+
+    Similarly backfills up to 9:45 for the 15-min ORB if needed.
+    """
+    now_et = datetime.now(_ET)
+    session_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+
+    # Only backfill if we're past the ORB window and it's still the same trading day
+    if now_et.time() < time(9, 35) or now_et.time() > time(
+        16, 0
+    ):  # pragma: no cover — tested via mock datetime
+        return
+
+    logger.info(
+        "orb_backfill_check",
+        now_et=now_et.strftime("%H:%M:%S"),
+        msg="Scanner started after ORB window, attempting REST backfill",
+    )
+
+    try:
+        settings = get_alpaca_settings()
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame as AlpacaTimeFrame
+
+        client = StockHistoricalDataClient(
+            api_key=settings.api_key,
+            secret_key=settings.secret_key,
+        )
+
+        # Fetch bars from session open to now (covers both 5-min and 15-min ORB)
+        backfill_end = min(now_et, now_et.replace(hour=9, minute=45, second=0))
+        start_utc = session_open.astimezone(UTC)
+        end_utc = backfill_end.astimezone(UTC)
+
+        symbols = list(pipelines.keys())
+        feed = _FEED_MAP.get(settings.feed, DataFeed.IEX)
+
+        for symbol in symbols:
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=AlpacaTimeFrame.Minute,
+                start=start_utc,
+                end=end_utc,
+                feed=feed,
+            )
+
+            try:
+                response = client.get_stock_bars(request)
+                raw_bars = (
+                    response.data.get(symbol, [])
+                    if hasattr(response, "data")
+                    else response.get(symbol, [])
+                )
+
+                count = 0
+                for raw in raw_bars:
+                    if any(
+                        getattr(raw, f) <= 0 for f in ("open", "high", "low", "close")
+                    ):  # pragma: no cover — Alpaca rarely returns zero-price bars
+                        continue
+                    ts = raw.timestamp
+                    if ts.tzinfo is None:  # pragma: no cover — Alpaca REST always returns tz-aware
+                        ts = ts.replace(tzinfo=UTC)
+                    bar = Bar(
+                        symbol=symbol,
+                        timeframe=TimeFrame.ONE_MIN,
+                        timestamp=ts,
+                        open=Decimal(str(raw.open)),
+                        high=Decimal(str(raw.high)),
+                        low=Decimal(str(raw.low)),
+                        close=Decimal(str(raw.close)),
+                        volume=int(raw.volume),
+                        vwap=Decimal(str(raw.vwap))
+                        if raw.vwap is not None
+                        else Decimal(str(raw.close)),
+                    )
+                    # Feed into levels only (not indicators — those warm up from live bars)
+                    pipelines[symbol].levels.update(bar)
+                    count += 1
+
+                logger.info(
+                    "orb_backfill_complete",
+                    symbol=symbol,
+                    bars=count,
+                    orb_complete=pipelines[symbol].levels._orb.is_complete,
+                )
+            except Exception as exc:
+                logger.warning("orb_backfill_failed", symbol=symbol, error=str(exc))
+
+    except Exception as exc:  # pragma: no cover — catches Alpaca SDK import/auth failures
+        logger.error("orb_backfill_error", error=str(exc))
 
 
 # ── bar processing ─────────────────────────────────────────────────────────────
@@ -278,8 +384,9 @@ async def _scheduler(
     dispatcher: AlertDispatcher,
     db: BarDatabase,
     executor: AlpacaExecutor | None = None,
+    stream: AlpacaBarStream | None = None,
 ) -> None:
-    """Fire periodic events: daily reset, EOD flatten, EOD summary."""
+    """Fire periodic events: daily reset, EOD flatten, EOD summary, websocket watchdog."""
     last_reset_date: datetime | None = None
     last_flatten_date: datetime | None = None
     last_eod_date: datetime | None = None
@@ -337,6 +444,22 @@ async def _scheduler(
             except Exception as exc:
                 logger.error("eod_summary_failed", error=str(exc))
             last_eod_date = now_et
+
+        # ── websocket watchdog: alert if no bars in 90s during market hours ──
+        if (
+            time(9, 30) <= now_et.time() <= time(16, 0)
+            and stream is not None
+            and stream.seconds_since_last_bar is not None
+            and stream.seconds_since_last_bar > 90
+        ):
+            logger.error(  # pragma: no cover — only fires during live market hours with stale WS
+                "websocket_watchdog_alert",
+                seconds_since_last_bar=round(stream.seconds_since_last_bar),
+            )
+            with contextlib.suppress(Exception):  # pragma: no cover
+                await dispatcher.dispatch_risk_warning(
+                    f"⚠️ No bars received for {int(stream.seconds_since_last_bar)}s — websocket may be down"
+                )
 
 
 def cast_trades(raw: list[dict[str, object]]) -> list[TradeResult]:
@@ -414,6 +537,9 @@ async def run() -> None:
     # ── per-symbol pipelines ──────────────────────────────────────────────────
     pipelines = _build_pipelines(symbols, db)
 
+    # ── backfill missed ORB bars on late start ─────────────────────────────
+    await _backfill_orb_bars(pipelines)
+
     # ── shared components ─────────────────────────────────────────────────────
     cooldown = CooldownTracker()
     risk = RiskManager(cooldown=cooldown, settings=risk_settings)
@@ -480,7 +606,7 @@ async def run() -> None:
                 name="bar_loop",
             )
             tg.create_task(
-                _scheduler(pipelines, cooldown, dispatcher, db, executor=executor),
+                _scheduler(pipelines, cooldown, dispatcher, db, executor=executor, stream=stream),
                 name="scheduler",
             )
     except* (

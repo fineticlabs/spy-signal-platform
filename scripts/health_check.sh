@@ -158,6 +158,31 @@ else
     echo "         Fix: Add the indicator name to _known set in src/indicators/registry.py"
 fi
 
+# ── 6. No websocket connection errors (last 5 minutes) ──────────────────
+
+WS_ERROR_COUNT=0
+WS_ERROR_PATTERNS="connection limit exceeded|Errno 49|Can't assign requested address|no close frame|websocket_error|websocket_watchdog_alert"
+
+while IFS= read -r line; do
+    ts=$(echo "$line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+    if [[ -n "$ts" ]]; then
+        line_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts" +%s 2>/dev/null || echo 0)
+        age=$(( NOW - line_epoch ))
+        if (( age >= 0 && age <= WINDOW_SECS )); then
+            ((WS_ERROR_COUNT++))
+        fi
+    fi
+done < <(grep -iE "$WS_ERROR_PATTERNS" "$LOG_FILE" | tail -200)
+
+if (( WS_ERROR_COUNT == 0 )); then
+    pass "No websocket errors (last 5 min)"
+else
+    fail "Websocket errors" "$WS_ERROR_COUNT connection errors in last 5 min"
+    echo "         Fix: Kill scanner, wait 30s, restart: bash scripts/auto_start.sh"
+    echo "         If 'connection limit exceeded': wait 60s for Alpaca to release connections"
+    echo "         Debug: grep -iE 'websocket|Errno|connection' $LOG_FILE | tail -10"
+fi
+
 # ── Verdict ─────────────────────────────────────────────────────────────────
 
 echo ""
