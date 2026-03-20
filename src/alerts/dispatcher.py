@@ -25,6 +25,8 @@ class _AlertChannel(Protocol):
 
     async def send_risk_warning(self, message: str) -> bool: ...
 
+    async def send_status(self, message: str) -> bool: ...
+
     async def send_daily_summary(self, trades: list[TradeResult]) -> bool: ...
 
 
@@ -98,6 +100,19 @@ class AlertDispatcher:
             logger.info("risk_warning_dispatched", message=message[:80])
         else:
             logger.error("risk_warning_dispatch_failed", message=message[:80])
+        return success
+
+    async def dispatch_status(self, message: str) -> bool:
+        """Dispatch a system status notification (not rate-limited).
+
+        Returns:
+            ``True`` if delivered, ``False`` if the channel failed.
+        """
+        success = await self._alerter.send_status(message)
+        if success:
+            logger.info("status_dispatched", message=message[:80])
+        else:
+            logger.error("status_dispatch_failed", message=message[:80])
         return success
 
     async def dispatch_daily_summary(self, trades: list[TradeResult]) -> bool:

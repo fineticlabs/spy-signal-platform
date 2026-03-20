@@ -151,16 +151,18 @@ def format_earnings_blackout_alert(symbol: str, earnings_date: str) -> str:
     )
 
 
-def format_risk_alert(message: str) -> str:
-    """Format a risk-management warning as a Telegram MarkdownV2 message.
+def format_risk_alert(message: str, header: str = "⚠️ *Risk Warning*") -> str:
+    """Format an alert as a Telegram MarkdownV2 message.
 
     Args:
-        message: Plain-text warning message.
+        message: Plain-text message body.
+        header:  MarkdownV2 header line (already escaped if needed).
+                 Defaults to ``"⚠️ *Risk Warning*"`` for backwards compatibility.
 
     Returns:
         MarkdownV2-formatted string.
     """
-    return f"⚠️ *Risk Warning*\n\n{_md2(message)}"
+    return f"{header}\n\n{_md2(message)}"
 
 
 def format_daily_summary(trades: list[TradeResult]) -> str:

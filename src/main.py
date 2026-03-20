@@ -505,6 +505,65 @@ async def _start_api(host: str = "127.0.0.1", port: int = 8000) -> None:
     await server.serve()
 
 
+# ── startup readiness notifications ──────────────────────────────────────────
+
+_WS_CONNECT_TIMEOUT = 90  # seconds to wait for websocket auth
+
+
+async def _notify_readiness(
+    stream: AlpacaBarStream,
+    dispatcher: AlertDispatcher,
+    n_symbols: int,
+) -> None:
+    """Await websocket connection and send Telegram readiness notifications.
+
+    1. Wait up to 90s for websocket auth+subscribe.
+    2. Send "Scanner ready" Telegram message.
+    3. Wait for first bar_received, then send "System GO".
+
+    If websocket doesn't connect in time, sends a failure alert instead.
+    """
+    # Wait for connection
+    try:
+        await asyncio.wait_for(stream.connected.wait(), timeout=_WS_CONNECT_TIMEOUT)
+        await asyncio.wait_for(stream.subscribed.wait(), timeout=30)
+    except TimeoutError:
+        logger.error(
+            "websocket_startup_timeout",
+            timeout=_WS_CONNECT_TIMEOUT,
+            msg="Websocket did not authenticate within timeout",
+        )
+        with contextlib.suppress(Exception):
+            await dispatcher.dispatch_risk_warning(
+                f"🚨 STARTUP FAILED: Websocket did not connect after {_WS_CONNECT_TIMEOUT}s. "
+                "Fix before market open."
+            )
+        return
+
+    # Connected — send readiness message
+    logger.info("scanner_ready", symbols=n_symbols)
+    with contextlib.suppress(Exception):
+        await dispatcher.dispatch_status(
+            f"✅ Scanner ready. Websocket connected. "
+            f"Monitoring {n_symbols} symbols. Waiting for market open at 9:30 ET."
+        )
+
+    # Wait for first bar — poll until a bar arrives or task is cancelled.
+    # We can't use an Event because _on_bar is in a different object; polling
+    # every 5s is fine for a one-time startup check.
+    try:
+        while stream.seconds_since_last_bar is None:  # — one-time startup poll
+            await asyncio.sleep(5)
+    except (
+        asyncio.CancelledError
+    ):  # pragma: no cover — fires when scanner shuts down during startup
+        return
+
+    logger.info("first_bar_received")
+    with contextlib.suppress(Exception):
+        await dispatcher.dispatch_status("📊 First bar received. ORB window tracking. System GO.")
+
+
 # ── graceful shutdown ──────────────────────────────────────────────────────────
 
 
@@ -584,7 +643,20 @@ async def run() -> None:
 
     # ── WebSocket ingestion queue — all symbols on one stream ─────────────────
     queue: asyncio.Queue[Bar] = asyncio.Queue(maxsize=1000)
-    stream = AlpacaBarStream(symbols=symbols, queue=queue, timeframe=TimeFrame.ONE_MIN)
+
+    async def _ws_failure_callback(
+        message: str,
+    ) -> None:  # pragma: no cover — only fires after 3 WS failures during live run
+        """Send Telegram alert when websocket exhausts all retries."""
+        with contextlib.suppress(Exception):
+            await dispatcher.dispatch_risk_warning(f"🚨 CRITICAL: {message}")
+
+    stream = AlpacaBarStream(
+        symbols=symbols,
+        queue=queue,
+        timeframe=TimeFrame.ONE_MIN,
+        on_failure=_ws_failure_callback,
+    )
 
     loop = asyncio.get_running_loop()
     _install_signal_handlers(loop)
@@ -608,6 +680,10 @@ async def run() -> None:
             tg.create_task(
                 _scheduler(pipelines, cooldown, dispatcher, db, executor=executor, stream=stream),
                 name="scheduler",
+            )
+            tg.create_task(
+                _notify_readiness(stream, dispatcher, len(symbols)),
+                name="readiness_monitor",
             )
     except* (
         asyncio.CancelledError

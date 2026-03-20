@@ -95,6 +95,44 @@ echo "$SCANNER_PID" > "$PID_FILE"
 echo "Scanner started with PID $SCANNER_PID"
 echo "Log file: $LOG_FILE"
 echo "PID file: $PID_FILE"
+
+# ── Post-launch: wait for websocket confirmation ────────────────────────────
 echo ""
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] auto_start.sh DONE"
+echo "[$(date '+%H:%M:%S')] Waiting for websocket authentication (up to 90s)..."
+
+WS_CONFIRMED=false
+for i in $(seq 1 90); do
+    if ! kill -0 "$SCANNER_PID" 2>/dev/null; then
+        echo "ERROR: Scanner process died during startup (PID $SCANNER_PID)."
+        echo "Check log: tail -30 $LOG_FILE"
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+    if grep -q "websocket_authenticated" "$LOG_FILE" 2>/dev/null; then
+        WS_CONFIRMED=true
+        echo "Websocket authenticated after ${i}s."
+        break
+    fi
+    sleep 1
+done
+
+if $WS_CONFIRMED; then
+    # Also check for subscription confirmation
+    for i in $(seq 1 30); do
+        if grep -q "websocket_subscribed" "$LOG_FILE" 2>/dev/null; then
+            echo "Websocket subscribed. Scanner is LIVE."
+            break
+        fi
+        sleep 1
+    done
+    echo ""
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] auto_start.sh DONE — scanner confirmed live"
+else
+    echo ""
+    echo "WARNING: Websocket did NOT authenticate within 90s."
+    echo "Scanner may be stuck. Check: tail -50 $LOG_FILE"
+    echo "The scanner will send a Telegram alert if it cannot connect."
+    echo ""
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] auto_start.sh DONE — websocket NOT confirmed"
+fi
 echo "============================================================"

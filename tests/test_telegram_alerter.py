@@ -245,6 +245,23 @@ class TestSendDailySummary:
         assert result is True
 
 
+# ── send_status ───────────────────────────────────────────────────────────
+
+
+class TestSendStatus:
+    @pytest.mark.asyncio()
+    async def test_formats_with_status_header(
+        self, alerter: TelegramAlerter, mock_bot: MagicMock
+    ) -> None:
+        result = await alerter.send_status("Scanner ready")
+        assert result is True
+        call_text = mock_bot.send_message.call_args.kwargs["text"]
+        assert "System Status" in call_text
+        assert "Scanner ready" in call_text
+        # Must NOT contain "Risk Warning"
+        assert "Risk Warning" not in call_text
+
+
 # ── Rate limiting NOT in TelegramAlerter ────────────────────────────────────
 
 

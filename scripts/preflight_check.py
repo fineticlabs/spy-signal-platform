@@ -434,7 +434,55 @@ def _check_pipeline_wiring() -> None:
         _record(False, "Pipeline wiring", f"{type(exc).__name__}: {exc}")
 
 
-# ── 12. Full test suite ─────────────────────────────────────────────────────
+# ── 12. Websocket connectivity ───────────────────────────────────────────────
+
+
+def _check_websocket_connectivity() -> None:
+    """Open a websocket to Alpaca, authenticate, then disconnect cleanly.
+
+    Catches 'connection limit exceeded' and auth errors before starting
+    the scanner, when there's still time to fix them.
+    """
+    try:
+        import asyncio
+        import contextlib
+
+        from alpaca.data.live import StockDataStream
+
+        from src.config import get_alpaca_settings
+
+        settings = get_alpaca_settings()
+
+        async def _test_ws() -> str:
+            client = StockDataStream(
+                api_key=settings.api_key,
+                secret_key=settings.secret_key,
+                feed="iex",
+            )
+            try:
+                await client._connect()
+                await client._auth()
+                # Auth succeeded — clean up
+                await client.close()
+                return "ok"
+            except ValueError as exc:
+                return f"auth failed: {exc}"
+            except OSError as exc:
+                return f"connection failed: {exc}"
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.close()
+
+        result = asyncio.run(_test_ws())
+        if result == "ok":
+            _record(True, "Websocket connectivity", "Auth + disconnect OK")
+        else:
+            _record(False, "Websocket connectivity", result)
+    except Exception as exc:
+        _record(False, "Websocket connectivity", f"{type(exc).__name__}: {exc}")
+
+
+# ── 13. Full test suite ─────────────────────────────────────────────────────
 
 
 def _check_tests() -> None:
@@ -489,6 +537,7 @@ def main() -> None:
     _check_mac_sleep()
     _check_no_scanner()
     _check_disk_space()
+    _check_websocket_connectivity()
     _check_pipeline_wiring()
     _check_tests()
 

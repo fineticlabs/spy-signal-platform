@@ -88,6 +88,7 @@ class FakeAlerter:
         self.send_signal = AsyncMock(return_value=True)
         self.send_risk_warning = AsyncMock(return_value=True)
         self.send_daily_summary = AsyncMock(return_value=True)
+        self.send_status = AsyncMock(return_value=True)
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────

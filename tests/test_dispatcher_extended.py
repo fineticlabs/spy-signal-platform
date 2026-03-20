@@ -44,11 +44,13 @@ def _make_alerter(
     *,
     signal_ok: bool = True,
     risk_ok: bool = True,
+    status_ok: bool = True,
     summary_ok: bool = True,
 ) -> AsyncMock:
     alerter = AsyncMock()
     alerter.send_signal = AsyncMock(return_value=signal_ok)
     alerter.send_risk_warning = AsyncMock(return_value=risk_ok)
+    alerter.send_status = AsyncMock(return_value=status_ok)
     alerter.send_daily_summary = AsyncMock(return_value=summary_ok)
     return alerter
 
@@ -103,6 +105,25 @@ class TestDispatchDailySummary:
         result = await dispatcher.dispatch_daily_summary([trade])
         assert result is True
         alerter.send_daily_summary.assert_awaited_once_with([trade])
+
+
+class TestDispatchStatus:
+    """Cover dispatch_status success and failure paths."""
+
+    @pytest.mark.asyncio
+    async def test_returns_true_on_success(self) -> None:
+        alerter = _make_alerter(status_ok=True)
+        dispatcher = AlertDispatcher(alerter)
+        result = await dispatcher.dispatch_status("Scanner ready")
+        assert result is True
+        alerter.send_status.assert_awaited_once_with("Scanner ready")
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_failure(self) -> None:
+        alerter = _make_alerter(status_ok=False)
+        dispatcher = AlertDispatcher(alerter)
+        result = await dispatcher.dispatch_status("Scanner ready")
+        assert result is False
 
 
 class TestDispatchSignalFailure:

@@ -73,6 +73,15 @@ class TelegramAlerter:
         text = format_risk_alert(message)
         return await self._send(text)
 
+    async def send_status(self, message: str) -> bool:
+        """Send a system status notification (not a warning).
+
+        Returns:
+            ``True`` if delivered successfully, ``False`` if all retries failed.
+        """
+        text = format_risk_alert(message, header="\u2139\ufe0f *System Status*")
+        return await self._send(text)
+
     async def send_daily_summary(self, trades: list[TradeResult]) -> bool:
         """Send the end-of-day trade summary.
 
