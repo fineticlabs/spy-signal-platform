@@ -7,11 +7,13 @@ premarket data arrives it remains inactive and logs a warning once.
 
 from __future__ import annotations
 
-from datetime import UTC, date, time, timedelta
+from datetime import UTC, date, time
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import structlog
+
+from src.levels.trading_calendar import last_trading_day
 
 if TYPE_CHECKING:
     from decimal import Decimal
@@ -55,7 +57,7 @@ class PreviousDayLevels:
 
         from src.models import TimeFrame
 
-        prev_date = session_date - timedelta(days=1)
+        prev_date = last_trading_day(session_date)
 
         # Build UTC window for the previous trading day (full day slice)
         from datetime import datetime as _dt

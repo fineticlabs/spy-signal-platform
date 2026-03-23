@@ -36,6 +36,7 @@ _ATR_MULTIPLIER = Decimal("1.5")
 _RISK_MULTIPLIER = Decimal("2.0")
 _VIX_MAX = Decimal("25")
 _ADX_MIN = Decimal("20")
+_VOL_LOW_RATIO = Decimal("0.5")  # volume < 0.5 * avg → hard reject (low liquidity)
 _RVOL_LOW = Decimal("0.5")  # RVOL < 0.5 → demote (-2 confidence, LOW_RVOL tag)
 _RVOL_HIGH = Decimal("1.5")  # RVOL >= 1.5 → boost (+1 confidence, HIGH_RVOL tag)
 _MARKET_DIRECTION_EXEMPT = {"SPY", "QQQ"}  # these ARE the market direction
@@ -152,8 +153,20 @@ class ORBStrategy(Strategy):
             logger.debug("orb_filter_low_adx", adx=str(adx))
             return None
 
-        # --- Volume filter ---
-        if avg_vol is None or Decimal(str(bar.volume)) < avg_vol * _VOL_MULTIPLIER:
+        # --- Low volume rejection (hard gate) ---
+        bar_vol = Decimal(str(bar.volume))
+        if avg_vol is not None and bar_vol < avg_vol * _VOL_LOW_RATIO:
+            logger.info(
+                "orb_filter_low_volume",
+                symbol=bar.symbol,
+                volume=bar.volume,
+                avg=str(avg_vol),
+                ratio=str(bar_vol / avg_vol if avg_vol else 0),
+            )
+            return None
+
+        # --- Breakout volume confirmation ---
+        if avg_vol is None or bar_vol < avg_vol * _VOL_MULTIPLIER:
             logger.debug("orb_filter_volume", volume=bar.volume, avg=str(avg_vol))
             return None
 

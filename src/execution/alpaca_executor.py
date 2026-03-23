@@ -103,6 +103,10 @@ class AlpacaExecutor:
             check failed or the API returned an error.
         """
         # ── safety checks ─────────────────────────────────────────────────
+        if self._has_existing_position_or_order(symbol):
+            logger.info("signal_skipped_existing_position", symbol=symbol)
+            return None
+
         if not self._check_market_hours():
             logger.warning("order_rejected_market_closed", symbol=symbol)
             return None
@@ -223,6 +227,31 @@ class AlpacaExecutor:
         return self._now_et_time() >= _FLATTEN_TIME
 
     # ── safety checks ─────────────────────────────────────────────────────────
+
+    def _has_existing_position_or_order(self, symbol: str) -> bool:
+        """Return ``True`` if there is an open position or pending order for *symbol*.
+
+        Prevents duplicate bracket orders from piling up on the same symbol.
+        """
+        try:
+            positions = self._client.get_all_positions()
+            for pos in positions:
+                if pos.symbol == symbol:
+                    return True
+        except APIError as exc:
+            logger.error("position_check_failed", symbol=symbol, error=str(exc))
+            return True  # fail-closed: block order if we can't verify
+
+        try:
+            orders = self._client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            for order in orders:
+                if order.symbol == symbol:
+                    return True
+        except APIError as exc:
+            logger.error("order_check_failed", symbol=symbol, error=str(exc))
+            return True  # fail-closed
+
+        return False
 
     def _now_et_time(self) -> time:
         """Return the current wall-clock time in ET.  Override in tests."""
