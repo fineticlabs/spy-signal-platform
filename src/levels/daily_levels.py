@@ -8,6 +8,7 @@ premarket data arrives it remains inactive and logs a warning once.
 from __future__ import annotations
 
 from datetime import UTC, date, time
+from datetime import datetime as _dt
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -26,6 +27,10 @@ logger = structlog.get_logger(__name__)
 _ET = ZoneInfo("America/New_York")
 _PREMARKET_START = time(4, 0)
 _SESSION_OPEN = time(9, 30)
+
+# Regular-session window in ET; converted to UTC for bar queries.
+_SESSION_START_ET = time(9, 30)
+_SESSION_END_ET = time(16, 0)
 
 
 class PreviousDayLevels:
@@ -59,11 +64,13 @@ class PreviousDayLevels:
 
         prev_date = last_trading_day(session_date)
 
-        # Build UTC window for the previous trading day (full day slice)
-        from datetime import datetime as _dt
-
-        start_utc = _dt.combine(prev_date, time.min).replace(tzinfo=UTC)
-        end_utc = _dt.combine(prev_date, time.max).replace(tzinfo=UTC)
+        # Build the UTC query window from the ET trading session, not from
+        # midnight-to-midnight UTC.  This correctly handles the fact that ET
+        # market hours map to a specific UTC range that varies by DST offset.
+        session_start_et = _dt.combine(prev_date, _SESSION_START_ET).replace(tzinfo=_ET)
+        session_end_et = _dt.combine(prev_date, _SESSION_END_ET).replace(tzinfo=_ET)
+        start_utc = session_start_et.astimezone(UTC)
+        end_utc = session_end_et.astimezone(UTC)
 
         try:
             bars = self._db.query_bars(
@@ -88,6 +95,7 @@ class PreviousDayLevels:
         logger.info(
             "pdl_loaded",
             prev_date=str(prev_date),
+            session_date=str(session_date),
             high=str(self._high),
             low=str(self._low),
             close=str(self._close),

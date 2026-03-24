@@ -74,6 +74,12 @@ class AlpacaExecutor:
             secret_key=secret_key,
             paper=paper,
         )
+        # In-memory set of symbols with active orders/positions today.
+        # Checked BEFORE the Alpaca API round-trip to prevent the race
+        # condition where order N+1 is submitted before Alpaca acknowledges
+        # order N.  Populated at startup via load_existing_positions() and
+        # updated on each successful bracket order submission.
+        self._submitted_symbols: set[str] = set()
         logger.info("executor_initialized", paper=paper)
 
     # ── public interface ──────────────────────────────────────────────────────
@@ -103,8 +109,15 @@ class AlpacaExecutor:
             check failed or the API returned an error.
         """
         # ── safety checks ─────────────────────────────────────────────────
+        # Fast local check first — eliminates race condition where the
+        # Alpaca API hasn't acknowledged the previous order yet.
+        if symbol in self._submitted_symbols:
+            logger.info("signal_skipped_local_dedup", symbol=symbol)
+            return None
+
         if self._has_existing_position_or_order(symbol):
             logger.info("signal_skipped_existing_position", symbol=symbol)
+            self._submitted_symbols.add(symbol)  # sync local set
             return None
 
         if not self._check_market_hours():
@@ -139,6 +152,7 @@ class AlpacaExecutor:
 
         try:
             order: Order = self._client.submit_order(order_data)
+            self._submitted_symbols.add(symbol)
             logger.info(
                 "bracket_order_submitted",
                 symbol=symbol,
@@ -158,6 +172,34 @@ class AlpacaExecutor:
                 error=str(exc),
             )
             return None
+
+    def load_existing_positions(self) -> list[str]:
+        """Pre-load current Alpaca positions into the local dedup set.
+
+        Call this once at startup (before the first signal cycle) so that
+        carry-over positions from the previous day are immediately known.
+
+        Returns:
+            List of symbols that were loaded.
+        """
+        try:
+            positions = self._client.get_all_positions()
+            symbols = [pos.symbol for pos in positions]
+            self._submitted_symbols.update(symbols)
+            logger.info(
+                "existing_positions_loaded",
+                symbols=symbols,
+                count=len(symbols),
+            )
+            return symbols
+        except APIError as exc:
+            logger.error("existing_positions_load_failed", error=str(exc))
+            return []
+
+    def clear_submitted_symbols(self) -> None:
+        """Clear the local dedup set.  Call at EOD after flatten."""
+        self._submitted_symbols.clear()
+        logger.info("submitted_symbols_cleared")
 
     def flatten_all_positions(self) -> int:
         """Close all open positions (EOD flatten).

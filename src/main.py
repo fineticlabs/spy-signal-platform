@@ -100,6 +100,11 @@ _SCHEDULER_INTERVAL = 30
 _regime_warmup_bar_counts: dict[str, int] = {}
 _regime_first_populated: set[str] = set()
 
+# Excluded weekdays (0=Mon).  Set once at startup via run(), checked in
+# _process_bar as a redundant safety net on top of the ORB strategy's own
+# excluded-day filter.
+_excluded_weekdays: set[int] = set()
+
 
 # ── per-symbol pipeline container ─────────────────────────────────────────────
 
@@ -285,6 +290,14 @@ async def _process_bar(
     executor: AlpacaExecutor | None = None,
 ) -> None:
     """Run a single bar through the full pipeline for its symbol."""
+    # 0. Excluded-day gate (redundant safety net — catches Mondays even if
+    #    the ORB strategy's own excluded_days check is bypassed or misconfigured).
+    #    Uses the module-level _excluded_weekdays set, populated once at startup.
+    if _excluded_weekdays:
+        bar_date = bar.timestamp.astimezone(_ET).date()
+        if bar_date.weekday() in _excluded_weekdays:
+            return
+
     # 1. Indicators
     pipeline.registry.update_all(bar)
     pipeline.bar_cache.append(bar)
@@ -567,6 +580,11 @@ def _reconcile_alpaca_fills(
     (by order_id) and update it with fill price, realized P&L, and outcome.
     Also inserts a trade row so the trades table is populated.
 
+    Handles three exit scenarios:
+    1. Bracket leg fired (stop/target hit during session)
+    2. EOD flatten closed the position (legs cancelled, separate close order)
+    3. Position still open (no exit — mark as 'open')
+
     Returns:
         Number of signals reconciled.
     """
@@ -583,8 +601,17 @@ def _reconcile_alpaca_fills(
     for order in filled_orders:
         order_map[str(order.id)] = order
 
+    # Build symbol → list of filled orders (for matching flatten close orders)
+    symbol_orders: dict[str, list[object]] = {}
+    for order in filled_orders:
+        sym = getattr(order, "symbol", "")
+        symbol_orders.setdefault(sym, []).append(order)
+
     # Get executed signals that have an order_id
     executed = query_executed_signals(db.conn, since=since)
+    # Collect bracket parent order_ids so we can exclude them when finding
+    # flatten orders later.
+    bracket_order_ids = {str(sig.get("order_id", "")) for sig in executed if sig.get("order_id")}
     reconciled = 0
 
     for sig in executed:
@@ -602,21 +629,43 @@ def _reconcile_alpaca_fills(
         position_size = int(sig.get("position_size", 0))
         stop = float(sig.get("stop_price", 0))
         target = float(sig.get("target_price", 0))
+        symbol = str(sig.get("symbol", "SPY"))
 
         fill_price = float(getattr(order, "filled_avg_price", 0) or 0)
         if fill_price <= 0:
-            fill_price = entry  # no fill price available
+            fill_price = entry
 
-        # Determine outcome from fill legs — check if child orders exist
-        # For bracket orders, the parent fills at entry; P&L comes from
-        # the stop/target leg that fired. Use the order's P&L if available.
+        # Determine exit price from bracket legs or flatten order.
+        # For bracket orders the parent fills at entry; P&L comes from
+        # whichever child leg fired (stop or target).
         legs = getattr(order, "legs", None) or []
-        exit_price = fill_price
+        exit_price: float | None = None
         for leg in legs:
-            if getattr(leg, "status", None) == "filled":
+            leg_status = str(getattr(leg, "status", ""))
+            if leg_status in ("filled", "OrderStatus.FILLED"):
                 leg_fill = float(getattr(leg, "filled_avg_price", 0) or 0)
                 if leg_fill > 0:
                     exit_price = leg_fill
+
+        # If no bracket leg filled (e.g. EOD flatten cancelled them), find
+        # the flatten close order for this symbol.
+        if exit_price is None:
+            for candidate in symbol_orders.get(symbol, []):
+                cand_id = str(getattr(candidate, "id", ""))
+                if cand_id in bracket_order_ids:
+                    continue  # skip the bracket parent itself
+                # Flatten orders are simple market sells/buys, not brackets
+                cand_class = str(getattr(candidate, "order_class", ""))
+                if cand_class in ("", "simple", "OrderClass.SIMPLE"):
+                    cand_fill = float(getattr(candidate, "filled_avg_price", 0) or 0)
+                    if cand_fill > 0:
+                        exit_price = cand_fill
+                        break
+
+        # If we still have no exit, the position may still be open — use
+        # entry as a placeholder (pnl=0, outcome=open).
+        if exit_price is None:
+            exit_price = fill_price
 
         if direction == "LONG":
             pnl = (exit_price - entry) * position_size
@@ -624,7 +673,9 @@ def _reconcile_alpaca_fills(
             pnl = (entry - exit_price) * position_size
 
         # Determine outcome
-        if abs(exit_price - target) < abs(exit_price - stop):
+        if exit_price == fill_price and not legs:
+            outcome = "open"
+        elif abs(exit_price - target) < abs(exit_price - stop):
             outcome = "winner"
         elif abs(exit_price - stop) < abs(exit_price - target):
             outcome = "loser"
@@ -633,7 +684,7 @@ def _reconcile_alpaca_fills(
 
         signal_id = int(sig.get("id", 0))
         if signal_id > 0:
-            with contextlib.suppress(Exception):
+            try:
                 update_signal_fill(
                     db.conn,
                     signal_id,
@@ -641,9 +692,16 @@ def _reconcile_alpaca_fills(
                     str(round(pnl, 2)),
                     outcome,
                 )
+            except Exception as exc:
+                logger.error(
+                    "reconcile_signal_update_failed",
+                    signal_id=signal_id,
+                    error=str(exc),
+                )
+                continue
 
             # Also insert into trades table for backward compat
-            with contextlib.suppress(Exception):
+            try:
                 db.conn.execute(
                     """INSERT INTO trades
                        (timestamp, strategy_name, direction, entry_price,
@@ -657,10 +715,16 @@ def _reconcile_alpaca_fills(
                         str(stop),
                         str(target),
                         str(round(pnl, 2)),
-                        str(sig.get("symbol", "SPY")),
+                        symbol,
                     ),
                 )
                 db.conn.commit()
+            except Exception as exc:
+                logger.error(
+                    "reconcile_trade_insert_failed",
+                    signal_id=signal_id,
+                    error=str(exc),
+                )
 
             reconciled += 1
 
@@ -983,6 +1047,7 @@ async def _scheduler(
             try:
                 cancelled = executor.cancel_open_orders()
                 closed = executor.flatten_all_positions()
+                executor.clear_submitted_symbols()
                 logger.info(
                     "eod_flatten_complete",
                     orders_cancelled=cancelled,
@@ -1192,6 +1257,10 @@ async def run() -> None:
     db.connect()
     ensure_schema(db.conn)
 
+    # ── excluded-day safety net (module-level cache for _process_bar) ────────
+    global _excluded_weekdays
+    _excluded_weekdays = set(app_settings.excluded_days)
+
     # ── per-symbol pipelines ──────────────────────────────────────────────────
     pipelines = _build_pipelines(symbols, db, excluded_days=app_settings.excluded_days)
 
@@ -1227,6 +1296,9 @@ async def run() -> None:
             mode=app_settings.execution_mode,
             paper=is_paper,
         )
+        # Pre-load carry-over positions so the dedup set knows about them
+        # BEFORE the first signal cycle fires.
+        executor.load_existing_positions()
 
     # ── inject live state into FastAPI (first symbol's pipeline for dashboard) ─
     from src.api.routes import set_dependencies
