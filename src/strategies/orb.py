@@ -1,4 +1,14 @@
-"""Opening Range Breakout (ORB) strategy — 5-min window."""
+"""Opening Range Breakout (ORB) strategy — 5-min window.
+
+Filters aligned with backtest engine (engine.py) as of 2026-03-24:
+- Trading window: configurable ``signal_cutoff_et`` (default 10:00 ET)
+- ADX threshold: configurable ``adx_min_threshold`` (default 25)
+- 2-bar consecutive candle confirmation before entry
+- EMA(20) trend alignment gates direction (LONG: close > EMA, SHORT: close < EMA)
+- Gap classification: ±0.3% directional gate
+- VIX term structure: backwardation is a hard block (not just tag)
+- ORB range minimum: 0.15% of price
+"""
 
 from __future__ import annotations
 
@@ -28,46 +38,99 @@ logger = structlog.get_logger(__name__)
 _ET = ZoneInfo("America/New_York")
 _LUNCH_START = time(11, 30)
 _LUNCH_END = time(13, 30)
-_CUTOFF = time(15, 45)
 
 _VOL_WINDOW = 20
 _VOL_MULTIPLIER = Decimal("1.5")
 _ATR_MULTIPLIER = Decimal("1.5")
 _RISK_MULTIPLIER = Decimal("2.0")
 _VIX_MAX = Decimal("25")
-_ADX_MIN = Decimal("20")
 _VOL_LOW_RATIO = Decimal("0.5")  # volume < 0.5 * avg → hard reject (low liquidity)
 _RVOL_LOW = Decimal("0.5")  # RVOL < 0.5 → demote (-2 confidence, LOW_RVOL tag)
 _RVOL_HIGH = Decimal("1.5")  # RVOL >= 1.5 → boost (+1 confidence, HIGH_RVOL tag)
 _MARKET_DIRECTION_EXEMPT = {"SPY", "QQQ"}  # these ARE the market direction
 
+# Default ORB range minimum (0.15% of price) — matches backtest _MIN_ORB_PCT
+_DEFAULT_ORB_MIN_RANGE_PCT = Decimal("0.0015")
+# Default gap classification threshold (±0.3%) — matches backtest _GAP_THRESHOLD_PCT
+_DEFAULT_GAP_THRESHOLD_PCT = Decimal("0.3")
+# Default ADX minimum — matches backtest _DAILY_ADX_MIN = 25
+_DEFAULT_ADX_MIN = Decimal("25")
+# Default signal cutoff — matches backtest _WINDOW1_END = 10:00 ET
+_DEFAULT_CUTOFF = time(10, 0)
+
 
 class ORBStrategy(Strategy):
     """5-min Opening Range Breakout strategy.
 
-    Entry:
+    Entry (after 2-bar confirmation):
 
-    - LONG  when ``close > ORB high`` AND ``volume >= 1.5x 20-bar average``
-    - SHORT when ``close < ORB low``  AND ``volume >= 1.5x 20-bar average``
+    - LONG  when 2 consecutive closes > ORB high AND volume >= 1.5x AND EMA aligned
+    - SHORT when 2 consecutive closes < ORB low  AND volume >= 1.5x AND EMA aligned
 
-    Filters:
+    Filters (aligned with backtest engine):
 
-    - Excluded weekdays (default: Monday) — configurable via ``excluded_days``
-    - ORB window complete (>= 9:35 ET)
+    - Excluded weekdays (default: Monday)
+    - Signal cutoff (default: 10:00 ET, matching backtest 9:35-10:00 window)
+    - ADX > 25 (configurable)
     - VIX < 25
-    - ADX > 20
+    - EMA(20) trend alignment gates direction
+    - Gap classification gates direction (±0.3%)
+    - ORB range minimum (0.15% of price)
+    - VIX backwardation hard block
     - Not in lunch chop (11:30-13:30 ET)
-    - Before forced-flat cutoff (15:45 ET)
+    - Economic calendar (FOMC/NFP/CPI/PPI days blocked)
 
-    Stop:   ``entry +/- 1.5 * ATR(14)``
-    Target: ``entry +/- 2 * risk_distance``
+    Stop:   ``entry +/- 1.5 * ATR(14) * kalman_mult``
+    Target: ``entry +/- 2 * base_atr_risk``
     """
 
-    def __init__(self, excluded_days: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        excluded_days: list[int] | None = None,
+        signal_cutoff_et: str | None = None,
+        adx_min_threshold: int | None = None,
+        orb_min_range_pct: float | None = None,
+        gap_threshold_pct: float | None = None,
+    ) -> None:
         self._volumes: deque[int] = deque(maxlen=_VOL_WINDOW)
         self._recent_bars: deque[Bar] = deque(maxlen=5)  # for candlestick filters
         self._excluded_days: set[int] = set(excluded_days if excluded_days is not None else [0])
         self._excluded_day_logged: set[str] = set()  # track per-date logging
+
+        # Configurable cutoff (default 10:00 ET, matching backtest)
+        if signal_cutoff_et is not None:
+            parts = signal_cutoff_et.split(":")
+            self._cutoff = time(int(parts[0]), int(parts[1]))
+        else:
+            self._cutoff = _DEFAULT_CUTOFF
+
+        # Configurable ADX threshold (default 25, matching backtest)
+        self._adx_min = (
+            Decimal(str(adx_min_threshold)) if adx_min_threshold is not None else _DEFAULT_ADX_MIN
+        )
+
+        # ORB range minimum
+        self._orb_min_range_pct = (
+            Decimal(str(orb_min_range_pct))
+            if orb_min_range_pct is not None
+            else _DEFAULT_ORB_MIN_RANGE_PCT
+        )
+
+        # Gap classification threshold
+        self._gap_threshold_pct = (
+            Decimal(str(gap_threshold_pct))
+            if gap_threshold_pct is not None
+            else _DEFAULT_GAP_THRESHOLD_PCT
+        )
+
+        # 2-bar confirmation state: symbol → (direction, bar_timestamp)
+        self._pending_breakouts: dict[str, tuple[Direction, str]] = {}
+
+        # Gap classification cache: date_str → gap_pct (computed once per day per symbol)
+        self._gap_cache: dict[str, Decimal | None] = {}
+
+        # ORB range filter cache: date_str:symbol → blocked (computed once per day)
+        self._orb_range_blocked: dict[str, bool] = {}
 
     # ── Strategy interface ─────────────────────────────────────────────────────
 
@@ -95,20 +158,7 @@ class ORBStrategy(Strategy):
         hmm_regime: str | None = None,
         kalman_stop_mult: Decimal | None = None,
     ) -> Signal | None:
-        """Return a Signal if ORB entry conditions are met, else ``None``.
-
-        Volume history is updated on every call regardless of filtering so that
-        the rolling average stays current even while conditions are not met.
-
-        Args:
-            bar:        Current completed bar.
-            indicators: Indicator snapshot at signal time.
-            levels:     Level snapshot (ORB, VWAP, etc.).
-            regime:     Regime detector with VIX/ADX state.
-            spy_vwap:   SPY's current intraday VWAP (for market direction
-                        confirmation on non-SPY/QQQ tickers).
-            spy_price:  SPY's current price (last close).
-        """
+        """Return a Signal if ORB entry conditions are met, else ``None``."""
         # --- Excluded weekday filter (Monday by default) ---
         bar_date = bar.timestamp.astimezone(_ET).date()
         if bar_date.weekday() in self._excluded_days:
@@ -132,9 +182,9 @@ class ORBStrategy(Strategy):
 
         bar_time = bar.timestamp.astimezone(_ET).time()
 
-        # --- Time filters ---
-        if bar_time >= _CUTOFF:
-            logger.debug("orb_filter_cutoff", bar_time=str(bar_time))
+        # --- Time filters (cutoff aligned with backtest: default 10:00 ET) ---
+        if bar_time >= self._cutoff:
+            logger.debug("orb_filter_cutoff", bar_time=str(bar_time), cutoff=str(self._cutoff))
             return None
         if _LUNCH_START <= bar_time < _LUNCH_END:
             logger.debug("orb_filter_lunch_chop", bar_time=str(bar_time))
@@ -159,6 +209,25 @@ class ORBStrategy(Strategy):
         if orb_high is None or orb_low is None:
             return None
 
+        # --- ORB range minimum filter (matches backtest _MIN_ORB_PCT) ---
+        orb_range_key = f"{bar_date}:{bar.symbol}"
+        if orb_range_key not in self._orb_range_blocked:
+            orb_range = orb_high - orb_low
+            range_pct = orb_range / orb_low if orb_low > 0 else Decimal("0")
+            blocked = range_pct < self._orb_min_range_pct
+            self._orb_range_blocked[orb_range_key] = blocked
+            if blocked:
+                logger.info(
+                    "orb_filter_narrow_range",
+                    symbol=bar.symbol,
+                    orb_high=str(orb_high),
+                    orb_low=str(orb_low),
+                    range_pct=str(range_pct),
+                    min_pct=str(self._orb_min_range_pct),
+                )
+        if self._orb_range_blocked.get(orb_range_key, False):
+            return None
+
         # --- Regime filters ---
         vix = regime.vix_level
         adx = regime.adx_value
@@ -168,9 +237,21 @@ class ORBStrategy(Strategy):
         if vix >= _VIX_MAX:
             logger.debug("orb_filter_high_vix", vix=str(vix))
             return None
-        if adx <= _ADX_MIN:
-            logger.debug("orb_filter_low_adx", adx=str(adx))
+        if adx <= self._adx_min:
+            logger.debug("orb_filter_low_adx", adx=str(adx), threshold=str(self._adx_min))
             return None
+
+        # --- VIX term structure: backwardation is a HARD BLOCK (matches backtest) ---
+        if vix_term_ratio is not None:
+            from src.filters.vix_term_structure import BACKWARDATION_THRESHOLD
+
+            if float(vix_term_ratio) > BACKWARDATION_THRESHOLD:
+                logger.info(
+                    "orb_filter_vix_backwardation",
+                    symbol=bar.symbol,
+                    vix_term_ratio=str(vix_term_ratio),
+                )
+                return None
 
         # --- Low volume rejection (hard gate) ---
         bar_vol = Decimal(str(bar.volume))
@@ -197,28 +278,108 @@ class ORBStrategy(Strategy):
 
         close = bar.close
 
-        # --- Kalman-adaptive stop sizing ---
+        # --- EMA trend alignment (matches backtest 15m EMA(20) gate) ---
+        ema20 = indicators.ema20
+        if ema20 is not None:
+            if close > orb_high and close <= ema20:
+                logger.info(
+                    "orb_filter_ema_trend",
+                    symbol=bar.symbol,
+                    direction="LONG",
+                    close=str(close),
+                    ema20=str(ema20),
+                )
+                return None
+            if close < orb_low and close >= ema20:
+                logger.info(
+                    "orb_filter_ema_trend",
+                    symbol=bar.symbol,
+                    direction="SHORT",
+                    close=str(close),
+                    ema20=str(ema20),
+                )
+                return None
+
+        # --- Gap classification (matches backtest ±0.3% directional gate) ---
+        gap_pct = self._get_gap_pct(bar, levels)
+        if gap_pct is not None:
+            if close > orb_high and gap_pct < -self._gap_threshold_pct:
+                # Gap down but trying to go LONG — blocked
+                logger.info(
+                    "orb_filter_gap_direction",
+                    symbol=bar.symbol,
+                    direction="LONG",
+                    gap_pct=str(gap_pct),
+                )
+                return None
+            if close < orb_low and gap_pct > self._gap_threshold_pct:
+                # Gap up but trying to go SHORT — blocked
+                logger.info(
+                    "orb_filter_gap_direction",
+                    symbol=bar.symbol,
+                    direction="SHORT",
+                    gap_pct=str(gap_pct),
+                )
+                return None
+
+        # --- Determine breakout direction ---
+        if close > orb_high:
+            current_direction = Direction.LONG
+        elif close < orb_low:
+            current_direction = Direction.SHORT
+        else:
+            # Price inside ORB range — clear any pending breakout
+            if bar.symbol in self._pending_breakouts:
+                logger.info(
+                    "orb_failed_confirmation",
+                    symbol=bar.symbol,
+                    reason="price_back_inside_orb",
+                )
+                del self._pending_breakouts[bar.symbol]
+            return None
+
+        # --- 2-bar consecutive candle confirmation (matches backtest) ---
+        bar_ts_key = bar.timestamp.isoformat()
+        pending = self._pending_breakouts.get(bar.symbol)
+
+        if pending is None or pending[0] != current_direction:
+            # First bar breaking ORB in this direction — set pending
+            self._pending_breakouts[bar.symbol] = (current_direction, bar_ts_key)
+            logger.info(
+                "orb_pending_confirmation",
+                symbol=bar.symbol,
+                direction=str(current_direction),
+                close=str(close),
+            )
+            return None
+
+        # Second consecutive bar outside ORB in same direction — confirmed!
+        del self._pending_breakouts[bar.symbol]
+        direction = current_direction
+        logger.info(
+            "orb_confirmed_breakout",
+            symbol=bar.symbol,
+            direction=str(direction),
+            close=str(close),
+        )
+
+        # --- Build signal ---
         km = kalman_stop_mult if kalman_stop_mult is not None else Decimal("1.0")
         adaptive_atr_stop = _ATR_MULTIPLIER * atr * km
         base_atr_risk = _ATR_MULTIPLIER * atr  # original risk for target (decoupled)
 
-        # --- Determine direction ---
-        if close > orb_high:
-            direction = Direction.LONG
+        if direction == Direction.LONG:
             entry = close
             stop = entry - adaptive_atr_stop
             risk = entry - stop
             target = entry + _RISK_MULTIPLIER * base_atr_risk
-            reason = f"Close {close} broke above ORB high {orb_high} " f"with volume {bar.volume:,}"
-        elif close < orb_low:
-            direction = Direction.SHORT
+            reason = f"Close {close} broke above ORB high {orb_high} (2-bar confirmed) with volume {bar.volume:,}"
+        else:
             entry = close
             stop = entry + adaptive_atr_stop
             risk = stop - entry
             target = entry - _RISK_MULTIPLIER * base_atr_risk
-            reason = f"Close {close} broke below ORB low {orb_low} " f"with volume {bar.volume:,}"
-        else:
-            return None  # price inside ORB range — no breakout
+            reason = f"Close {close} broke below ORB low {orb_low} (2-bar confirmed) with volume {bar.volume:,}"
 
         # --- Market direction confirmation: informational tag, no blocking ---
         _spy_aligned: bool | None = None
@@ -239,6 +400,15 @@ class ORBStrategy(Strategy):
         dir_str = str(direction)
         confidence = 3
         tags: list[str] = []
+
+        # Gap classification tag (informational)
+        if gap_pct is not None:
+            if gap_pct > self._gap_threshold_pct:
+                tags.append("GAP_UP")
+            elif gap_pct < -self._gap_threshold_pct:
+                tags.append("GAP_DOWN")
+            else:
+                tags.append("GAP_FLAT")
 
         # SPY VWAP alignment tag (informational, no blocking)
         if _spy_aligned is True:
@@ -278,20 +448,14 @@ class ORBStrategy(Strategy):
                 confidence -= 1
                 tags.append("VP_POC_CROSS")
 
-        # VIX term structure confidence adjustment (informational, no blocking)
+        # VIX term structure contango tag (backwardation already hard-blocked above)
         if vix_term_ratio is not None:
-            from src.filters.vix_term_structure import (
-                BACKWARDATION_THRESHOLD,
-                CONTANGO_THRESHOLD,
-            )
+            from src.filters.vix_term_structure import CONTANGO_THRESHOLD
 
             ratio_f = float(vix_term_ratio)
             if ratio_f < CONTANGO_THRESHOLD:
                 confidence += 1
                 tags.append("CONTANGO")
-            elif ratio_f > BACKWARDATION_THRESHOLD:
-                confidence -= 2
-                tags.append("BACKWARDATION")
 
         # HMM regime confidence adjustment (informational, no blocking)
         # Backtest showed VOLATILE is best for ORB (+1), CALM is weakest (-1)
@@ -353,6 +517,7 @@ class ORBStrategy(Strategy):
 
         logger.info(
             "orb_signal",
+            symbol=bar.symbol,
             direction=dir_str,
             entry=str(entry),
             stop=str(stop),
@@ -369,3 +534,46 @@ class ORBStrategy(Strategy):
         if not self._volumes:
             return None
         return Decimal(str(sum(self._volumes) / len(self._volumes)))
+
+    def _get_gap_pct(self, bar: Bar, levels: LevelSnapshot) -> Decimal | None:
+        """Compute today's gap percentage vs previous day close.
+
+        Returns gap as a percentage (e.g., 0.5 = +0.5%).
+        Cached per date:symbol so it's only computed once.
+        """
+        bar_date = bar.timestamp.astimezone(_ET).date()
+        cache_key = f"{bar_date}:{bar.symbol}"
+        if cache_key in self._gap_cache:
+            return self._gap_cache[cache_key]
+
+        prev_close = levels.prev_day_close
+        if prev_close is None or prev_close <= 0:
+            self._gap_cache[cache_key] = None
+            return None
+
+        # Approximate session open from ORB midpoint (the true session open is
+        # the first bar's open, which we don't store separately).
+        orb_high = levels.orb_high
+        orb_low = levels.orb_low
+        if orb_high is not None and orb_low is not None:
+            # Approximate session open as ORB midpoint (close enough for gap calc)
+            # The true session open is the first bar's open, which we don't store
+            # separately. The ORB midpoint is a reasonable proxy.
+            approx_open = (orb_high + orb_low) / 2
+        else:
+            approx_open = bar.open
+
+        gap_pct = (approx_open - prev_close) / prev_close * 100
+        self._gap_cache[cache_key] = gap_pct
+
+        logger.info(
+            "orb_gap_classified",
+            symbol=bar.symbol,
+            gap_pct=str(gap_pct),
+            prev_close=str(prev_close),
+            approx_open=str(approx_open),
+            direction="UP"
+            if gap_pct > self._gap_threshold_pct
+            else ("DOWN" if gap_pct < -self._gap_threshold_pct else "FLAT"),
+        )
+        return gap_pct

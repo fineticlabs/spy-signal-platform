@@ -140,6 +140,35 @@ class AppSettings(BaseSettings):
             raise ValueError(f"log_level must be one of {valid}, got {v!r}")
         return upper
 
+    signal_cutoff_et: str = Field(
+        default="10:00",
+        description=(
+            "Latest ET time to generate new ORB signals (HH:MM format). "
+            "Backtest window is 9:35-10:00; default aligns live with backtest."
+        ),
+    )
+    adx_min_threshold: int = Field(
+        default=25,
+        description=(
+            "Minimum daily ADX value to allow ORB signals. "
+            "Backtest uses 25; lower values allow weaker trends."
+        ),
+    )
+    orb_min_range_pct: float = Field(
+        default=0.0015,
+        description=(
+            "Minimum ORB range as a fraction of price (0.0015 = 0.15%). "
+            "Days with narrower ORBs are skipped (no signals)."
+        ),
+    )
+    gap_threshold_pct: float = Field(
+        default=0.3,
+        description=(
+            "Gap classification threshold (%). "
+            "Gap > +threshold: LONG only; gap < -threshold: SHORT only; else both."
+        ),
+    )
+
     excluded_days: list[int] = Field(
         default=[0],
         description=(
@@ -152,6 +181,18 @@ class AppSettings(BaseSettings):
         default="alerts_only",
         description="Execution mode: 'alerts_only', 'paper_trade', or 'live_trade'",
     )
+
+    @field_validator("signal_cutoff_et")
+    @classmethod
+    def validate_signal_cutoff_et(cls, v: str) -> str:
+        """Validate HH:MM format."""
+        from datetime import time as _time
+
+        parts = v.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"signal_cutoff_et must be HH:MM, got {v!r}")
+        _time(int(parts[0]), int(parts[1]))  # raises ValueError if invalid
+        return v
 
     @field_validator("excluded_days", mode="before")
     @classmethod

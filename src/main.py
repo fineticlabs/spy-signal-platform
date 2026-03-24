@@ -36,7 +36,6 @@ flush pending state and close the DB connection.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import signal as _signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time
@@ -150,13 +149,21 @@ def _build_pipelines(
     symbols: list[str],
     db: BarDatabase,
     excluded_days: list[int] | None = None,
+    signal_cutoff_et: str | None = None,
+    adx_min_threshold: int | None = None,
+    orb_min_range_pct: float | None = None,
+    gap_threshold_pct: float | None = None,
 ) -> dict[str, _SymbolPipeline]:
     """Build one :class:`_SymbolPipeline` per ticker symbol.
 
     Args:
-        symbols:       List of uppercase ticker symbols.
-        db:            Connected :class:`BarDatabase` (needed by LevelManager).
-        excluded_days: Weekdays to skip (0=Mon). Passed to ORBStrategy.
+        symbols:            List of uppercase ticker symbols.
+        db:                 Connected :class:`BarDatabase` (needed by LevelManager).
+        excluded_days:      Weekdays to skip (0=Mon). Passed to ORBStrategy.
+        signal_cutoff_et:   Latest ET time for new signals (HH:MM). Default "10:00".
+        adx_min_threshold:  Minimum ADX to allow signals. Default 25.
+        orb_min_range_pct:  Minimum ORB range as fraction of price. Default 0.0015.
+        gap_threshold_pct:  Gap classification threshold (%). Default 0.3.
 
     Returns:
         Dict mapping symbol → pipeline.
@@ -168,7 +175,13 @@ def _build_pipelines(
             registry=_build_registry(),
             levels=LevelManager(db=db, symbol=symbol),
             regime=RegimeDetector(),
-            strategy=ORBStrategy(excluded_days=excluded_days),
+            strategy=ORBStrategy(
+                excluded_days=excluded_days,
+                signal_cutoff_et=signal_cutoff_et,
+                adx_min_threshold=adx_min_threshold,
+                orb_min_range_pct=orb_min_range_pct,
+                gap_threshold_pct=gap_threshold_pct,
+            ),
         )
         logger.info("pipeline_built", symbol=symbol)
     return pipelines
@@ -808,8 +821,15 @@ def _evaluate_signal_outcomes(
             }
             results["no_data"].append(no_data_result)
             if signal_id > 0:
-                with contextlib.suppress(Exception):
+                try:
                     update_signal_outcome(db.conn, signal_id, "no_data")
+                except Exception as exc:
+                    logger.error(
+                        "signal_outcome_update_failed",
+                        signal_id=signal_id,
+                        outcome="no_data",
+                        error=str(exc),
+                    )
             continue
 
         outcome = "open"
@@ -856,8 +876,15 @@ def _evaluate_signal_outcomes(
 
         # Update DB
         if signal_id > 0:
-            with contextlib.suppress(Exception):
+            try:
                 update_signal_outcome(db.conn, signal_id, outcome)
+            except Exception as exc:
+                logger.error(
+                    "signal_outcome_update_failed",
+                    signal_id=signal_id,
+                    outcome=outcome,
+                    error=str(exc),
+                )
 
     return results
 
@@ -1008,11 +1035,13 @@ async def _scheduler(
                 _day_names = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"}
                 day_name = _day_names.get(today.weekday(), str(today.weekday()))
                 logger.info("excluded_day_no_trading", date=str(today), day=day_name)
-                with contextlib.suppress(Exception):
+                try:
                     await dispatcher.dispatch_status(
                         f"📅 {day_name} — no trading per strategy rules.\n"
                         f"ORB signals suppressed for all {len(pipelines)} tickers."
                     )
+                except Exception as exc:
+                    logger.error("dispatch_excluded_day_failed", error=str(exc))
 
             last_reset_date = now_et
 
@@ -1025,16 +1054,20 @@ async def _scheduler(
             logger.info("orb_formation_check", complete=orb_count, total=total)
 
             if orb_count == 0:
-                with contextlib.suppress(Exception):
+                try:
                     await dispatcher.dispatch_risk_warning(
                         f"No ORB ranges formed: 0/{total} tickers by 9:50 ET. "
                         f"Check data feed and websocket."
                     )
+                except Exception as exc:
+                    logger.error("dispatch_orb_warning_failed", error=str(exc))
             elif orb_count < total // 2:
-                with contextlib.suppress(Exception):
+                try:
                     await dispatcher.dispatch_status(
                         f"⚠️ Partial ORB\n{orb_count}/{total} tickers formed ORB by 9:50 ET."
                     )
+                except Exception as exc:
+                    logger.error("dispatch_orb_status_failed", error=str(exc))
             last_orb_check_date = now_et
 
         # ── EOD flatten at 15:55 ET ──────────────────────────────────────────
@@ -1096,10 +1129,12 @@ async def _scheduler(
                 "websocket_watchdog_alert",
                 seconds_since_last_bar=round(stream.seconds_since_last_bar),
             )
-            with contextlib.suppress(Exception):  # pragma: no cover
+            try:  # pragma: no cover
                 await dispatcher.dispatch_risk_warning(
                     f"Websocket stale: no bars received in {int(stream.seconds_since_last_bar)}s during market hours."
                 )
+            except Exception as exc:  # pragma: no cover
+                logger.error("dispatch_watchdog_failed", error=str(exc))
 
 
 def cast_trades(raw: list[dict[str, object]]) -> list[TradeResult]:
@@ -1173,21 +1208,25 @@ async def _notify_readiness(
             timeout=_WS_CONNECT_TIMEOUT,
             msg="Websocket did not authenticate within timeout",
         )
-        with contextlib.suppress(Exception):
+        try:
             await dispatcher.dispatch_risk_warning(
                 f"STARTUP FAILED: Websocket did not connect after {_WS_CONNECT_TIMEOUT}s. "
                 f"Check Alpaca keys and network."
             )
+        except Exception as exc:
+            logger.error("dispatch_startup_failure_failed", error=str(exc))
         return
 
     # Connected — send readiness message
     logger.info("scanner_ready", symbols=n_symbols)
-    with contextlib.suppress(Exception):
+    try:
         await dispatcher.dispatch_status(
             f"✅ Scanner Ready\n"
             f"Websocket connected | {n_symbols} symbols\n"
             f"Waiting for market open at 9:30 ET"
         )
+    except Exception as exc:
+        logger.error("dispatch_scanner_ready_failed", error=str(exc))
 
     # Wait for first bar — poll until a bar arrives or task is cancelled.
     # We can't use an Event because _on_bar is in a different object; polling
@@ -1201,8 +1240,10 @@ async def _notify_readiness(
         return
 
     logger.info("first_bar_received")
-    with contextlib.suppress(Exception):
+    try:
         await dispatcher.dispatch_status("📊 First bar received. ORB window tracking. System GO.")
+    except Exception as exc:
+        logger.error("dispatch_first_bar_failed", error=str(exc))
 
 
 # ── graceful shutdown ──────────────────────────────────────────────────────────
@@ -1262,13 +1303,22 @@ async def run() -> None:
     _excluded_weekdays = set(app_settings.excluded_days)
 
     # ── per-symbol pipelines ──────────────────────────────────────────────────
-    pipelines = _build_pipelines(symbols, db, excluded_days=app_settings.excluded_days)
+    pipelines = _build_pipelines(
+        symbols,
+        db,
+        excluded_days=app_settings.excluded_days,
+        signal_cutoff_et=app_settings.signal_cutoff_et,
+        adx_min_threshold=app_settings.adx_min_threshold,
+        orb_min_range_pct=app_settings.orb_min_range_pct,
+        gap_threshold_pct=app_settings.gap_threshold_pct,
+    )
 
     # ── backfill missed ORB bars on late start ─────────────────────────────
     await _backfill_orb_bars(pipelines)
 
     # ── shared components ─────────────────────────────────────────────────────
     cooldown = CooldownTracker()
+    # get_position_count callback wired after executor init below
     risk = RiskManager(cooldown=cooldown, settings=risk_settings)
 
     telegram_settings = get_telegram_settings()
@@ -1299,6 +1349,8 @@ async def run() -> None:
         # Pre-load carry-over positions so the dedup set knows about them
         # BEFORE the first signal cycle fires.
         executor.load_existing_positions()
+        # Wire position count callback for max_concurrent_positions enforcement
+        risk._get_position_count = executor.get_position_count
 
     # ── inject live state into FastAPI (first symbol's pipeline for dashboard) ─
     from src.api.routes import set_dependencies
@@ -1319,8 +1371,10 @@ async def run() -> None:
         message: str,
     ) -> None:  # pragma: no cover — only fires after 3 WS failures during live run
         """Send Telegram alert when websocket exhausts all retries."""
-        with contextlib.suppress(Exception):
+        try:
             await dispatcher.dispatch_risk_warning(f"🚨 CRITICAL: {message}")
+        except Exception as exc:
+            logger.error("dispatch_ws_failure_failed", error=str(exc))
 
     stream = AlpacaBarStream(
         symbols=symbols,
@@ -1390,8 +1444,10 @@ async def run() -> None:
                 logger.error("eod_summary_failed_on_shutdown", error=str(exc))
         else:  # pragma: no cover — only when 16:05 ET EOD already fired
             logger.info("eod_skipped_on_shutdown", reason="already sent at 16:05 ET")
-        with contextlib.suppress(Exception):
+        try:
             await dispatcher.dispatch_status("\U0001f6d1 Scanner stopped gracefully.")
+        except Exception as exc:
+            logger.error("dispatch_shutdown_status_failed", error=str(exc))
         db.close()
         logger.info("platform_stopped")
 

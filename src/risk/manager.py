@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import time
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -37,25 +38,31 @@ class RiskManager:
     Checks are applied in fail-fast order:
 
     a. Daily loss limit not breached
-    b. Current time within allowed window (9:35-15:45, lunch filtered unless confidence >= 4)
-    c. Daily trade count below max
-    d. Not tilted (3+ consecutive losses)
-    e. Cooldown elapsed after 2 consecutive losses
-    f. Risk/reward >= 1.5
-    g. Position size feasible within 1% account risk
+    b. Max concurrent positions not exceeded
+    c. Current time within allowed window (9:35-15:45, lunch filtered unless confidence >= 4)
+    d. Daily trade count below max
+    e. Not tilted (3+ consecutive losses)
+    f. Cooldown elapsed after 2 consecutive losses
+    g. Risk/reward >= 1.5
+    h. Position size feasible within 1% account risk
 
     Args:
         cooldown:  Shared :class:`CooldownTracker` instance.
         settings:  :class:`~src.config.RiskSettings` to use.  Defaults to the
                    application settings from the environment.
+        get_position_count: Optional callable returning the current number of
+                   open positions (from Alpaca executor). If not provided,
+                   max_concurrent_positions check is skipped.
     """
 
     def __init__(
         self,
         cooldown: CooldownTracker,
         settings: RiskSettings | None = None,
+        get_position_count: Callable[[], int] | None = None,
     ) -> None:
         self._cooldown = cooldown
+        self._get_position_count = get_position_count
         if settings is not None:
             self._settings = settings
         else:
@@ -82,14 +89,26 @@ class RiskManager:
             logger.warning("risk_rejected_daily_loss", reason=reason)
             return RiskDecision(approved=False, reason=reason)
 
-        # b. Time window check
+        # b. Max concurrent positions
+        if self._get_position_count is not None:
+            try:
+                pos_count = self._get_position_count()
+                max_pos = self._settings.max_concurrent_positions
+                if pos_count >= max_pos:
+                    reason = f"Max concurrent positions reached: {pos_count}/{max_pos}"
+                    logger.warning("risk_max_positions_reached", reason=reason, count=pos_count)
+                    return RiskDecision(approved=False, reason=reason)
+            except Exception as exc:
+                logger.error("risk_position_count_failed", error=str(exc))
+
+        # c. Time window check
         if not self._is_time_allowed(signal):
             bar_time = signal.timestamp.astimezone(_ET).time()
             reason = f"Outside allowed trading window: {bar_time}"
             logger.warning("risk_rejected_time", reason=reason, bar_time=str(bar_time))
             return RiskDecision(approved=False, reason=reason)
 
-        # c. Daily trade count
+        # d. Daily trade count
         if self._cooldown.daily_trade_count >= self._settings.max_trades_per_day:
             reason = (
                 f"Max daily trades reached: {self._cooldown.daily_trade_count} "
@@ -98,7 +117,7 @@ class RiskManager:
             logger.warning("risk_rejected_trade_count", reason=reason)
             return RiskDecision(approved=False, reason=reason)
 
-        # d. Tilt check (3+ consecutive losses)
+        # e. Tilt check (3+ consecutive losses)
         if self._cooldown.is_tilted():
             reason = (
                 f"Tilted: {self._cooldown.consecutive_losses} consecutive losses "
@@ -107,7 +126,7 @@ class RiskManager:
             logger.warning("risk_rejected_tilted", reason=reason)
             return RiskDecision(approved=False, reason=reason)
 
-        # e. Cooldown check (15 min after 2 consecutive losses)
+        # f. Cooldown check (15 min after 2 consecutive losses)
         if not self._cooldown.is_cooled_down():
             reason = (
                 f"Cooldown active: {self._cooldown.consecutive_losses} consecutive losses, "
@@ -116,13 +135,13 @@ class RiskManager:
             logger.warning("risk_rejected_cooldown", reason=reason)
             return RiskDecision(approved=False, reason=reason)
 
-        # f. Risk/reward ratio
+        # g. Risk/reward ratio
         if signal.risk_reward_ratio < _MIN_RR:
             reason = f"R:R {signal.risk_reward_ratio:.2f} below minimum {_MIN_RR}"
             logger.warning("risk_rejected_rr", reason=reason, rr=str(signal.risk_reward_ratio))
             return RiskDecision(approved=False, reason=reason)
 
-        # g. Position sizing (scaled by position_scale_factor)
+        # h. Position sizing (scaled by position_scale_factor)
         size = calculate_position_size(
             account_size=self._settings.account_size,
             risk_pct=self._settings.risk_per_trade_pct,

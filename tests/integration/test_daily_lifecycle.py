@@ -108,7 +108,7 @@ def _run_bars_through_pipeline(bars: list[Bar], symbol: str = "SPY") -> tuple:
     registry = _build_registry()
     levels = LevelManager(db=None, symbol=symbol)
     regime = RegimeDetector()
-    strategy = ORBStrategy(excluded_days=[])
+    strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45", adx_min_threshold=15)
     signals = []
     for b in bars:
         registry.update_all(b)
@@ -178,7 +178,12 @@ class TestLunchChopFilter:
 
 
 class TestSignalTimeWindow:
-    """Verify signals only fire within the valid 9:35-15:45 ET window."""
+    """Verify signals only fire within the allowed time window.
+
+    Note: ``_run_bars_through_pipeline`` uses a relaxed ``signal_cutoff_et="15:45"``
+    so integration tests can exercise full-day bar sequences.  The default
+    production cutoff (10:00 ET) is validated in ``test_filter_parity.py``.
+    """
 
     @patch("src.strategies.orb.is_high_impact_day", return_value=False)
     @patch("src.strategies.orb.is_earnings_blackout", return_value=False)
@@ -193,6 +198,7 @@ class TestSignalTimeWindow:
         for sig in signals:
             t = sig.timestamp.astimezone(et).time()
             assert t >= time(9, 35), f"Signal before 9:35 ET: {t}"
+            # _run_bars_through_pipeline uses signal_cutoff_et="15:45"
             assert t < time(15, 45), f"Signal after 15:45 ET: {t}"
 
 
@@ -294,13 +300,17 @@ class TestSignalsPersistence:
     @patch("src.strategies.orb.is_high_impact_day", return_value=False)
     @patch("src.strategies.orb.is_earnings_blackout", return_value=False)
     async def test_signals_table_has_correct_count_after_day(self, _m1, _m2, fake_db) -> None:
-        """Prevents: signals silently dropped, DB count off from dispatched count."""
+        """Prevents: signals silently dropped, DB count off from dispatched count.
+
+        Uses a wider signal_cutoff_et so the breakout bars at offset 35
+        (10:05 ET) aren't filtered by the default 10:00 cutoff.
+        """
         pipe = _SymbolPipeline(
             symbol="SPY",
             registry=_build_registry(),
             levels=LevelManager(db=None, symbol="SPY"),
             regime=RegimeDetector(),
-            strategy=ORBStrategy(excluded_days=[]),
+            strategy=ORBStrategy(excluded_days=[], signal_cutoff_et="15:45", adx_min_threshold=15),
         )
         alerter = FakeAlerter()
         disp = AlertDispatcher(alerter=alerter)

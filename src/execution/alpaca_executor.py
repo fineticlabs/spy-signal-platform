@@ -196,6 +196,11 @@ class AlpacaExecutor:
             logger.error("existing_positions_load_failed", error=str(exc))
             return []
 
+    def get_position_count(self) -> int:
+        """Return the current number of open Alpaca positions."""
+        positions = self._client.get_all_positions()
+        return len(positions)
+
     def clear_submitted_symbols(self) -> None:
         """Clear the local dedup set.  Call at EOD after flatten."""
         self._submitted_symbols.clear()

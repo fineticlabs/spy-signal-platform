@@ -104,7 +104,7 @@ def _build_pipeline(
     registry = _build_registry()
     levels = LevelManager(db=None, symbol="SPY")
     regime = RegimeDetector()
-    strategy = ORBStrategy(excluded_days=[])
+    strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
     cooldown = CooldownTracker()
     settings = RiskSettings(
         account_size=Decimal(str(account_size)),
@@ -162,8 +162,8 @@ class TestORBPipelineIntegration:
         # Feed ORB window (9:30-9:34 ET), ORB high ~483.5
         _feed_orb_bars(registry, levels, orb_high=483.0)
 
-        # Set regime so ORB filters pass
-        regime.update(vix=Decimal("18"), adx=Decimal("25"), trending_up=True)
+        # Set regime so ORB filters pass (ADX must be > 25 per backtest parity)
+        regime.update(vix=Decimal("18"), adx=Decimal("28"), trending_up=True)
 
         # Feed enough additional bars so volume deque has 20 entries at 500k avg
         for minute in range(35, 55):
@@ -172,14 +172,19 @@ class TestORBPipelineIntegration:
             levels.update(bar)
             strategy.evaluate(bar, registry.get_snapshot(), levels.get_levels(), regime)
 
-        # Feed the breakout bar
-        breakout = _et_bar(et_hour, et_minute, close=breakout_close, volume=breakout_volume)
-        registry.update_all(breakout)
-        levels.update(breakout)
+        # Feed two consecutive breakout bars (2-bar confirmation required)
+        breakout1 = _et_bar(et_hour, et_minute, close=breakout_close, volume=breakout_volume)
+        registry.update_all(breakout1)
+        levels.update(breakout1)
+        strategy.evaluate(breakout1, registry.get_snapshot(), levels.get_levels(), regime)
+
+        breakout2 = _et_bar(et_hour, et_minute + 1, close=breakout_close, volume=breakout_volume)
+        registry.update_all(breakout2)
+        levels.update(breakout2)
         snapshot = registry.get_snapshot()
         level_snap = levels.get_levels()
 
-        signal = strategy.evaluate(breakout, snapshot, level_snap, regime)
+        signal = strategy.evaluate(breakout2, snapshot, level_snap, regime)
         decision = risk.approve(signal) if signal is not None else None
         return signal, decision, alerter
 
@@ -268,7 +273,7 @@ class TestORBPipelineIntegration:
             registry.update_all(bar)
             levels.update(bar)
 
-        regime.update(vix=Decimal("18"), adx=Decimal("25"), trending_up=False)
+        regime.update(vix=Decimal("18"), adx=Decimal("28"), trending_up=False)
 
         # Prime volume deque with 20 avg-500k bars
         for minute in range(35, 55):
@@ -277,12 +282,18 @@ class TestORBPipelineIntegration:
             levels.update(bar)
             strategy.evaluate(bar, registry.get_snapshot(), levels.get_levels(), regime)
 
-        breakdown = _et_bar(10, 0, close=474.0, volume=1_500_000)
-        registry.update_all(breakdown)
-        levels.update(breakdown)
+        # 2-bar confirmation for breakdown
+        breakdown1 = _et_bar(10, 0, close=474.0, volume=1_500_000)
+        registry.update_all(breakdown1)
+        levels.update(breakdown1)
+        strategy.evaluate(breakdown1, registry.get_snapshot(), levels.get_levels(), regime)
+
+        breakdown2 = _et_bar(10, 1, close=474.0, volume=1_500_000)
+        registry.update_all(breakdown2)
+        levels.update(breakdown2)
         snapshot = registry.get_snapshot()
         level_snap = levels.get_levels()
-        signal = strategy.evaluate(breakdown, snapshot, level_snap, regime)
+        signal = strategy.evaluate(breakdown2, snapshot, level_snap, regime)
 
         assert signal is not None
         assert signal.direction == Direction.SHORT

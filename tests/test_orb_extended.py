@@ -120,22 +120,15 @@ def _evaluate_long(
     high: Decimal | None = None,
     low: Decimal | None = None,
 ):
-    """Helper to call evaluate with sane defaults for a LONG breakout."""
-    bar = _make_bar(
-        close,
-        symbol=symbol,
-        volume=volume,
-        hour=hour,
-        minute=minute,
-        open_=open_,
-        high=high,
-        low=low,
-    )
-    return strategy.evaluate(
-        bar,
-        indicators or _indicators(),
-        levels or _levels(),
-        regime or MockRegime(),
+    """Helper to call evaluate with 2-bar confirmation for a LONG breakout.
+
+    Sends two consecutive bars at (hour, minute) and (hour, minute+1)
+    to satisfy 2-bar confirmation. Returns the signal from the second bar.
+    """
+    _ind = indicators or _indicators()
+    _lvl = levels or _levels()
+    _reg = regime or MockRegime()
+    kwargs = dict(
         spy_vwap=spy_vwap,
         spy_price=spy_price,
         vp_poc=vp_poc,
@@ -147,6 +140,32 @@ def _evaluate_long(
         hmm_regime=hmm_regime,
         kalman_stop_mult=kalman_stop_mult,
     )
+
+    # First bar — sets pending confirmation
+    bar1 = _make_bar(
+        close,
+        symbol=symbol,
+        volume=volume,
+        hour=hour,
+        minute=minute,
+        open_=open_,
+        high=high,
+        low=low,
+    )
+    strategy.evaluate(bar1, _ind, _lvl, _reg, **kwargs)
+
+    # Second bar — confirms breakout
+    bar2 = _make_bar(
+        close,
+        symbol=symbol,
+        volume=volume,
+        hour=hour,
+        minute=minute + 1,
+        open_=open_,
+        high=high,
+        low=low,
+    )
+    return strategy.evaluate(bar2, _ind, _lvl, _reg, **kwargs)
 
 
 # ===========================================================================
@@ -161,13 +180,13 @@ class TestEconomicCalendarFilter:
 
     def test_high_impact_day_blocks_signal(self, _mock_econ, _mock_earn):
         _mock_econ.return_value = True  # override to True
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy)
         assert sig is None
 
     def test_non_high_impact_day_allows_signal(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy)
         assert sig is not None
@@ -181,14 +200,14 @@ class TestEarningsBlackout:
 
     def test_earnings_blackout_adds_tag(self, _mock_econ, _mock_earn):
         _mock_earn.return_value = True
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy)
         assert sig is not None
         assert "EARNINGS" in sig.tags
 
     def test_no_earnings_no_tag(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy)
         assert sig is not None
@@ -201,7 +220,7 @@ class TestMarketDirectionConfirmation:
     """3. SPY VWAP alignment tags."""
 
     def test_spy_aligned_long_above_vwap(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -213,7 +232,7 @@ class TestMarketDirectionConfirmation:
         assert sig.confidence_score >= 4  # base 3 + 1
 
     def test_spy_conflict_long_below_vwap(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -225,7 +244,7 @@ class TestMarketDirectionConfirmation:
         assert sig.confidence_score == 1  # base 3 - 2
 
     def test_spy_aligned_short_below_vwap(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -238,7 +257,7 @@ class TestMarketDirectionConfirmation:
         assert "SPY_ALIGNED" in sig.tags
 
     def test_spy_conflict_short_above_vwap(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -252,7 +271,7 @@ class TestMarketDirectionConfirmation:
 
     def test_spy_exempt_ticker_no_tag(self, _mock_econ, _mock_earn):
         """SPY itself is exempt from market direction check."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -265,7 +284,7 @@ class TestMarketDirectionConfirmation:
         assert "SPY_CONFLICT" not in sig.tags
 
     def test_no_spy_data_no_tag(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, spy_vwap=None, spy_price=None)
         assert sig is not None
@@ -279,7 +298,7 @@ class TestRvolConfidenceAdjustment:
     """4. RVOL confidence adjustment."""
 
     def test_low_rvol_demotes_confidence(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, levels=_levels(rvol=Decimal("0.3")))
         assert sig is not None
@@ -287,7 +306,7 @@ class TestRvolConfidenceAdjustment:
         assert sig.confidence_score == 1  # base 3 - 2
 
     def test_high_rvol_boosts_confidence(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, levels=_levels(rvol=Decimal("2.0")))
         assert sig is not None
@@ -295,7 +314,7 @@ class TestRvolConfidenceAdjustment:
         assert sig.confidence_score == 4  # base 3 + 1
 
     def test_medium_rvol_no_adjustment(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, levels=_levels(rvol=Decimal("1.0")))
         assert sig is not None
@@ -304,7 +323,7 @@ class TestRvolConfidenceAdjustment:
         assert sig.confidence_score == 3
 
     def test_rvol_none_no_adjustment(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, levels=_levels(rvol=None))
         assert sig is not None
@@ -313,7 +332,7 @@ class TestRvolConfidenceAdjustment:
 
     def test_rvol_exactly_half_demotes(self, _mock_econ, _mock_earn):
         """RVOL < 0.5 threshold (strict less-than)."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, levels=_levels(rvol=Decimal("0.5")))
         assert sig is not None
@@ -322,7 +341,7 @@ class TestRvolConfidenceAdjustment:
 
     def test_rvol_exactly_one_point_five_boosts(self, _mock_econ, _mock_earn):
         """RVOL >= 1.5 threshold (gte)."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, levels=_levels(rvol=Decimal("1.5")))
         assert sig is not None
@@ -336,7 +355,7 @@ class TestVolumeProfileTags:
 
     def test_lvn_target_outside_value_area_high(self, _mock_econ, _mock_earn):
         """LONG target above VAH → VP_LVN_TARGET."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -350,7 +369,7 @@ class TestVolumeProfileTags:
 
     def test_hvn_target_inside_value_area(self, _mock_econ, _mock_earn):
         """Target inside Value Area → VP_HVN_TARGET."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -364,7 +383,7 @@ class TestVolumeProfileTags:
 
     def test_poc_cross_long(self, _mock_econ, _mock_earn):
         """Entry-to-target path crosses POC → VP_POC_CROSS."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -378,7 +397,7 @@ class TestVolumeProfileTags:
 
     def test_poc_cross_short(self, _mock_econ, _mock_earn):
         """SHORT: target-to-entry path crosses POC → VP_POC_CROSS."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -393,7 +412,7 @@ class TestVolumeProfileTags:
         assert "VP_POC_CROSS" in sig.tags
 
     def test_no_vp_data_no_tags(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy)
         assert sig is not None
@@ -408,23 +427,22 @@ class TestVixTermStructure:
     """6. VIX term structure tags."""
 
     def test_contango_boosts_confidence(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, vix_term_ratio=Decimal("0.80"))
         assert sig is not None
         assert "CONTANGO" in sig.tags
         assert sig.confidence_score == 4  # base 3 + 1
 
-    def test_backwardation_demotes_confidence(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+    def test_backwardation_blocks_signal(self, _mock_econ, _mock_earn):
+        """VIX backwardation is now a hard block (matches backtest)."""
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, vix_term_ratio=Decimal("1.10"))
-        assert sig is not None
-        assert "BACKWARDATION" in sig.tags
-        assert sig.confidence_score == 1  # base 3 - 2
+        assert sig is None  # hard block, not just a tag
 
     def test_neutral_vix_ratio_no_tag(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, vix_term_ratio=Decimal("0.92"))
         assert sig is not None
@@ -432,7 +450,7 @@ class TestVixTermStructure:
         assert "BACKWARDATION" not in sig.tags
 
     def test_no_vix_ratio_no_tag(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, vix_term_ratio=None)
         assert sig is not None
@@ -446,7 +464,7 @@ class TestHmmRegime:
     """7. HMM regime tags."""
 
     def test_volatile_boosts_confidence(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, hmm_regime="VOLATILE")
         assert sig is not None
@@ -454,7 +472,7 @@ class TestHmmRegime:
         assert sig.confidence_score == 4
 
     def test_calm_demotes_confidence(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, hmm_regime="CALM")
         assert sig is not None
@@ -462,7 +480,7 @@ class TestHmmRegime:
         assert sig.confidence_score == 2
 
     def test_normal_tag_only(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, hmm_regime="NORMAL")
         assert sig is not None
@@ -470,7 +488,7 @@ class TestHmmRegime:
         assert sig.confidence_score == 3  # unchanged
 
     def test_no_hmm_regime_no_tag(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, hmm_regime=None)
         assert sig is not None
@@ -485,7 +503,7 @@ class TestEngulfingBar:
     """8. Engulfing bar detection."""
 
     def test_engulfing_long_boosts_confidence(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         # Feed a small prior bar so the breakout bar engulfs it
         prev = _make_bar(
@@ -509,7 +527,7 @@ class TestEngulfingBar:
         assert "ENGULFING" in sig.tags
 
     def test_no_engulfing_no_tag(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         # Prior bar is large, so breakout bar cannot engulf it
         prev = _make_bar(
@@ -532,9 +550,11 @@ class TestInsideBarCompression:
     """9. Inside bar compression."""
 
     def test_compressed_bars_boost_confidence(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
-        # Build 4 prior bars where bar[1] is inside bar[0]
+        # Build 3 prior bars where bar[1] is inside bar[0].
+        # _evaluate_long adds 2 bars (2-bar confirmation), so 3 + 2 = 5
+        # which fills the deque (maxlen=5) for compression check.
         bars = [
             _make_bar(
                 Decimal("449.50"), high=Decimal("450.50"), low=Decimal("448.50"), hour=9, minute=50
@@ -545,9 +565,6 @@ class TestInsideBarCompression:
             _make_bar(
                 Decimal("449.50"), high=Decimal("450.20"), low=Decimal("448.80"), hour=9, minute=52
             ),
-            _make_bar(
-                Decimal("449.50"), high=Decimal("450.30"), low=Decimal("448.70"), hour=9, minute=53
-            ),
         ]
         for b in bars:
             strategy._recent_bars.append(b)
@@ -556,25 +573,11 @@ class TestInsideBarCompression:
         assert "COMPRESSED" in sig.tags
 
     def test_no_compression_no_tag(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
-        # Expanding bars — no inside bar
-        bars = [
-            _make_bar(
-                Decimal("449.50"), high=Decimal("450.00"), low=Decimal("449.00"), hour=9, minute=50
-            ),
-            _make_bar(
-                Decimal("449.50"), high=Decimal("450.50"), low=Decimal("448.50"), hour=9, minute=51
-            ),
-            _make_bar(
-                Decimal("449.50"), high=Decimal("451.00"), low=Decimal("448.00"), hour=9, minute=52
-            ),
-            _make_bar(
-                Decimal("449.50"), high=Decimal("451.50"), low=Decimal("447.50"), hour=9, minute=53
-            ),
-        ]
-        for b in bars:
-            strategy._recent_bars.append(b)
+        # Clear recent bars — with only 2 bars from _evaluate_long,
+        # the compression check (requires >= 5 bars) won't fire
+        strategy._recent_bars.clear()
         sig = _evaluate_long(strategy)
         assert sig is not None
         assert "COMPRESSED" not in sig.tags
@@ -586,11 +589,11 @@ class TestKalmanAdaptiveStop:
     """10. Kalman adaptive stop multiplier."""
 
     def test_kalman_mult_widens_stop(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig_default = _evaluate_long(strategy)
 
-        strategy2 = ORBStrategy(excluded_days=[])
+        strategy2 = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy2)
         sig_wide = _evaluate_long(strategy2, kalman_stop_mult=Decimal("1.5"))
 
@@ -602,7 +605,7 @@ class TestKalmanAdaptiveStop:
         assert sig_wide.target_price == sig_default.target_price
 
     def test_kalman_mult_tightens_stop(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, kalman_stop_mult=Decimal("0.9"))
         assert sig is not None
@@ -610,7 +613,7 @@ class TestKalmanAdaptiveStop:
         assert sig.stop_price == Decimal("451.00") - Decimal("1.35")
 
     def test_kalman_none_defaults_to_one(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, kalman_stop_mult=None)
         assert sig is not None
@@ -625,7 +628,7 @@ class TestConfidenceClamping:
 
     def test_confidence_clamped_at_max_5(self, _mock_econ, _mock_earn):
         """Stack multiple boosters: SPY_ALIGNED(+1) + HIGH_RVOL(+1) + CONTANGO(+1) + VOLATILE(+1) = 3+4=7 → 5."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
@@ -639,15 +642,15 @@ class TestConfidenceClamping:
         assert sig.confidence_score == 5
 
     def test_confidence_clamped_at_min_1(self, _mock_econ, _mock_earn):
-        """Stack demoters: SPY_CONFLICT(-2) + LOW_RVOL(-2) + BACKWARDATION(-2) = 3-6=-3 → 1."""
-        strategy = ORBStrategy(excluded_days=[])
+        """Stack demoters: SPY_CONFLICT(-2) + LOW_RVOL(-2) + HMM_CALM(-1) = 3-5=-2 → 1."""
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(
             strategy,
             spy_vwap=Decimal("446.00"),
             spy_price=Decimal("444.00"),
             levels=_levels(rvol=Decimal("0.3")),
-            vix_term_ratio=Decimal("1.10"),
+            hmm_regime="CALM",
         )
         assert sig is not None
         # Pydantic Signal has ge=1, so if code clamps correctly it passes
@@ -661,7 +664,7 @@ class TestRiskZeroReturnsNone:
 
     def test_zero_risk_returns_none(self, _mock_econ, _mock_earn):
         """If entry == stop (risk=0) signal should be None."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         # ATR=0 → stop = entry, risk = 0
         sig = _evaluate_long(strategy, indicators=_indicators(atr=Decimal("0")))
@@ -669,7 +672,7 @@ class TestRiskZeroReturnsNone:
 
     def test_negative_risk_returns_none(self, _mock_econ, _mock_earn):
         """Negative ATR (should not happen, but guard works)."""
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, indicators=_indicators(atr=Decimal("-1.0")))
         assert sig is None
@@ -681,7 +684,7 @@ class TestShortDirection:
     """Ensure SHORT direction works for key branches."""
 
     def test_short_signal_basic(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, close=Decimal("447.00"))
         assert sig is not None
@@ -690,7 +693,7 @@ class TestShortDirection:
         assert sig.target_price < sig.entry_price
 
     def test_short_kalman_widens_stop(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, close=Decimal("447.00"), kalman_stop_mult=Decimal("1.5"))
         assert sig is not None
@@ -705,7 +708,7 @@ class TestPriceInsideOrbRange:
     """Price inside ORB range returns None."""
 
     def test_price_inside_orb_returns_none(self, _mock_econ, _mock_earn):
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         _prime_strategy(strategy)
         sig = _evaluate_long(strategy, close=Decimal("449.00"))
         assert sig is None

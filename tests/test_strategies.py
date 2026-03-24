@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from src.models import Bar, Direction, IndicatorSnapshot, LevelSnapshot, Regime, TimeFrame
+from src.models import Bar, Direction, IndicatorSnapshot, LevelSnapshot, Regime, Signal, TimeFrame
 from src.strategies.orb import ORBStrategy
 from src.strategies.regime import RegimeDetector
 
@@ -82,6 +82,48 @@ def _prime(
         strategy.evaluate(_bar(9, 36 + i, close=482.0, volume=volume), indicators, levels, regime)
 
 
+def _two_bar_breakout(
+    strategy: ORBStrategy,
+    close: float,
+    volume: int = 2_000_000,
+    orb_high: float = 485.0,
+    orb_low: float = 480.0,
+    atr: float = 2.0,
+    regime: RegimeDetector | None = None,
+    indicators: IndicatorSnapshot | None = None,
+    levels: LevelSnapshot | None = None,
+    et_hour: int = 9,
+    et_minute_1: int = 36,
+    et_minute_2: int = 37,
+    date_str: str = "2024-01-15",
+) -> Signal | None:
+    """Send two consecutive bars to trigger 2-bar confirmation.
+
+    Returns the signal from the second bar (or None).
+    """
+    if regime is None:
+        regime = _make_regime()
+    if indicators is None:
+        indicators = _make_indicators(atr=atr)
+    if levels is None:
+        levels = _make_levels(orb_high=orb_high, orb_low=orb_low)
+
+    # First bar — sets pending
+    strategy.evaluate(
+        _bar(et_hour, et_minute_1, close=close, volume=volume, date_str=date_str),
+        indicators,
+        levels,
+        regime,
+    )
+    # Second bar — confirms
+    return strategy.evaluate(
+        _bar(et_hour, et_minute_2, close=close, volume=volume, date_str=date_str),
+        indicators,
+        levels,
+        regime,
+    )
+
+
 # ── RegimeDetector tests ──────────────────────────────────────────────────────
 
 
@@ -131,42 +173,25 @@ class TestRegimeDetector:
 
 
 class TestORBStrategy:
+    """Tests updated for 2-bar confirmation and 10:00 ET cutoff (backtest parity)."""
+
     def test_long_signal_fires_above_orb_high(self) -> None:
-        """LONG signal when close > ORB high with sufficient volume."""
+        """LONG signal when 2 consecutive closes > ORB high with sufficient volume."""
         strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
-        levels = _make_levels(orb_high=485.0, orb_low=480.0)
-        indicators = _make_indicators(atr=2.0)
-        regime = _make_regime()
-
-        # Close above ORB high, volume 2x average
-        signal = strategy.evaluate(
-            _bar(10, 0, close=486.0, volume=2_000_000),
-            indicators,
-            levels,
-            regime,
-        )
+        signal = _two_bar_breakout(strategy, close=486.0)
 
         assert signal is not None
         assert signal.direction == Direction.LONG
         assert signal.entry_price == Decimal("486.0")
 
     def test_short_signal_fires_below_orb_low(self) -> None:
-        """SHORT signal when close < ORB low with sufficient volume."""
+        """SHORT signal when 2 consecutive closes < ORB low with sufficient volume."""
         strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
-        levels = _make_levels(orb_high=485.0, orb_low=480.0)
-        indicators = _make_indicators(atr=2.0)
-        regime = _make_regime(trending_up=False)
-
-        signal = strategy.evaluate(
-            _bar(10, 0, close=479.0, volume=2_000_000),
-            indicators,
-            levels,
-            regime,
-        )
+        signal = _two_bar_breakout(strategy, close=479.0, regime=_make_regime(trending_up=False))
 
         assert signal is not None
         assert signal.direction == Direction.SHORT
@@ -178,7 +203,7 @@ class TestORBStrategy:
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
-            _bar(10, 0, close=482.5, volume=2_000_000),
+            _bar(9, 36, close=482.5, volume=2_000_000),
             _make_indicators(),
             _make_levels(orb_high=485.0, orb_low=480.0),
             _make_regime(),
@@ -199,7 +224,7 @@ class TestORBStrategy:
         assert signal is None
 
     def test_no_signal_during_lunch_chop(self) -> None:
-        """No signal between 11:30 and 13:30 ET."""
+        """No signal between 11:30 and 13:30 ET (blocked by cutoff first at 10:00)."""
         strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
@@ -212,12 +237,12 @@ class TestORBStrategy:
         assert signal is None
 
     def test_no_signal_after_cutoff(self) -> None:
-        """No signal at or after 15:45 ET."""
+        """No signal at or after the cutoff (default 10:00 ET)."""
         strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
-            _bar(15, 45, close=486.0, volume=2_000_000),
+            _bar(10, 0, close=486.0, volume=2_000_000),
             _make_indicators(),
             _make_levels(orb_high=485.0, orb_low=480.0),
             _make_regime(),
@@ -230,7 +255,7 @@ class TestORBStrategy:
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
-            _bar(10, 0, close=486.0, volume=2_000_000),
+            _bar(9, 36, close=486.0, volume=2_000_000),
             _make_indicators(),
             _make_levels(orb_high=485.0, orb_low=480.0),
             _make_regime(vix=26.0),
@@ -238,15 +263,15 @@ class TestORBStrategy:
         assert signal is None
 
     def test_no_signal_when_adx_too_low(self) -> None:
-        """No signal when ADX <= 20."""
+        """No signal when ADX <= 25 (aligned with backtest threshold)."""
         strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
-            _bar(10, 0, close=486.0, volume=2_000_000),
+            _bar(9, 36, close=486.0, volume=2_000_000),
             _make_indicators(),
             _make_levels(orb_high=485.0, orb_low=480.0),
-            _make_regime(adx=18.0),
+            _make_regime(adx=24.0),
         )
         assert signal is None
 
@@ -255,9 +280,8 @@ class TestORBStrategy:
         strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
-        # Volume only 1.2x average — below the 1.5x threshold
         signal = strategy.evaluate(
-            _bar(10, 0, close=486.0, volume=1_200_000),
+            _bar(9, 36, close=486.0, volume=1_200_000),
             _make_indicators(),
             _make_levels(orb_high=485.0, orb_low=480.0),
             _make_regime(),
@@ -271,12 +295,7 @@ class TestORBStrategy:
 
         atr = Decimal("2.0")
         entry = Decimal("486.0")
-        signal = strategy.evaluate(
-            _bar(10, 0, close=float(entry), volume=2_000_000),
-            _make_indicators(atr=float(atr)),
-            _make_levels(orb_high=485.0, orb_low=480.0),
-            _make_regime(),
-        )
+        signal = _two_bar_breakout(strategy, close=float(entry), atr=float(atr))
 
         assert signal is not None
         expected_stop = entry - Decimal("1.5") * atr  # 483.0
@@ -293,11 +312,11 @@ class TestORBStrategy:
 
         atr = Decimal("2.0")
         entry = Decimal("479.0")
-        signal = strategy.evaluate(
-            _bar(10, 0, close=float(entry), volume=2_000_000),
-            _make_indicators(atr=float(atr)),
-            _make_levels(orb_high=485.0, orb_low=480.0),
-            _make_regime(trending_up=False),
+        signal = _two_bar_breakout(
+            strategy,
+            close=float(entry),
+            atr=float(atr),
+            regime=_make_regime(trending_up=False),
         )
 
         assert signal is not None
@@ -313,12 +332,7 @@ class TestORBStrategy:
         _prime(strategy, n=20, volume=1_000_000)
 
         regime = _make_regime(vix=18.5, adx=28.0, trending_up=True)
-        signal = strategy.evaluate(
-            _bar(10, 0, close=486.0, volume=2_000_000),
-            _make_indicators(),
-            _make_levels(orb_high=485.0, orb_low=480.0),
-            regime,
-        )
+        signal = _two_bar_breakout(strategy, close=486.0, regime=regime)
 
         assert signal is not None
         assert signal.vix == Decimal("18.5")
@@ -331,7 +345,7 @@ class TestORBStrategy:
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
-            _bar(10, 0, close=486.0, volume=2_000_000),
+            _bar(9, 36, close=486.0, volume=2_000_000),
             IndicatorSnapshot(),  # all None
             _make_levels(orb_high=485.0, orb_low=480.0),
             _make_regime(),

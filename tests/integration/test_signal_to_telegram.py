@@ -112,7 +112,7 @@ def pipeline():
         registry=_build_registry(),
         levels=LevelManager(db=None, symbol="SPY"),
         regime=RegimeDetector(),
-        strategy=ORBStrategy(excluded_days=[]),
+        strategy=ORBStrategy(excluded_days=[], signal_cutoff_et="15:45", adx_min_threshold=15),
     )
 
 
@@ -219,7 +219,7 @@ class TestSignalToDispatcher:
             registry=_build_registry(),
             levels=LevelManager(db=None, symbol="SPY"),
             regime=RegimeDetector(),
-            strategy=ORBStrategy(excluded_days=[]),
+            strategy=ORBStrategy(excluded_days=[], signal_cutoff_et="15:45", adx_min_threshold=15),
         )
         await _feed_full_sequence(pipe, rm, disp, fake_db)
         assert fake_alerter.send_signal.call_count == 0
@@ -241,7 +241,7 @@ class TestSignalToDispatcher:
             registry=_build_registry(),
             levels=LevelManager(db=None, symbol="SPY"),
             regime=RegimeDetector(),
-            strategy=ORBStrategy(excluded_days=[]),
+            strategy=ORBStrategy(excluded_days=[], signal_cutoff_et="15:45", adx_min_threshold=15),
         )
         await _feed_full_sequence(pipe, rm, disp, fake_db)
         since = datetime(2024, 1, 1, tzinfo=UTC)

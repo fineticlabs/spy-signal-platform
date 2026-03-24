@@ -821,14 +821,14 @@ class TestORBStrategy:
     def test_required_indicators_line75(self):
         from src.strategies.orb import ORBStrategy
 
-        strat = ORBStrategy(excluded_days=[])
+        strat = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         assert strat.required_indicators() == ["atr"]
 
     def test_orb_high_low_none_line140(self):
         from src.strategies.orb import ORBStrategy
         from tests.conftest import make_bar
 
-        strat = ORBStrategy(excluded_days=[])
+        strat = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         # Fill some volume history
         for _ in range(20):
             strat._volumes.append(100_000)
@@ -852,7 +852,7 @@ class TestORBStrategy:
         from src.strategies.orb import ORBStrategy
         from tests.conftest import make_bar
 
-        strat = ORBStrategy(excluded_days=[])
+        strat = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         for _ in range(20):
             strat._volumes.append(100_000)
 

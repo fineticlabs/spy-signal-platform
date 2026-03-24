@@ -243,7 +243,7 @@ class TestVolumeFilterRejectsLowVolume:
         """Create an ORBStrategy primed with a volume baseline."""
         from src.strategies.orb import ORBStrategy
 
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
         # Prime with baseline volume data (ORB incomplete, no signals fire)
         from src.models import IndicatorSnapshot, LevelSnapshot
         from src.strategies.regime import RegimeDetector
@@ -334,12 +334,12 @@ class TestVolumeFilterRejectsLowVolume:
         regime = RegimeDetector()
         regime.update(vix=Decimal("18"), adx=Decimal("28"), trending_up=True)
 
-        # Volume 2M >= 1.5 * 1M → breakout confirmed
-        ts = datetime(2024, 1, 15, 10, 0, tzinfo=et).astimezone(UTC)
-        bar = Bar(
+        # Volume 2M >= 1.5 * 1M → breakout confirmed (2-bar confirmation needed)
+        ts1 = datetime(2024, 1, 15, 9, 56, tzinfo=et).astimezone(UTC)
+        bar1 = Bar(
             symbol="SPY",
             timeframe=TimeFrame.ONE_MIN,
-            timestamp=ts,
+            timestamp=ts1,
             open=Decimal("486.00"),
             high=Decimal("486.50"),
             low=Decimal("485.50"),
@@ -347,7 +347,21 @@ class TestVolumeFilterRejectsLowVolume:
             volume=2_000_000,
             vwap=Decimal("486.00"),
         )
-        signal = strategy.evaluate(bar, indicators, levels, regime)
+        strategy.evaluate(bar1, indicators, levels, regime)  # first bar: pending
+
+        ts2 = datetime(2024, 1, 15, 9, 57, tzinfo=et).astimezone(UTC)
+        bar2 = Bar(
+            symbol="SPY",
+            timeframe=TimeFrame.ONE_MIN,
+            timestamp=ts2,
+            open=Decimal("486.00"),
+            high=Decimal("486.50"),
+            low=Decimal("485.50"),
+            close=Decimal("486.00"),
+            volume=2_000_000,
+            vwap=Decimal("486.00"),
+        )
+        signal = strategy.evaluate(bar2, indicators, levels, regime)  # second bar: confirmed
         assert signal is not None
         assert signal.direction.name == "LONG"
 
@@ -661,7 +675,7 @@ class TestMondayFilterLive:
         from src.models import LevelSnapshot
         from src.strategies.orb import ORBStrategy
 
-        strategy = ORBStrategy(excluded_days=[0])
+        strategy = ORBStrategy(excluded_days=[0], signal_cutoff_et="15:45")
 
         # Prime with volume data on a Tuesday
         indicators, levels_incomplete, regime = self._make_deps()
@@ -671,9 +685,11 @@ class TestMondayFilterLive:
             strategy.evaluate(bar, indicators, levels_incomplete, regime)
 
         indicators, levels, regime = self._make_deps()
-        # 2026-03-24 is a Tuesday — should produce signal
-        bar = self._make_bar_on_day("2026-03-24", close=486.0, volume=2_000_000)
-        signal = strategy.evaluate(bar, indicators, levels, regime)
+        # 2026-03-24 is a Tuesday — needs 2 bars for confirmation
+        bar1 = self._make_bar_on_day("2026-03-24", close=486.0, volume=2_000_000)
+        strategy.evaluate(bar1, indicators, levels, regime)  # pending
+        bar2 = self._make_bar_on_day("2026-03-24", close=486.0, volume=2_000_000)
+        signal = strategy.evaluate(bar2, indicators, levels, regime)  # confirmed
         assert signal is not None
         assert signal.direction.name == "LONG"
 
@@ -682,7 +698,7 @@ class TestMondayFilterLive:
         from src.models import LevelSnapshot
         from src.strategies.orb import ORBStrategy
 
-        strategy = ORBStrategy(excluded_days=[])
+        strategy = ORBStrategy(excluded_days=[], signal_cutoff_et="15:45")
 
         # Prime
         indicators, levels_incomplete, regime = self._make_deps()
@@ -692,8 +708,10 @@ class TestMondayFilterLive:
             strategy.evaluate(bar, indicators, levels_incomplete, regime)
 
         indicators, levels, regime = self._make_deps()
-        bar = self._make_bar_on_day("2026-03-23", close=486.0, volume=2_000_000)
-        signal = strategy.evaluate(bar, indicators, levels, regime)
+        bar1 = self._make_bar_on_day("2026-03-23", close=486.0, volume=2_000_000)
+        strategy.evaluate(bar1, indicators, levels, regime)  # pending
+        bar2 = self._make_bar_on_day("2026-03-23", close=486.0, volume=2_000_000)
+        signal = strategy.evaluate(bar2, indicators, levels, regime)  # confirmed
         assert signal is not None
 
     def test_config_excluded_days_default_is_monday(self) -> None:
