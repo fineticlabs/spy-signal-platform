@@ -673,14 +673,14 @@ class TestAlpacaExecutor:
         executor._client.get_all_positions.side_effect = APIError({"message": "fail"})
 
         result = executor.flatten_all_positions()
-        assert result == 0
+        assert result == {}
 
     def test_flatten_no_positions(self) -> None:
         executor = self._make_executor()
         executor._client.get_all_positions.return_value = []
 
         result = executor.flatten_all_positions()
-        assert result == 0
+        assert result == {}
 
     def test_flatten_close_failure(self) -> None:
         from alpaca.common.exceptions import APIError
@@ -694,7 +694,8 @@ class TestAlpacaExecutor:
         executor._client.close_position.side_effect = APIError({"message": "fail"})
 
         result = executor.flatten_all_positions()
-        assert result == 0
+        # SPY should show as failed after all retry attempts
+        assert result.get("SPY") != "closed"
 
     def test_cancel_open_orders_api_error(self) -> None:
         from alpaca.common.exceptions import APIError

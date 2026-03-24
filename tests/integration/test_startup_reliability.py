@@ -111,8 +111,12 @@ class TestConnectionStateEvents:
         ):
             await stream.start()
 
-        assert len(failure_messages) == 1
-        assert "3 attempts" in failure_messages[0]
+        # 3 disconnect alerts + 1 final exhaustion alert = 4 total
+        assert len(failure_messages) == 4
+        # Last message should be the exhaustion alert
+        assert "3 attempts" in failure_messages[-1]
+        # Earlier messages should be disconnect alerts
+        assert "disconnected" in failure_messages[0].lower()
 
     @pytest.mark.asyncio
     async def test_retry_count_matches_max_retries(self) -> None:

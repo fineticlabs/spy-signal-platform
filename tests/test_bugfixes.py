@@ -608,9 +608,8 @@ class TestEodSummaryExecutionData:
             reconciled = _reconcile_alpaca_fills(mock_executor, db, since)
 
         assert reconciled == 1
-        # Verify trade was inserted into trades table
+        # Verify trade was inserted into trades table (via single transaction)
         db.conn.execute.assert_called()
-        db.conn.commit.assert_called()
 
 
 # ── Monday filter: live scanner skips excluded days ──────────────────────────

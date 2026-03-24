@@ -232,23 +232,23 @@ class TestFlattenAllPositions:
         ]
         executor._client.close_position.return_value = _mock_order()
 
-        closed = executor.flatten_all_positions()
+        results = executor.flatten_all_positions()
 
-        assert closed == 2
-        assert executor._client.close_position.call_count == 2
+        assert sum(1 for v in results.values() if v == "closed") == 2
+        assert executor._client.close_position.call_count >= 2
 
     def test_flatten_no_positions(self) -> None:
         """No action taken when there are no positions."""
         executor = _make_executor()
         executor._client.get_all_positions.return_value = []
 
-        closed = executor.flatten_all_positions()
+        results = executor.flatten_all_positions()
 
-        assert closed == 0
+        assert results == {}
         executor._client.close_position.assert_not_called()
 
     def test_flatten_handles_partial_failure(self) -> None:
-        """If one position fails to close, others still close."""
+        """If one position fails to close, others still close (with retry)."""
         from alpaca.common.exceptions import APIError
 
         executor = _make_executor()
@@ -256,14 +256,18 @@ class TestFlattenAllPositions:
             _mock_position(symbol="SPY"),
             _mock_position(symbol="TSLA"),
         ]
+        # SPY closes, TSLA fails on all retries
         executor._client.close_position.side_effect = [
-            _mock_order(),
-            APIError("Position not found"),
+            _mock_order(),  # SPY first attempt
+            APIError("Position not found"),  # TSLA first attempt
+            APIError("Position not found"),  # TSLA second attempt
+            APIError("Position not found"),  # TSLA third attempt
         ]
 
-        closed = executor.flatten_all_positions()
+        results = executor.flatten_all_positions()
 
-        assert closed == 1
+        assert results["SPY"] == "closed"
+        assert results["TSLA"] != "closed"
 
 
 # ── Test: cancel_open_orders ─────────────────────────────────────────────────

@@ -63,6 +63,8 @@ class RiskManager:
     ) -> None:
         self._cooldown = cooldown
         self._get_position_count = get_position_count
+        self._symbol_pnl: dict[str, Decimal] = {}  # per-symbol cumulative P&L today
+        self._blocked_symbols: set[str] = set()  # symbols that hit max loss
         if settings is not None:
             self._settings = settings
         else:
@@ -89,7 +91,14 @@ class RiskManager:
             logger.warning("risk_rejected_daily_loss", reason=reason)
             return RiskDecision(approved=False, reason=reason)
 
-        # b. Max concurrent positions
+        # b. Per-symbol max loss check
+        sym = signal.symbol
+        if sym in self._blocked_symbols:
+            reason = f"Symbol {sym} blocked — daily loss limit reached"
+            logger.warning("risk_symbol_max_loss", reason=reason, symbol=sym)
+            return RiskDecision(approved=False, reason=reason)
+
+        # c. Max concurrent positions
         if self._get_position_count is not None:
             try:
                 pos_count = self._get_position_count()
@@ -101,14 +110,14 @@ class RiskManager:
             except Exception as exc:
                 logger.error("risk_position_count_failed", error=str(exc))
 
-        # c. Time window check
+        # d. Time window check
         if not self._is_time_allowed(signal):
             bar_time = signal.timestamp.astimezone(_ET).time()
             reason = f"Outside allowed trading window: {bar_time}"
             logger.warning("risk_rejected_time", reason=reason, bar_time=str(bar_time))
             return RiskDecision(approved=False, reason=reason)
 
-        # d. Daily trade count
+        # e. Daily trade count
         if self._cooldown.daily_trade_count >= self._settings.max_trades_per_day:
             reason = (
                 f"Max daily trades reached: {self._cooldown.daily_trade_count} "
@@ -117,7 +126,7 @@ class RiskManager:
             logger.warning("risk_rejected_trade_count", reason=reason)
             return RiskDecision(approved=False, reason=reason)
 
-        # e. Tilt check (3+ consecutive losses)
+        # f. Tilt check (3+ consecutive losses)
         if self._cooldown.is_tilted():
             reason = (
                 f"Tilted: {self._cooldown.consecutive_losses} consecutive losses "
@@ -126,7 +135,7 @@ class RiskManager:
             logger.warning("risk_rejected_tilted", reason=reason)
             return RiskDecision(approved=False, reason=reason)
 
-        # f. Cooldown check (15 min after 2 consecutive losses)
+        # g. Cooldown check (15 min after 2 consecutive losses)
         if not self._cooldown.is_cooled_down():
             reason = (
                 f"Cooldown active: {self._cooldown.consecutive_losses} consecutive losses, "
@@ -135,13 +144,13 @@ class RiskManager:
             logger.warning("risk_rejected_cooldown", reason=reason)
             return RiskDecision(approved=False, reason=reason)
 
-        # g. Risk/reward ratio
+        # h. Risk/reward ratio
         if signal.risk_reward_ratio < _MIN_RR:
             reason = f"R:R {signal.risk_reward_ratio:.2f} below minimum {_MIN_RR}"
             logger.warning("risk_rejected_rr", reason=reason, rr=str(signal.risk_reward_ratio))
             return RiskDecision(approved=False, reason=reason)
 
-        # h. Position sizing (scaled by position_scale_factor)
+        # i. Position sizing (scaled by position_scale_factor)
         size = calculate_position_size(
             account_size=self._settings.account_size,
             risk_pct=self._settings.risk_per_trade_pct,
@@ -175,6 +184,24 @@ class RiskManager:
 
     def _is_past_daily_loss_limit(self) -> bool:
         return self._cooldown.daily_pnl <= -self._max_daily_loss()
+
+    def record_symbol_pnl(self, symbol: str, pnl: Decimal) -> None:
+        """Record realized P&L for a symbol and block if max loss exceeded."""
+        current = self._symbol_pnl.get(symbol, Decimal("0"))
+        self._symbol_pnl[symbol] = current + pnl
+        if self._symbol_pnl[symbol] <= -self._settings.max_symbol_loss:
+            self._blocked_symbols.add(symbol)
+            logger.warning(
+                "risk_symbol_blocked",
+                symbol=symbol,
+                cumulative_pnl=str(self._symbol_pnl[symbol]),
+                threshold=str(self._settings.max_symbol_loss),
+            )
+
+    def reset_symbol_tracking(self) -> None:
+        """Reset per-symbol P&L tracking — call at daily reset."""
+        self._symbol_pnl.clear()
+        self._blocked_symbols.clear()
 
     def _is_time_allowed(self, signal: Signal) -> bool:
         bar_time = signal.timestamp.astimezone(_ET).time()

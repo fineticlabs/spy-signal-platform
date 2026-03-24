@@ -174,27 +174,48 @@ class AlpacaExecutor:
             return None
 
     def load_existing_positions(self) -> list[str]:
-        """Pre-load current Alpaca positions into the local dedup set.
+        """Pre-load current Alpaca positions AND open orders into the dedup set.
 
         Call this once at startup (before the first signal cycle) so that
-        carry-over positions from the previous day are immediately known.
+        carry-over positions and pending orders from the previous session
+        are immediately known — prevents duplicate bracket orders on restart.
 
         Returns:
             List of symbols that were loaded.
         """
+        loaded: list[str] = []
         try:
             positions = self._client.get_all_positions()
-            symbols = [pos.symbol for pos in positions]
-            self._submitted_symbols.update(symbols)
+            pos_symbols = [pos.symbol for pos in positions]
+            self._submitted_symbols.update(pos_symbols)
+            loaded.extend(pos_symbols)
             logger.info(
                 "existing_positions_loaded",
-                symbols=symbols,
-                count=len(symbols),
+                symbols=pos_symbols,
+                count=len(pos_symbols),
             )
-            return symbols
         except APIError as exc:
             logger.error("existing_positions_load_failed", error=str(exc))
-            return []
+
+        # Also sync open orders (pending fills from previous session)
+        try:
+            open_orders = self._client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN),
+            )
+            order_symbols = list({o.symbol for o in open_orders})
+            new_symbols = [s for s in order_symbols if s not in self._submitted_symbols]
+            self._submitted_symbols.update(order_symbols)
+            if new_symbols:
+                logger.info(
+                    "existing_orders_loaded",
+                    symbols=new_symbols,
+                    count=len(new_symbols),
+                )
+            loaded.extend(new_symbols)
+        except APIError as exc:
+            logger.error("existing_orders_load_failed", error=str(exc))
+
+        return loaded
 
     def get_position_count(self) -> int:
         """Return the current number of open Alpaca positions."""
@@ -206,43 +227,87 @@ class AlpacaExecutor:
         self._submitted_symbols.clear()
         logger.info("submitted_symbols_cleared")
 
-    def flatten_all_positions(self) -> int:
-        """Close all open positions (EOD flatten).
+    def flatten_all_positions(self) -> dict[str, str]:
+        """Close all open positions (EOD flatten) with retry.
+
+        Attempts to close each position, retrying failures up to 3 times
+        with 2s delay. Only clears symbols from the dedup set for positions
+        that actually closed. Verifies final state by re-querying.
 
         Returns:
-            Number of positions that were closed (or attempted).
+            Dict mapping symbol → "closed" or error message.
         """
+        import time as _time_mod
+
+        max_retries = 3
+        retry_delay = 2
+
         try:
             positions = self.get_positions()
         except APIError as exc:
             logger.error("flatten_get_positions_failed", error=str(exc))
-            return 0
+            return {}
 
         if not positions:
             logger.info("flatten_no_positions")
-            return 0
+            return {}
 
-        closed = 0
-        for pos in positions:
-            try:
-                self._client.close_position(
-                    symbol_or_asset_id=pos.symbol,
-                    close_options=ClosePositionRequest(qty=str(abs(int(pos.qty)))),
-                )
+        results: dict[str, str] = {}
+        pending = [(pos.symbol, str(abs(int(pos.qty)))) for pos in positions]
+
+        for attempt in range(1, max_retries + 1):
+            still_pending: list[tuple[str, str]] = []
+            for symbol, qty in pending:
+                try:
+                    self._client.close_position(
+                        symbol_or_asset_id=symbol,
+                        close_options=ClosePositionRequest(qty=qty),
+                    )
+                    results[symbol] = "closed"
+                    self._submitted_symbols.discard(symbol)
+                    logger.info("position_closed", symbol=symbol, qty=qty, attempt=attempt)
+                except APIError as exc:
+                    results[symbol] = str(exc)
+                    still_pending.append((symbol, qty))
+                    logger.error(
+                        "position_close_failed",
+                        symbol=symbol,
+                        error=str(exc),
+                        attempt=attempt,
+                    )
+
+            if not still_pending:
+                break
+            if attempt < max_retries:
                 logger.info(
-                    "position_closed",
-                    symbol=pos.symbol,
-                    qty=str(pos.qty),
-                    side=pos.side,
+                    "flatten_retry",
+                    remaining=len(still_pending),
+                    attempt=attempt + 1,
                 )
-                closed += 1
-            except APIError as exc:
+                _time_mod.sleep(retry_delay)
+            pending = still_pending
+
+        # Verify final state
+        try:
+            remaining = self.get_positions()
+            remaining_symbols = [p.symbol for p in remaining]
+            if remaining_symbols:
                 logger.error(
-                    "position_close_failed",
-                    symbol=pos.symbol,
-                    error=str(exc),
+                    "eod_flatten_partial",
+                    still_open=remaining_symbols,
+                    total=len(positions),
+                    closed=sum(1 for v in results.values() if v == "closed"),
                 )
-        return closed
+            else:
+                logger.info(
+                    "eod_flatten_complete",
+                    total=len(positions),
+                    closed=sum(1 for v in results.values() if v == "closed"),
+                )
+        except APIError as exc:
+            logger.error("flatten_verify_failed", error=str(exc))
+
+        return results
 
     def cancel_open_orders(self) -> int:
         """Cancel all open orders.

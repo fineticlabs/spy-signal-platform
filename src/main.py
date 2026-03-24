@@ -76,7 +76,6 @@ from src.storage.queries import (
     query_executed_signals,
     query_recent_signals,
     query_recent_trades,
-    update_signal_fill,
     update_signal_outcome,
 )
 from src.strategies.orb import ORBStrategy
@@ -98,6 +97,7 @@ _SCHEDULER_INTERVAL = 30
 # ── regime warmup progress tracking ──────────────────────────────────────────
 _regime_warmup_bar_counts: dict[str, int] = {}
 _regime_first_populated: set[str] = set()
+_vix_fallback_alerted: bool = False  # one-time alert per session
 
 # Excluded weekdays (0=Mon).  Set once at startup via run(), checked in
 # _process_bar as a redundant safety net on top of the ORB strategy's own
@@ -349,7 +349,13 @@ async def _process_bar(
         adx_val = indicator_snapshot.adx
 
         # VIX: use fallback until a real-time feed is wired in
-        vix_val: Decimal | None = pipeline.regime.vix_level or _VIX_FALLBACK
+        vix_val: Decimal | None = pipeline.regime.vix_level
+        if vix_val is None:
+            vix_val = _VIX_FALLBACK
+            global _vix_fallback_alerted
+            if not _vix_fallback_alerted:
+                logger.warning("vix_fallback_used", fallback=str(_VIX_FALLBACK))
+                _vix_fallback_alerted = True
 
         pipeline.regime.update(vix=vix_val, adx=adx_val, trending_up=trending_up)
 
@@ -626,6 +632,8 @@ def _reconcile_alpaca_fills(
     # flatten orders later.
     bracket_order_ids = {str(sig.get("order_id", "")) for sig in executed if sig.get("order_id")}
     reconciled = 0
+    pending_updates: list[tuple[int, str, str, str]] = []
+    pending_trades: list[tuple[str, ...]] = []
 
     for sig in executed:
         order_id = sig.get("order_id")
@@ -697,49 +705,46 @@ def _reconcile_alpaca_fills(
 
         signal_id = int(sig.get("id", 0))
         if signal_id > 0:
-            try:
-                update_signal_fill(
-                    db.conn,
-                    signal_id,
-                    str(exit_price),
+            pending_updates.append((signal_id, str(exit_price), str(round(pnl, 2)), outcome))
+            pending_trades.append(
+                (
+                    str(sig.get("timestamp", "")),
+                    str(sig.get("strategy_name", "")),
+                    direction,
+                    str(entry),
+                    str(stop),
+                    str(target),
                     str(round(pnl, 2)),
-                    outcome,
+                    symbol,
                 )
-            except Exception as exc:
-                logger.error(
-                    "reconcile_signal_update_failed",
-                    signal_id=signal_id,
-                    error=str(exc),
-                )
-                continue
+            )
 
-            # Also insert into trades table for backward compat
+    # Commit all reconciliation updates in a single transaction
+    if pending_updates:
+        for attempt in range(2):  # 1 retry on failure
             try:
-                db.conn.execute(
-                    """INSERT INTO trades
-                       (timestamp, strategy_name, direction, entry_price,
-                        stop_price, target_price, pnl, symbol)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        str(sig.get("timestamp", "")),
-                        str(sig.get("strategy_name", "")),
-                        direction,
-                        str(entry),
-                        str(stop),
-                        str(target),
-                        str(round(pnl, 2)),
-                        symbol,
-                    ),
-                )
-                db.conn.commit()
+                with db.conn:
+                    for signal_id, fill_p, pnl_s, outcome in pending_updates:
+                        db.conn.execute(
+                            """UPDATE signals SET fill_price = ?, realized_pnl = ?, outcome = ?
+                               WHERE id = ?""",
+                            (fill_p, pnl_s, outcome, signal_id),
+                        )
+                    for trade_row in pending_trades:
+                        db.conn.execute(
+                            """INSERT INTO trades
+                               (timestamp, strategy_name, direction, entry_price,
+                                stop_price, target_price, pnl, symbol)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            trade_row,
+                        )
+                reconciled = len(pending_updates)
+                break
             except Exception as exc:
-                logger.error(
-                    "reconcile_trade_insert_failed",
-                    signal_id=signal_id,
-                    error=str(exc),
-                )
-
-            reconciled += 1
+                if attempt == 0:
+                    logger.warning("reconcile_transaction_failed_retry", error=str(exc))
+                    continue
+                logger.error("reconcile_transaction_failed", error=str(exc))
 
     logger.info(
         "reconcile_complete",
@@ -1079,13 +1084,29 @@ async def _scheduler(
             logger.info("eod_flatten_starting", date=str(today))
             try:
                 cancelled = executor.cancel_open_orders()
-                closed = executor.flatten_all_positions()
-                executor.clear_submitted_symbols()
+                flatten_results = executor.flatten_all_positions()
+                n_closed = sum(1 for v in flatten_results.values() if v == "closed")
+                n_total = len(flatten_results)
+                failed = {s: e for s, e in flatten_results.items() if e != "closed"}
+                # Only clear dedup for successfully closed symbols
+                # (flatten_all_positions already does this per-symbol)
+                if not failed:
+                    executor.clear_submitted_symbols()
                 logger.info(
-                    "eod_flatten_complete",
+                    "eod_flatten_summary",
                     orders_cancelled=cancelled,
-                    positions_closed=closed,
+                    positions_closed=n_closed,
+                    positions_total=n_total,
+                    failed=list(failed.keys()) if failed else [],
                 )
+                # Send Telegram summary for flatten
+                flatten_msg = f"EOD Flatten: {n_closed}/{n_total} positions closed."
+                if failed:
+                    flatten_msg += f"\nFailed: {', '.join(failed.keys())}"
+                try:
+                    await dispatcher.dispatch_status(flatten_msg)
+                except Exception as exc:
+                    logger.error("dispatch_flatten_status_failed", error=str(exc))
             except Exception as exc:
                 logger.error("eod_flatten_failed", error=str(exc))
             last_flatten_date = now_et
@@ -1317,7 +1338,8 @@ async def run() -> None:
     await _backfill_orb_bars(pipelines)
 
     # ── shared components ─────────────────────────────────────────────────────
-    cooldown = CooldownTracker()
+    cooldown = CooldownTracker(db_conn=db.conn)
+    cooldown.load_from_db()  # restore crash-persistent cooldown state
     # get_position_count callback wired after executor init below
     risk = RiskManager(cooldown=cooldown, settings=risk_settings)
 
@@ -1423,8 +1445,20 @@ async def run() -> None:
         for exc in eg.exceptions:
             logger.error("platform_error", error=str(exc))
     finally:
+        shutdown_start = datetime.now(UTC)
         logger.info("finally_block_entered")
         await stream.stop()
+
+        # Wait briefly for in-flight bar processing to finish
+        if not queue.empty():
+            logger.info("shutdown_draining_queue", pending=queue.qsize())
+            try:
+                await asyncio.wait_for(queue.join(), timeout=5.0)
+            except (TimeoutError, Exception):
+                logger.warning("shutdown_queue_drain_timeout")
+
+        # Run EOD reconciliation if not already done
+        reconcile_status = "skipped"
         if not _eod_sent_today:  # pragma: no cover — shutdown-only path
             try:
                 await asyncio.wait_for(
@@ -1438,14 +1472,47 @@ async def run() -> None:
                     ),
                     timeout=10.0,
                 )
+                reconcile_status = "complete"
             except TimeoutError:
                 logger.error("eod_summary_timed_out_on_shutdown")
+                reconcile_status = "timeout"
             except Exception as exc:
                 logger.error("eod_summary_failed_on_shutdown", error=str(exc))
+                reconcile_status = "failed"
         else:  # pragma: no cover — only when 16:05 ET EOD already fired
             logger.info("eod_skipped_on_shutdown", reason="already sent at 16:05 ET")
+            reconcile_status = "already_sent"
+
+        # Commit any pending DB transactions
+        if db.conn is not None:
+            try:
+                db.conn.commit()
+            except Exception as exc:
+                logger.error("shutdown_db_commit_failed", error=str(exc))
+
+        # Count today's signals for the shutdown message
+        signal_count = 0
+        if db.conn is not None:
+            try:
+                since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+                rows = query_recent_signals(db.conn, since=since, limit=10000)
+                signal_count = len(rows)
+            except Exception as exc:
+                logger.warning("shutdown_signal_count_failed", error=str(exc))
+
+        shutdown_duration = (datetime.now(UTC) - shutdown_start).total_seconds()
+        logger.info(
+            "scanner_shutdown",
+            reconciliation=reconcile_status,
+            signals_today=signal_count,
+            duration_s=round(shutdown_duration, 1),
+        )
+
         try:
-            await dispatcher.dispatch_status("\U0001f6d1 Scanner stopped gracefully.")
+            await dispatcher.dispatch_status(
+                f"\U0001f6d1 Scanner shutdown — {signal_count} signals today, "
+                f"reconciliation {reconcile_status} ({shutdown_duration:.1f}s)"
+            )
         except Exception as exc:
             logger.error("dispatch_shutdown_status_failed", error=str(exc))
         db.close()

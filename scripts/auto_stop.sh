@@ -36,7 +36,9 @@ VENV_DIR="$PROJECT_DIR/.venv"
 LOGS_DIR="$PROJECT_DIR/logs"
 PID_FILE="$LOGS_DIR/scanner.pid"
 DB_PATH="$PROJECT_DIR/data/spy_signals.db"
-TODAY=$(date +%Y-%m-%d)
+# Use ET for all date calculations so "trading day" matches market hours
+# regardless of the operator's local timezone (e.g. Pacific).
+TODAY=$(TZ=America/New_York date +%Y-%m-%d)
 LOG_FILE="$LOGS_DIR/stop_${TODAY}.log"
 
 # ── Ensure logs directory exists ──────────────────────────────────────────────

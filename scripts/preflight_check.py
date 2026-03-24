@@ -483,7 +483,104 @@ def _check_websocket_connectivity() -> None:
         _record(False, "Websocket connectivity", f"{type(exc).__name__}: {exc}")
 
 
-# ── 13. Full test suite ─────────────────────────────────────────────────────
+# ── 14. Expected account number verification ────────────────────────────────
+
+
+def _check_account_number() -> None:
+    """Verify Alpaca API keys point to the expected account."""
+    expected = os.environ.get("ALPACA_EXPECTED_ACCOUNT", "")
+    if not expected:
+        _record(True, "Account verification", "ALPACA_EXPECTED_ACCOUNT not set — skipped")
+        return
+
+    try:
+        from src.config import get_alpaca_settings
+        from src.execution.alpaca_executor import AlpacaExecutor
+
+        settings = get_alpaca_settings()
+        executor = AlpacaExecutor(
+            api_key=settings.api_key,
+            secret_key=settings.secret_key,
+            paper=True,
+        )
+        acct = executor.get_account()
+        actual = str(acct.account_number)
+
+        if actual != expected:
+            _record(
+                False,
+                "Account verification",
+                f"API keys point to wrong account — expected {expected}, got {actual}",
+            )
+        else:
+            _record(True, "Account verification", f"Account {actual[:4]}... matches expected")
+    except Exception as exc:
+        _record(False, "Account verification", f"{type(exc).__name__}: {exc}")
+
+
+# ── 15. Signals/trades schema validation ─────────────────────────────────────
+
+
+def _check_schema_columns() -> None:
+    """Verify signals and trades tables have all required columns."""
+    db_path = _ROOT / "data" / "spy_signals.db"
+    if not db_path.exists():
+        _record(False, "Schema validation", "Database does not exist")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        issues: list[str] = []
+
+        # Check signals table columns
+        sig_required = {
+            "id",
+            "symbol",
+            "executed",
+            "order_id",
+            "fill_price",
+            "realized_pnl",
+            "outcome",
+        }
+        sig_cols_rows = conn.execute("PRAGMA table_info(signals)").fetchall()
+        sig_cols = {row[1] for row in sig_cols_rows}
+        sig_missing = sig_required - sig_cols
+        if sig_missing:
+            issues.append(f"signals missing columns: {', '.join(sorted(sig_missing))}")
+
+        # Check trades table columns
+        trades_required = {
+            "id",
+            "timestamp",
+            "strategy_name",
+            "direction",
+            "entry_price",
+            "pnl",
+            "symbol",
+        }
+        trades_cols_rows = conn.execute("PRAGMA table_info(trades)").fetchall()
+        trades_cols = {row[1] for row in trades_cols_rows}
+        trades_missing = trades_required - trades_cols
+        if trades_missing:
+            issues.append(f"trades missing columns: {', '.join(sorted(trades_missing))}")
+
+        conn.close()
+
+        if issues:
+            _record(False, "Schema validation", "; ".join(issues) + " — run ensure_schema() to fix")
+        else:
+            _record(
+                True,
+                "Schema validation",
+                f"signals ({len(sig_cols)} cols), trades ({len(trades_cols)} cols) OK",
+            )
+    except Exception as exc:
+        _record(False, "Schema validation", f"{type(exc).__name__}: {exc}")
+
+
+# ── 16. Full test suite ─────────────────────────────────────────────────────
 
 
 def _check_tests() -> None:
@@ -540,6 +637,8 @@ def main() -> None:
     _check_disk_space()
     _check_websocket_connectivity()
     _check_pipeline_wiring()
+    _check_account_number()
+    _check_schema_columns()
     _check_tests()
 
     # ── summary ──────────────────────────────────────────────────────────────

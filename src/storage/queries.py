@@ -97,6 +97,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE trades ADD COLUMN symbol TEXT DEFAULT 'SPY'")
 
+    # Migrate: create cooldown_state table for crash-persistent cooldown tracking
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cooldown_state (
+            id                 INTEGER PRIMARY KEY CHECK (id = 1),
+            consecutive_losses INTEGER NOT NULL DEFAULT 0,
+            daily_pnl          TEXT    NOT NULL DEFAULT '0',
+            daily_trade_count  INTEGER NOT NULL DEFAULT 0,
+            last_loss_time     TEXT,
+            session_date       TEXT    NOT NULL
+        )
+    """)
+
     logger.debug("signal_trade_schema_ensured")
 
 
@@ -274,6 +286,46 @@ def query_executed_signals(
         (since.astimezone(UTC).isoformat(),),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def save_cooldown_state(
+    conn: sqlite3.Connection,
+    consecutive_losses: int,
+    daily_pnl: str,
+    daily_trade_count: int,
+    last_loss_time: str | None,
+    session_date: str,
+) -> None:
+    """Persist cooldown state to DB (upsert single row)."""
+    with conn:
+        conn.execute(
+            """INSERT INTO cooldown_state (id, consecutive_losses, daily_pnl, daily_trade_count, last_loss_time, session_date)
+               VALUES (1, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 consecutive_losses = excluded.consecutive_losses,
+                 daily_pnl = excluded.daily_pnl,
+                 daily_trade_count = excluded.daily_trade_count,
+                 last_loss_time = excluded.last_loss_time,
+                 session_date = excluded.session_date""",
+            (consecutive_losses, daily_pnl, daily_trade_count, last_loss_time, session_date),
+        )
+
+
+def load_cooldown_state(
+    conn: sqlite3.Connection,
+    session_date: str,
+) -> dict[str, object] | None:
+    """Load cooldown state from DB if it matches the current session date.
+
+    Returns None if no state exists or the stored state is from a different day.
+    """
+    row = conn.execute(
+        "SELECT * FROM cooldown_state WHERE id = 1 AND session_date = ?",
+        (session_date,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
 
 
 def update_signal_outcome(conn: sqlite3.Connection, signal_id: int, outcome: str) -> None:

@@ -48,7 +48,11 @@ class RiskSettings(BaseSettings):
     )
     max_trades_per_day: int = Field(default=5, description="Max number of trades per day")
     max_concurrent_positions: int = Field(
-        default=3, description="Max concurrent open positions (informational)"
+        default=3, description="Max concurrent open positions (enforced)"
+    )
+    max_symbol_loss: Decimal = Field(
+        default=Decimal("500"),
+        description="Max cumulative loss per symbol per day in USD before blocking new entries",
     )
     position_scale_factor: float = Field(
         default=0.25,
