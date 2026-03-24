@@ -904,20 +904,11 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         # Market direction confirmation: informational only (no blocking)
         # Live strategy uses SPY VWAP alignment for confidence adjustment.
 
-        # Dynamic risk multiplier based on ORB range vs trailing 20-day percentiles
-        p25 = self.orb_p25[-1]
-        p75 = self.orb_p75[-1]
-        orb_range_abs = orb_high - orb_low
-
-        if not np.isnan(p25) and not np.isnan(p75):
-            if orb_range_abs > p75:
-                dynamic_risk_mult = 2.5
-            elif orb_range_abs < p25:
-                dynamic_risk_mult = 1.5
-            else:
-                dynamic_risk_mult = self.risk_mult
-        else:
-            dynamic_risk_mult = self.risk_mult
+        # Fixed 2.0R target — aligned with live scanner.
+        # Dynamic targets (1.5-2.5R) were removed for parity: the live scanner
+        # uses fixed 2.0R and the marginal PF improvement (~0.02) from dynamic
+        # targets does not justify the divergence risk.
+        dynamic_risk_mult = self.risk_mult
 
         # Consecutive-candle confirmation: require prev bar also outside ORB
         prev_close = float(self.data.Close[-2]) if len(self.data.Close) >= 2 else float("nan")
@@ -1005,9 +996,8 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
                 return
             # Target based on original ATR risk, not Kalman-scaled stop
             target = entry + dynamic_risk_mult * base_atr_risk
-            vp_blocked, vp_tag = _vp_check(target, entry)
-            if vp_blocked:
-                return
+            # VP is informational only (aligned with live scanner — no blocking)
+            _vp_blocked, vp_tag = _vp_check(target, entry)
             self.buy(sl=stop, tp=target, size=self.position_scale_factor, tag=_build_tag(vp_tag))
             self._daily_trade_count += 1
 
@@ -1026,9 +1016,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
                 return
             # Target based on original ATR risk, not Kalman-scaled stop
             target = entry - dynamic_risk_mult * base_atr_risk
-            vp_blocked, vp_tag = _vp_check(target, entry)
-            if vp_blocked:
-                return
+            _vp_blocked, vp_tag = _vp_check(target, entry)
             self.sell(sl=stop, tp=target, size=self.position_scale_factor, tag=_build_tag(vp_tag))
             self._daily_trade_count += 1
 
@@ -1274,11 +1262,17 @@ def run_backtest(
         }
     )
 
+    # spread = fraction of price applied per trade (buy at price*(1+spread),
+    # sell at price*(1-spread)).  Default 0.0001 = 0.01% ≈ $0.02/share on
+    # a $200 stock, matching the slippage parameter's $0.02/share intent.
+    # Convert dollar slippage to fraction using ~$200 avg stock price.
+    spread_frac = slippage / 200.0  # $0.02 / $200 = 0.0001
     bt = Backtest(
         bt_df,
         ORBStrategy,
         cash=cash,
         commission=0.0,
+        spread=spread_frac,
         exclusive_orders=True,
     )
 

@@ -54,6 +54,10 @@ class RiskSettings(BaseSettings):
         default=Decimal("500"),
         description="Max cumulative loss per symbol per day in USD before blocking new entries",
     )
+    max_same_sector: int = Field(
+        default=2,
+        description="Max concurrent positions from the same sector (default 2).",
+    )
     position_scale_factor: float = Field(
         default=0.25,
         description=(
@@ -170,6 +174,13 @@ class AppSettings(BaseSettings):
         description=(
             "Gap classification threshold (%). "
             "Gap > +threshold: LONG only; gap < -threshold: SHORT only; else both."
+        ),
+    )
+    realized_vol_max: float = Field(
+        default=0.18,
+        description=(
+            "Max 20-day annualized realized vol (0.18 = 18%). "
+            "Blocks all signals when HV exceeds this. Matches backtest _REALIZED_VOL_MAX."
         ),
     )
 

@@ -1145,19 +1145,19 @@ class TestPatchedIndicatorPaths:
         mock_vp.return_value = (poc, vah, val_, hvn, lvn)
 
         stats = run_backtest(df, cash=100_000.0, min_orb_pct=0.0001)
-        # All trades blocked by VP HVN target
-        assert stats["# Trades"] == 0
+        # VP is informational only (no blocking) — trades proceed with VP tag
+        assert stats["# Trades"] > 0
 
     @patch("src.backtest.engine.compute_earnings_blocked_array")
     @patch("src.backtest.engine.compute_econ_blocked_array")
     @patch("src.backtest.engine._compute_prior_day_vp_arrays")
-    def test_vp_hvn_target_blocks_short(
+    def test_vp_hvn_target_tags_short(
         self,
         mock_vp: Any,
         mock_econ: Any,
         mock_earnings: Any,
     ) -> None:
-        """Lines 942-943, 1022: VP target inside Value Area for SHORT → BLOCKED."""
+        """VP target inside Value Area for SHORT → tagged but not blocked."""
         df = _build_breakout_df(n_days=35, direction="short")
         n = len(df)
         mock_econ.return_value = np.zeros(n, dtype=bool)
@@ -1171,7 +1171,8 @@ class TestPatchedIndicatorPaths:
         mock_vp.return_value = (poc, vah, val_, hvn, lvn)
 
         stats = run_backtest(df, cash=100_000.0, min_orb_pct=0.0001)
-        assert stats["# Trades"] == 0
+        # VP is informational only (no blocking)
+        assert stats["# Trades"] > 0
 
     @patch("src.backtest.engine.compute_earnings_blocked_array")
     @patch("src.backtest.engine.compute_econ_blocked_array")

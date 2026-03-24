@@ -91,6 +91,7 @@ class ORBStrategy(Strategy):
         adx_min_threshold: int | None = None,
         orb_min_range_pct: float | None = None,
         gap_threshold_pct: float | None = None,
+        realized_vol_max: float | None = None,
     ) -> None:
         self._volumes: deque[int] = deque(maxlen=_VOL_WINDOW)
         self._recent_bars: deque[Bar] = deque(maxlen=5)  # for candlestick filters
@@ -121,6 +122,11 @@ class ORBStrategy(Strategy):
             Decimal(str(gap_threshold_pct))
             if gap_threshold_pct is not None
             else _DEFAULT_GAP_THRESHOLD_PCT
+        )
+
+        # Realized vol threshold (default 0.18 = 18% annualized)
+        self._realized_vol_max = (
+            Decimal(str(realized_vol_max)) if realized_vol_max is not None else Decimal("0.18")
         )
 
         # 2-bar confirmation state: symbol → (direction, bar_timestamp)
@@ -241,6 +247,17 @@ class ORBStrategy(Strategy):
             logger.debug("orb_filter_low_adx", adx=str(adx), threshold=str(self._adx_min))
             return None
 
+        # --- Realized vol filter (matches backtest _REALIZED_VOL_MAX) ---
+        rv = regime.realized_vol
+        if rv is not None and rv >= self._realized_vol_max:
+            logger.info(
+                "orb_filter_high_vol",
+                symbol=bar.symbol,
+                realized_vol=str(rv),
+                threshold=str(self._realized_vol_max),
+            )
+            return None
+
         # --- VIX term structure: backwardation is a HARD BLOCK (matches backtest) ---
         if vix_term_ratio is not None:
             from src.filters.vix_term_structure import BACKWARDATION_THRESHOLD
@@ -278,8 +295,10 @@ class ORBStrategy(Strategy):
 
         close = bar.close
 
-        # --- EMA trend alignment (matches backtest 15m EMA(20) gate) ---
-        ema20 = indicators.ema20
+        # --- EMA trend alignment (uses 15-min EMA(20) matching backtest) ---
+        # Prefer the 15-min resampled EMA from regime detector (matches backtest).
+        # Fall back to 1-min EMA(20) from indicators if 15-min not yet seeded.
+        ema20 = regime.ema20_15m if regime.ema20_15m is not None else indicators.ema20
         if ema20 is not None:
             if close > orb_high and close <= ema20:
                 logger.info(

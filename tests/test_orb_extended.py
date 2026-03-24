@@ -34,6 +34,8 @@ class MockRegime:
         self.adx_value = adx
         self.current_regime = regime
         self.is_tradeable = True
+        self.ema20_15m: Decimal | None = None  # matches RegimeDetector
+        self.realized_vol: Decimal | None = None  # matches RegimeDetector
 
 
 def _make_bar(

@@ -145,6 +145,27 @@ def _build_registry() -> IndicatorRegistry:
 _VIX_FALLBACK = Decimal("20")
 
 
+def _fetch_live_vix() -> Decimal | None:
+    """Fetch the current VIX level from yfinance.
+
+    Returns the last price as Decimal, or None on failure.
+    """
+    try:
+        import yfinance as yf
+
+        ticker = yf.Ticker("^VIX")
+        price = ticker.fast_info.get("lastPrice")
+        if price is not None and price > 0:
+            vix = Decimal(str(round(float(price), 2)))
+            logger.info("vix_fetched", value=str(vix), source="yfinance")
+            return vix
+        logger.warning("vix_fetch_no_price")
+        return None
+    except Exception as exc:
+        logger.warning("vix_fetch_failed", error=str(exc))
+        return None
+
+
 def _build_pipelines(
     symbols: list[str],
     db: BarDatabase,
@@ -153,6 +174,7 @@ def _build_pipelines(
     adx_min_threshold: int | None = None,
     orb_min_range_pct: float | None = None,
     gap_threshold_pct: float | None = None,
+    realized_vol_max: float | None = None,
 ) -> dict[str, _SymbolPipeline]:
     """Build one :class:`_SymbolPipeline` per ticker symbol.
 
@@ -181,6 +203,7 @@ def _build_pipelines(
                 adx_min_threshold=adx_min_threshold,
                 orb_min_range_pct=orb_min_range_pct,
                 gap_threshold_pct=gap_threshold_pct,
+                realized_vol_max=realized_vol_max,
             ),
         )
         logger.info("pipeline_built", symbol=symbol)
@@ -291,6 +314,131 @@ async def _backfill_orb_bars(
         logger.error("orb_backfill_error", error=str(exc))
 
 
+# ── daily ADX + 15-min EMA from historical bars ──────────────────────────────
+
+
+def _compute_daily_indicators(
+    db: BarDatabase,
+    pipelines: dict[str, _SymbolPipeline],
+) -> None:
+    """Compute daily ADX(14) and seed 15-min EMA(20) from historical bars.
+
+    Uses SPY daily bars to compute ADX (matching the backtest's daily ADX
+    methodology), then applies the result to all pipelines.  Seeds each
+    pipeline's 15-min EMA from the last 2 days of bars.
+
+    Called once at startup after ORB backfill.
+    """
+    if db.conn is None:
+        return
+
+    try:
+        import numpy as np
+        import pandas as pd
+        import talib
+
+        # Query last 30 days of 1-min SPY bars for daily ADX
+        since = datetime.now(UTC) - __import__("datetime").timedelta(days=35)
+        rows = db.conn.execute(
+            """SELECT timestamp, open, high, low, close, volume
+               FROM bars WHERE symbol = 'SPY' AND timeframe = '1Min'
+                 AND timestamp >= ?
+               ORDER BY timestamp""",
+            (since.isoformat(),),
+        ).fetchall()
+
+        if len(rows) < 100:
+            logger.warning("daily_adx_insufficient_data", rows=len(rows))
+            return
+
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df = df.set_index("timestamp")
+        for col in ("open", "high", "low", "close"):
+            df[col] = df[col].astype(float)
+
+        # Resample to daily OHLCV (matching backtest methodology)
+        et_idx = df.index.tz_convert(_ET)
+        df_et = df.copy()
+        df_et.index = et_idx
+        daily = (
+            df_et.resample("1D")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+            .dropna()
+        )
+
+        if len(daily) < 15:
+            logger.warning("daily_adx_insufficient_daily_bars", days=len(daily))
+            return
+
+        # Compute ADX(14) via TA-Lib, shifted 1 day (no lookahead)
+        adx_arr = talib.ADX(
+            daily["high"].values,
+            daily["low"].values,
+            daily["close"].values,
+            timeperiod=14,
+        )
+        # Use yesterday's value (shift -1 to avoid lookahead)
+        valid_adx = adx_arr[~np.isnan(adx_arr)]
+        if len(valid_adx) < 2:
+            logger.warning("daily_adx_no_valid_values")
+            return
+
+        yesterday_adx = Decimal(str(round(float(valid_adx[-2]), 2)))  # D-1
+
+        for pipeline in pipelines.values():
+            pipeline.regime.set_daily_adx(yesterday_adx)
+
+        logger.info("daily_adx_computed", value=str(yesterday_adx), daily_bars=len(daily))
+
+        # Compute 20-day realized vol (matching backtest _REALIZED_VOL methodology)
+        daily_returns = daily["close"].pct_change()
+        rolling_std = daily_returns.rolling(20).std()
+        valid_std = rolling_std.dropna()
+        if len(valid_std) >= 2:
+            # Use D-1 value (shifted 1 day, no lookahead)
+            yesterday_hv = float(valid_std.iloc[-2]) * np.sqrt(252)
+            realized_vol_decimal = Decimal(str(round(yesterday_hv, 4)))
+            for pipeline in pipelines.values():
+                pipeline.regime.set_realized_vol(realized_vol_decimal)
+            logger.info("realized_vol_computed", value=str(realized_vol_decimal))
+
+        # Seed 15-min EMA(20) for each symbol from last 2 days of bars
+        for symbol, pipeline in pipelines.items():
+            sym_rows = db.conn.execute(
+                """SELECT timestamp, close FROM bars
+                   WHERE symbol = ? AND timeframe = '1Min'
+                     AND timestamp >= ?
+                   ORDER BY timestamp""",
+                (
+                    symbol,
+                    (datetime.now(UTC) - __import__("datetime").timedelta(days=3)).isoformat(),
+                ),
+            ).fetchall()
+
+            if len(sym_rows) < 30:
+                continue
+
+            sym_df = pd.DataFrame(sym_rows, columns=["timestamp", "close"])
+            sym_df["timestamp"] = pd.to_datetime(sym_df["timestamp"], utc=True)
+            sym_df = sym_df.set_index("timestamp")
+            sym_df["close"] = sym_df["close"].astype(float)
+
+            # Resample to 15-min and take last close of each bucket
+            sym_et = sym_df.copy()
+            sym_et.index = sym_et.index.tz_convert(_ET)
+            bars_15m = sym_et.resample("15min").last().dropna()
+            closes_15m = bars_15m["close"].tolist()
+
+            if len(closes_15m) >= 20:
+                pipeline.regime.seed_15m_ema(closes_15m)
+
+        logger.info("daily_indicators_computed")
+
+    except Exception as exc:
+        logger.error("daily_indicators_failed", error=str(exc))
+
+
 # ── bar processing ─────────────────────────────────────────────────────────────
 
 
@@ -335,6 +483,9 @@ async def _process_bar(
     # 2. Levels
     pipeline.levels.update(bar)
     level_snapshot = pipeline.levels.get_levels()
+
+    # 2b. Feed bar into 15-min aggregator for EMA(20) on 15-min bars
+    pipeline.regime.update_15m_bar(bar)
 
     # Update regime from freshest indicator values
     atr = indicator_snapshot.atr
@@ -1032,6 +1183,13 @@ async def _scheduler(
                 pipeline.levels._day.__init__()  # type: ignore[misc]
                 pipeline.levels._premarket.__init__()  # type: ignore[misc]
                 pipeline.levels._last_date = None
+            # Refresh live VIX and daily ADX at session open
+            _refresh_vix = _fetch_live_vix()
+            if _refresh_vix is not None:
+                for pipeline in pipelines.values():
+                    pipeline.regime.update(vix=_refresh_vix)
+            _compute_daily_indicators(db, pipelines)
+
             # Notify on excluded weekdays (e.g. Monday)
             from src.config import get_app_settings as _get_app_settings
 
@@ -1332,10 +1490,23 @@ async def run() -> None:
         adx_min_threshold=app_settings.adx_min_threshold,
         orb_min_range_pct=app_settings.orb_min_range_pct,
         gap_threshold_pct=app_settings.gap_threshold_pct,
+        realized_vol_max=app_settings.realized_vol_max,
     )
 
     # ── backfill missed ORB bars on late start ─────────────────────────────
     await _backfill_orb_bars(pipelines)
+
+    # ── compute daily ADX, seed 15-min EMA, and fetch live VIX ─────────
+    _compute_daily_indicators(db, pipelines)
+
+    # Fetch live VIX at startup
+    live_vix = _fetch_live_vix()
+    if live_vix is not None:
+        for pipeline in pipelines.values():
+            pipeline.regime.update(vix=live_vix)
+        logger.info("vix_live_initialized", vix=str(live_vix))
+    else:
+        logger.warning("vix_live_unavailable_using_fallback", fallback=str(_VIX_FALLBACK))
 
     # ── shared components ─────────────────────────────────────────────────────
     cooldown = CooldownTracker(db_conn=db.conn)
@@ -1373,6 +1544,7 @@ async def run() -> None:
         executor.load_existing_positions()
         # Wire position count callback for max_concurrent_positions enforcement
         risk._get_position_count = executor.get_position_count
+        risk._get_open_symbols = lambda: [p.symbol for p in executor.get_positions()]
 
     # ── inject live state into FastAPI (first symbol's pipeline for dashboard) ─
     from src.api.routes import set_dependencies

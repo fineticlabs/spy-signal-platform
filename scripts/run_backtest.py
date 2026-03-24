@@ -96,6 +96,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--out-dir", default="docs", help="Output directory (default: docs)")
     parser.add_argument("--timeframe", default="1Min", help="Bar timeframe (default: 1Min)")
+    parser.add_argument(
+        "--min-years",
+        type=float,
+        default=0,
+        help="Minimum years of data required per ticker (default: 0 = no filter). "
+        "Skips tickers with fewer years and prints a comparison.",
+    )
     return parser.parse_args()
 
 
@@ -383,8 +390,19 @@ def main() -> None:
         print("WARNING: No VIX term structure data — contango/backwardation tagging disabled")
 
     ticker_results: list[TickerResult] = []
+    excluded_tickers: list[str] = []
 
     for sym in symbols:
+        # Survivorship filter: skip tickers with less than --min-years of data
+        if args.min_years > 0:
+            sym_df = load_bars(db, symbol=sym, timeframe=TimeFrame.ONE_MIN)
+            if not sym_df.empty:
+                date_range = (sym_df.index[-1] - sym_df.index[0]).days / 365.25
+                if date_range < args.min_years:
+                    excluded_tickers.append(sym)
+                    print(f"  [{sym}] Skipped: {date_range:.1f} years < {args.min_years} required")
+                    continue
+
         result = _run_symbol(
             db=db,
             sym=sym,
@@ -439,6 +457,20 @@ def main() -> None:
     csv_path = out_dir / "backtest_results.csv"
     combined_trades.to_csv(csv_path, index=False)
     print(f"Trade log saved to {csv_path}")
+
+    # ── survivorship comparison ────────────────────────────────────────────
+    if excluded_tickers:
+        n_included = len(results_with_trades)
+        print(f"\n{'=' * 80}")
+        print(f"  Survivorship Analysis (--min-years={args.min_years})")
+        print(f"  Included: {n_included} tickers (>= {args.min_years}yr)")
+        print(f"  Excluded: {', '.join(excluded_tickers)}")
+        print(
+            f"  PF={metrics.get('profit_factor', 0):.3f}, "
+            f"Trades={len(combined_trades)}, "
+            f"Net=${metrics.get('net_pnl', 0):,.0f}"
+        )
+        print("=" * 80)
 
 
 if __name__ == "__main__":
