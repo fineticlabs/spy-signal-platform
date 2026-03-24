@@ -6,7 +6,7 @@ Python 3.12 intraday ORB trading signal platform. 26 tickers, Alpaca API data, T
 ```bash
 make run                                    # Start live scanner
 make dashboard                              # Launch Streamlit dashboard
-pytest tests/ -v --tb=short                 # Run full test suite (410+ tests)
+pytest tests/ -v --tb=short                 # Run full test suite (1,478 tests)
 ruff check src/ tests/ && ruff format src/ tests/  # Lint + format
 python scripts/run_backtest.py              # Walk-forward backtest (all tickers)
 python scripts/replay_day.py --date DATE    # Replay a single trading day
@@ -55,12 +55,15 @@ src/
 - **Walk-forward 60-day IS window**: Intentional — captures current regime, not diluted history.
 - **Kalman stop multiplier clamped [0.90, 1.50]**: Values outside this range indicate bugs.
 - **ORB = first 5 bars (9:30-9:35 ET)**: Not configurable without backtest re-validation.
-- **Lunch chop 11:30-13:30 ET**: No new trades unless confluence > 4/5.
+- **Signal cutoff 10:00 ET**: Default matches backtest window (9:35-10:00). Configurable via `signal_cutoff_et`.
+- **Lunch chop 11:30-13:30 ET**: No new trades unless confluence > 4/5 (only applies if cutoff extended past 10:00).
 
 ## Risk Rules (Non-Negotiable)
-- Max 1% account risk per trade ($500 on $50K)
+- Max 1% account risk per trade ($500 on $50K), scaled by 0.25x position_scale_factor
 - Max 3% daily loss -> stop trading for the day
-- Max 5 trades per day
+- Max $500 loss per symbol per day -> block new entries for that symbol
+- Max 5 trades per day, max 3 concurrent positions (enforced)
 - 2 consecutive losses -> 15-min cooldown; 3 consecutive -> done for the day
-- No new trades after 15:45 ET; all flat by 15:55 ET
+- Cooldown state persisted to DB (survives scanner restarts)
+- No new signals after 10:00 ET (configurable signal_cutoff_et); all flat by 15:55 ET
 - Minimum 1.5:1 reward-to-risk or signal is rejected
