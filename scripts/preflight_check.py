@@ -447,6 +447,7 @@ def _check_websocket_connectivity() -> None:
         import asyncio
         import contextlib
 
+        from alpaca.data.enums import DataFeed
         from alpaca.data.live import StockDataStream
 
         from src.config import get_alpaca_settings
@@ -457,7 +458,7 @@ def _check_websocket_connectivity() -> None:
             client = StockDataStream(
                 api_key=settings.api_key,
                 secret_key=settings.secret_key,
-                feed="iex",
+                feed=DataFeed.IEX,
             )
             try:
                 await client._connect()

@@ -68,12 +68,13 @@ echo "[$(date '+%H:%M:%S')] Testing Alpaca API connectivity..."
 if python -c "
 from src.config import get_alpaca_settings
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.enums import DataFeed
 s = get_alpaca_settings()
 c = StockHistoricalDataClient(api_key=s.api_key, secret_key=s.secret_key)
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from datetime import datetime, timedelta, timezone
-r = StockBarsRequest(symbol_or_symbols='SPY', timeframe=TimeFrame.Minute, start=datetime.now(timezone.utc) - timedelta(hours=1), end=datetime.now(timezone.utc))
+r = StockBarsRequest(symbol_or_symbols='SPY', timeframe=TimeFrame.Minute, start=datetime.now(timezone.utc) - timedelta(hours=1), end=datetime.now(timezone.utc), feed=DataFeed.IEX)
 bars = c.get_stock_bars(r)
 print(f'API OK — got {len(bars.data.get(\"SPY\", []))} bars')
 " 2>&1; then
