@@ -709,3 +709,145 @@ class TestMondayFilterLive:
 
         settings = AppSettings(_env_file=None, excluded_days="0,4")  # type: ignore[call-arg]
         assert settings.excluded_days == [0, 4]
+
+
+# ── Position scale factor ────────────────────────────────────────────────────
+
+
+class TestPositionScaleFactor:
+    """position_scale_factor reduces position sizes in both live and backtest."""
+
+    def test_live_default_scale_produces_25pct(self) -> None:
+        """Default 0.25 scale factor gives 25% of base size."""
+        from src.risk.position_sizing import calculate_position_size
+
+        base = calculate_position_size(
+            account_size=Decimal("50000"),
+            risk_pct=Decimal("1.0"),
+            entry=Decimal("100.00"),
+            stop=Decimal("99.00"),
+            scale_factor=1.0,
+        )
+        scaled = calculate_position_size(
+            account_size=Decimal("50000"),
+            risk_pct=Decimal("1.0"),
+            entry=Decimal("100.00"),
+            stop=Decimal("99.00"),
+            scale_factor=0.25,
+        )
+        assert base == 500  # $500 risk / $1 risk-per-share
+        assert scaled == 125  # 500 * 0.25
+        assert scaled == base // 4
+
+    def test_live_scale_factor_1_gives_original(self) -> None:
+        """Scale factor of 1.0 gives original behavior."""
+        from src.risk.position_sizing import calculate_position_size
+
+        original = calculate_position_size(
+            account_size=Decimal("50000"),
+            risk_pct=Decimal("1.0"),
+            entry=Decimal("480.00"),
+            stop=Decimal("477.00"),
+        )
+        scaled = calculate_position_size(
+            account_size=Decimal("50000"),
+            risk_pct=Decimal("1.0"),
+            entry=Decimal("480.00"),
+            stop=Decimal("477.00"),
+            scale_factor=1.0,
+        )
+        assert original == scaled
+
+    def test_live_scale_applied_before_bp_cap(self) -> None:
+        """Scaled size should fit within buying power without downsizing."""
+        from src.risk.position_sizing import calculate_position_size
+
+        # At $480, base size=166 shares → $79,680 position value
+        # With 0.25 scale → 41 shares → $19,680 position value (fits in $50K BP)
+        base = calculate_position_size(
+            account_size=Decimal("50000"),
+            risk_pct=Decimal("1.0"),
+            entry=Decimal("480.00"),
+            stop=Decimal("477.00"),
+            scale_factor=1.0,
+        )
+        scaled = calculate_position_size(
+            account_size=Decimal("50000"),
+            risk_pct=Decimal("1.0"),
+            entry=Decimal("480.00"),
+            stop=Decimal("477.00"),
+            scale_factor=0.25,
+        )
+        assert base == 166
+        assert scaled == 41
+        # Scaled position value fits in 50% of $100K buying power
+        assert scaled * 480 < 50000
+
+    def test_risk_manager_uses_scale_factor(self) -> None:
+        """RiskManager passes scale_factor from RiskSettings to position sizing."""
+        from datetime import UTC, datetime
+
+        from src.config import RiskSettings
+        from src.models import Direction, Regime, Signal, TimeFrame
+        from src.risk.cooldown import CooldownTracker
+        from src.risk.manager import RiskManager
+
+        settings = RiskSettings(
+            account_size=Decimal("50000"),
+            risk_per_trade_pct=Decimal("1.0"),
+            position_scale_factor=0.25,
+        )
+        cooldown = CooldownTracker()
+        manager = RiskManager(cooldown=cooldown, settings=settings)
+
+        signal = Signal(
+            symbol="SPY",
+            direction=Direction.LONG,
+            strategy_name="ORB-5min",
+            entry_price=Decimal("100.00"),
+            stop_price=Decimal("99.00"),
+            target_price=Decimal("103.00"),
+            risk_reward_ratio=Decimal("3.0"),
+            confidence_score=3,
+            reason="test",
+            timeframe=TimeFrame.ONE_MIN,
+            regime=Regime.TRENDING_UP,
+            vix=Decimal("18"),
+            adx=Decimal("28"),
+            timestamp=datetime(2024, 1, 15, 14, 36, tzinfo=UTC),
+        )
+
+        decision = manager.approve(signal)
+        assert decision.approved
+        # Base would be 500 (50000 * 0.01 / 1.00), scaled to 125
+        assert decision.position_size == 125
+
+    def test_config_default_is_025(self) -> None:
+        """RiskSettings default position_scale_factor is 0.25."""
+        from src.config import RiskSettings
+
+        settings = RiskSettings()
+        assert settings.position_scale_factor == 0.25
+
+    def test_config_scale_from_env(self, monkeypatch) -> None:
+        """position_scale_factor can be set via env var."""
+        monkeypatch.setenv("POSITION_SCALE_FACTOR", "0.5")
+        from src.config import RiskSettings
+
+        settings = RiskSettings()
+        assert settings.position_scale_factor == 0.5
+
+    def test_backtest_engine_has_scale_param(self) -> None:
+        """Backtest ORBStrategy has position_scale_factor attribute."""
+        from src.backtest.engine import ORBStrategy as BacktestORB
+
+        assert hasattr(BacktestORB, "position_scale_factor")
+        assert BacktestORB.position_scale_factor == 0.25
+
+    def test_both_paths_same_config(self) -> None:
+        """Both live and backtest use the same default scale factor value."""
+        from src.backtest.engine import ORBStrategy as BacktestORB
+        from src.config import RiskSettings
+
+        settings = RiskSettings()
+        assert settings.position_scale_factor == BacktestORB.position_scale_factor

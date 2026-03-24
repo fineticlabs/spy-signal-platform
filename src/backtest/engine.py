@@ -652,6 +652,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
     min_orb_pct: float = _MIN_ORB_PCT
     symbol: str = "SPY"
     excluded_days: str = "0"  # comma-separated weekday ints (0=Mon); backtesting.py needs str
+    position_scale_factor: float = 0.25  # fraction of equity per trade (shared with live scanner)
 
     def init(self) -> None:
         """Pre-compute all series indicators once on the full price history."""
@@ -1007,7 +1008,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             vp_blocked, vp_tag = _vp_check(target, entry)
             if vp_blocked:
                 return
-            self.buy(sl=stop, tp=target, tag=_build_tag(vp_tag))
+            self.buy(sl=stop, tp=target, size=self.position_scale_factor, tag=_build_tag(vp_tag))
             self._daily_trade_count += 1
 
         # SHORT breakdown: two consecutive closes below ORB low
@@ -1028,7 +1029,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             vp_blocked, vp_tag = _vp_check(target, entry)
             if vp_blocked:
                 return
-            self.sell(sl=stop, tp=target, tag=_build_tag(vp_tag))
+            self.sell(sl=stop, tp=target, size=self.position_scale_factor, tag=_build_tag(vp_tag))
             self._daily_trade_count += 1
 
 
@@ -1240,20 +1241,23 @@ def run_backtest(
     max_trades_per_day: int = _MAX_TRADES_PER_DAY,
     min_orb_pct: float = _MIN_ORB_PCT,
     symbol: str = "SPY",
+    position_scale_factor: float = 0.25,
 ) -> Any:
     """Run the ORB backtest on *df* and return the Backtesting stats dict.
 
     Args:
-        df:                OHLCV DataFrame with DatetimeIndex (UTC).
-        cash:              Starting equity in USD.
-        slippage:          Slippage per share per side in USD (default $0.02).
-        atr_mult:          ATR stop multiplier.
-        risk_mult:         Reward-to-risk multiplier for target (fallback when no
-                           percentile data available).
-        vol_mult:          Volume threshold multiplier (default 1.5).
-        max_trades_per_day: Max entries per ET calendar day (default 5).
-        min_orb_pct:       Min ORB range as fraction of price (default 0.0015).
-        symbol:            Ticker symbol for per-ticker filters (default "SPY").
+        df:                    OHLCV DataFrame with DatetimeIndex (UTC).
+        cash:                  Starting equity in USD.
+        slippage:              Slippage per share per side in USD (default $0.02).
+        atr_mult:              ATR stop multiplier.
+        risk_mult:             Reward-to-risk multiplier for target (fallback when no
+                               percentile data available).
+        vol_mult:              Volume threshold multiplier (default 1.5).
+        max_trades_per_day:    Max entries per ET calendar day (default 5).
+        min_orb_pct:           Min ORB range as fraction of price (default 0.0015).
+        symbol:                Ticker symbol for per-ticker filters (default "SPY").
+        position_scale_factor: Fraction of equity per trade (default 0.25 = 25%).
+                               Shared with live scanner via RiskSettings.
 
     Returns:
         ``backtesting.Stats`` object (dict-like).  Access ``._trades`` for the
@@ -1285,6 +1289,7 @@ def run_backtest(
         max_trades_per_day=max_trades_per_day,
         min_orb_pct=min_orb_pct,
         symbol=symbol,
+        position_scale_factor=position_scale_factor,
     )
 
     logger.info(

@@ -10,18 +10,22 @@ def calculate_position_size(
     risk_pct: Decimal,
     entry: Decimal,
     stop: Decimal,
+    scale_factor: float = 1.0,
 ) -> int:
     """Calculate the number of shares to trade given a fixed risk fraction.
 
     The position size is the largest whole number of shares such that the
     total dollar risk (entry-to-stop distance * shares) does not exceed
-    ``account_size * risk_pct / 100``.
+    ``account_size * risk_pct / 100``, then scaled by *scale_factor*.
 
     Args:
-        account_size: Total account value in dollars.
-        risk_pct:     Percentage of account to risk (e.g. ``Decimal("1.0")`` = 1%).
-        entry:        Planned entry price per share.
-        stop:         Initial stop-loss price per share.
+        account_size:  Total account value in dollars.
+        risk_pct:      Percentage of account to risk (e.g. ``Decimal("1.0")`` = 1%).
+        entry:         Planned entry price per share.
+        stop:          Initial stop-loss price per share.
+        scale_factor:  Multiplier applied to the computed size (e.g. 0.25 = 25%).
+                       Applied before flooring so the final result is always
+                       a whole number of shares.
 
     Returns:
         Number of shares to trade, floored to the nearest whole share.
@@ -31,4 +35,5 @@ def calculate_position_size(
     if risk_per_share <= 0:
         return 0
     dollar_risk = account_size * risk_pct / Decimal("100")
-    return int(dollar_risk / risk_per_share)  # floor toward zero
+    base_size = dollar_risk / risk_per_share
+    return int(base_size * Decimal(str(scale_factor)))  # floor toward zero

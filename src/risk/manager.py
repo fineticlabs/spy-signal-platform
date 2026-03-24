@@ -122,12 +122,13 @@ class RiskManager:
             logger.warning("risk_rejected_rr", reason=reason, rr=str(signal.risk_reward_ratio))
             return RiskDecision(approved=False, reason=reason)
 
-        # g. Position sizing
+        # g. Position sizing (scaled by position_scale_factor)
         size = calculate_position_size(
             account_size=self._settings.account_size,
             risk_pct=self._settings.risk_per_trade_pct,
             entry=signal.entry_price,
             stop=signal.stop_price,
+            scale_factor=self._settings.position_scale_factor,
         )
         if size == 0:
             reason = (

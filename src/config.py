@@ -50,6 +50,22 @@ class RiskSettings(BaseSettings):
     max_concurrent_positions: int = Field(
         default=3, description="Max concurrent open positions (informational)"
     )
+    position_scale_factor: float = Field(
+        default=0.25,
+        description=(
+            "Multiplier applied to computed position size (0.25 = 25% of base size). "
+            "Shared by both live scanner and backtest engine."
+        ),
+    )
+
+    @field_validator("position_scale_factor")
+    @classmethod
+    def validate_scale_factor(cls, v: float) -> float:
+        if v <= 0 or v > 1.0:
+            raise ValueError(
+                f"position_scale_factor must be between 0 (exclusive) and 1.0, got {v}"
+            )
+        return v
 
     @field_validator("risk_per_trade_pct", "max_daily_loss_pct")
     @classmethod
