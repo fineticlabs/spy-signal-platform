@@ -369,6 +369,7 @@ class TestEodStatusIncludesSignalQuality:
             {"approved": 0, "reject_reason": "cooldown"},
         ]
         trades = [{"pnl": "150.00"}]
+        executed_signals = [{"id": 1}, {"id": 2}]
 
         outcomes = {
             "winners": [{"theoretical_pnl": 400.0}],
@@ -380,6 +381,7 @@ class TestEodStatusIncludesSignalQuality:
         with (
             patch("src.main.query_recent_signals", return_value=signals),
             patch("src.main.query_recent_trades", return_value=trades),
+            patch("src.main.query_executed_signals", return_value=executed_signals),
             patch("src.main._evaluate_signal_outcomes", return_value=outcomes),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
@@ -404,12 +406,15 @@ class TestEodStatusIncludesSignalQuality:
             {"approved": 1, "reject_reason": ""},
         ]
         trades = [{"pnl": "150.00"}]
+        # 1 of 2 approved signals was executed
+        executed_signals = [{"id": 1}]
 
         outcomes = {"winners": [], "losers": [], "open": [], "no_data": []}
 
         with (
             patch("src.main.query_recent_signals", return_value=signals),
             patch("src.main.query_recent_trades", return_value=trades),
+            patch("src.main.query_executed_signals", return_value=executed_signals),
             patch("src.main._evaluate_signal_outcomes", return_value=outcomes),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
@@ -432,6 +437,7 @@ class TestEodStatusIncludesSignalQuality:
 
         signals = [{"approved": 1, "reject_reason": ""}]
         trades: list[dict[str, object]] = []
+        executed_signals: list[dict[str, object]] = []
 
         outcomes = {
             "winners": [],
@@ -443,6 +449,7 @@ class TestEodStatusIncludesSignalQuality:
         with (
             patch("src.main.query_recent_signals", return_value=signals),
             patch("src.main.query_recent_trades", return_value=trades),
+            patch("src.main.query_executed_signals", return_value=executed_signals),
             patch("src.main._evaluate_signal_outcomes", return_value=outcomes),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
@@ -462,6 +469,7 @@ class TestEodStatusIncludesSignalQuality:
 
         signals = [{"approved": 1, "reject_reason": ""}]
         trades: list[dict[str, object]] = []
+        executed_signals: list[dict[str, object]] = []
 
         outcomes = {
             "winners": [],
@@ -473,6 +481,7 @@ class TestEodStatusIncludesSignalQuality:
         with (
             patch("src.main.query_recent_signals", return_value=signals),
             patch("src.main.query_recent_trades", return_value=trades),
+            patch("src.main.query_executed_signals", return_value=executed_signals),
             patch("src.main._evaluate_signal_outcomes", return_value=outcomes),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
@@ -494,6 +503,7 @@ class TestEodStatusIncludesSignalQuality:
 
         signals = [{"approved": 1, "reject_reason": ""} for _ in range(5)]
         losers = [{"theoretical_pnl": -100.0, "direction": "SHORT"} for _ in range(5)]
+        executed_signals: list[dict[str, object]] = []
 
         outcomes = {
             "winners": [],
@@ -505,6 +515,7 @@ class TestEodStatusIncludesSignalQuality:
         with (
             patch("src.main.query_recent_signals", return_value=signals),
             patch("src.main.query_recent_trades", return_value=[]),
+            patch("src.main.query_executed_signals", return_value=executed_signals),
             patch("src.main._evaluate_signal_outcomes", return_value=outcomes),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)

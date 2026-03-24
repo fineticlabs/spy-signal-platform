@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 import structlog
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
     ClosePositionRequest,
     GetOrdersRequest,
@@ -333,3 +333,43 @@ class AlpacaExecutor:
         except APIError as exc:
             logger.error("paper_assertion_check_failed", error=str(exc))
             return False
+
+    # ── reconciliation ─────────────────────────────────────────────────────────
+
+    def get_closed_orders_today(self) -> list[Order]:
+        """Return all filled/cancelled orders from today.
+
+        Used at EOD to reconcile executed orders back to signal records.
+        """
+        try:
+            today_start = datetime.now(_ET).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            orders = self._client.get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.CLOSED,
+                    after=today_start.isoformat(),
+                    limit=500,
+                ),
+            )
+            return [o for o in orders if o.status == OrderStatus.FILLED]
+        except APIError as exc:
+            logger.error("get_closed_orders_failed", error=str(exc))
+            return []
+
+    def get_daily_pnl(self) -> Decimal:
+        """Return today's realized P&L from the Alpaca account.
+
+        Calculated as current equity minus last equity (previous close).
+        """
+        try:
+            account = self._client.get_account()
+            equity = Decimal(str(account.equity))
+            last_equity = Decimal(str(account.last_equity))
+            return equity - last_equity
+        except APIError as exc:
+            logger.error("get_daily_pnl_failed", error=str(exc))
+            return Decimal("0")

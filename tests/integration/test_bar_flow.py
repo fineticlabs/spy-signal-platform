@@ -77,7 +77,7 @@ def _run_bars_through_pipeline(
     registry = _build_registry()
     levels = LevelManager(db=None, symbol=symbol)
     regime = RegimeDetector()
-    strategy = ORBStrategy()
+    strategy = ORBStrategy(excluded_days=[])
     signals = []
     for b in bars:
         registry.update_all(b)

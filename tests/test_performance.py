@@ -196,7 +196,7 @@ class TestStrategyPerformance:
         from src.strategies.orb import ORBStrategy
         from src.strategies.regime import RegimeDetector
 
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         regime = RegimeDetector()
         regime.update(vix=Decimal("18"), adx=Decimal("28"), trending_up=True)
 

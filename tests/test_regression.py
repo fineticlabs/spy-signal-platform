@@ -85,7 +85,7 @@ class TestSignalReproducibility:
 
         results: list[list[Signal | None]] = []
         for _ in range(3):
-            strategy = ORBStrategy()
+            strategy = ORBStrategy(excluded_days=[])
             regime = RegimeDetector()
             regime.update(vix=Decimal("18"), adx=Decimal("28"), trending_up=True)
             run_signals = []
@@ -129,7 +129,7 @@ class TestSignalReproducibility:
         signals_b: list[Signal | None] = []
 
         for run_signals in (signals_a, signals_b):
-            strat = ORBStrategy()
+            strat = ORBStrategy(excluded_days=[])
             regime = RegimeDetector()
             regime.update(vix=Decimal("18"), adx=Decimal("28"), trending_up=True)
             for bar in bars:

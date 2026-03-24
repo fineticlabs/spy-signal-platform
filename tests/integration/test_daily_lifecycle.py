@@ -108,7 +108,7 @@ def _run_bars_through_pipeline(bars: list[Bar], symbol: str = "SPY") -> tuple:
     registry = _build_registry()
     levels = LevelManager(db=None, symbol=symbol)
     regime = RegimeDetector()
-    strategy = ORBStrategy()
+    strategy = ORBStrategy(excluded_days=[])
     signals = []
     for b in bars:
         registry.update_all(b)
@@ -300,7 +300,7 @@ class TestSignalsPersistence:
             registry=_build_registry(),
             levels=LevelManager(db=None, symbol="SPY"),
             regime=RegimeDetector(),
-            strategy=ORBStrategy(),
+            strategy=ORBStrategy(excluded_days=[]),
         )
         alerter = FakeAlerter()
         disp = AlertDispatcher(alerter=alerter)

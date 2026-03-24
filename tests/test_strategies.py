@@ -133,7 +133,7 @@ class TestRegimeDetector:
 class TestORBStrategy:
     def test_long_signal_fires_above_orb_high(self) -> None:
         """LONG signal when close > ORB high with sufficient volume."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         levels = _make_levels(orb_high=485.0, orb_low=480.0)
@@ -154,7 +154,7 @@ class TestORBStrategy:
 
     def test_short_signal_fires_below_orb_low(self) -> None:
         """SHORT signal when close < ORB low with sufficient volume."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         levels = _make_levels(orb_high=485.0, orb_low=480.0)
@@ -174,7 +174,7 @@ class TestORBStrategy:
 
     def test_no_signal_inside_orb_range(self) -> None:
         """No signal when close is between ORB high and low."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
@@ -187,7 +187,7 @@ class TestORBStrategy:
 
     def test_no_signal_before_orb_complete(self) -> None:
         """No signal while the ORB window is still open."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
@@ -200,7 +200,7 @@ class TestORBStrategy:
 
     def test_no_signal_during_lunch_chop(self) -> None:
         """No signal between 11:30 and 13:30 ET."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
@@ -213,7 +213,7 @@ class TestORBStrategy:
 
     def test_no_signal_after_cutoff(self) -> None:
         """No signal at or after 15:45 ET."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
@@ -226,7 +226,7 @@ class TestORBStrategy:
 
     def test_no_signal_when_vix_too_high(self) -> None:
         """No signal when VIX >= 25."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
@@ -239,7 +239,7 @@ class TestORBStrategy:
 
     def test_no_signal_when_adx_too_low(self) -> None:
         """No signal when ADX <= 20."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(
@@ -252,7 +252,7 @@ class TestORBStrategy:
 
     def test_no_signal_when_volume_insufficient(self) -> None:
         """No signal when volume < 1.5x 20-bar average."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         # Volume only 1.2x average — below the 1.5x threshold
@@ -266,7 +266,7 @@ class TestORBStrategy:
 
     def test_long_stop_and_target_calculated_from_atr(self) -> None:
         """LONG: stop = entry - 1.5*ATR, target = entry + 2*risk."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         atr = Decimal("2.0")
@@ -288,7 +288,7 @@ class TestORBStrategy:
 
     def test_short_stop_and_target_calculated_from_atr(self) -> None:
         """SHORT: stop = entry + 1.5*ATR, target = entry - 2*risk."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         atr = Decimal("2.0")
@@ -309,7 +309,7 @@ class TestORBStrategy:
 
     def test_signal_carries_regime_context(self) -> None:
         """Signal includes VIX, ADX, and regime on the output."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         regime = _make_regime(vix=18.5, adx=28.0, trending_up=True)
@@ -327,7 +327,7 @@ class TestORBStrategy:
 
     def test_no_signal_without_atr(self) -> None:
         """No signal when ATR is None (indicator not yet warmed up)."""
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         _prime(strategy, n=20, volume=1_000_000)
 
         signal = strategy.evaluate(

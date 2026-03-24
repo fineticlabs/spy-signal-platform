@@ -456,6 +456,8 @@ class TestScheduler:
             patch("src.main.asyncio.sleep", side_effect=_fake_sleep),
             patch("src.main.datetime") as mock_dt,
             patch("src.main.query_recent_trades", return_value=[], create=True),
+            patch("src.main.query_recent_signals", return_value=[]),
+            patch("src.main.query_executed_signals", return_value=[]),
             patch("src.storage.queries.query_recent_trades", return_value=[]),
         ):
             mock_dt.now.return_value = mock_now
@@ -818,6 +820,7 @@ class TestSendEodStatus:
         with (
             patch("src.main.query_recent_signals", return_value=[]),
             patch("src.main.query_recent_trades", return_value=[]),
+            patch("src.main.query_executed_signals", return_value=[]),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
 
@@ -844,10 +847,12 @@ class TestSendEodStatus:
             {"approved": 0, "reject_reason": "cooldown"},
         ]
         trades = [{"pnl": "150.00"}, {"pnl": "-50.00"}]
+        executed_signals = [{"id": 1}]
 
         with (
             patch("src.main.query_recent_signals", return_value=signals),
             patch("src.main.query_recent_trades", return_value=trades),
+            patch("src.main.query_executed_signals", return_value=executed_signals),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
 
@@ -877,6 +882,7 @@ class TestSendEodStatus:
         with (
             patch("src.main.query_recent_signals", return_value=[]),
             patch("src.main.query_recent_trades", return_value=[]),
+            patch("src.main.query_executed_signals", return_value=[]),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
 
@@ -905,6 +911,7 @@ class TestSendEodStatus:
         with (
             patch("src.main.query_recent_signals", return_value=signals),
             patch("src.main.query_recent_trades", return_value=[]),
+            patch("src.main.query_executed_signals", return_value=[]),
         ):
             await _send_eod_status(dispatcher, db, pipelines, cooldown)
 
@@ -1069,6 +1076,7 @@ class TestSchedulerEodStatus:
             patch("src.main.datetime") as mock_dt,
             patch("src.main.query_recent_trades", return_value=[]),
             patch("src.main.query_recent_signals", return_value=[]),
+            patch("src.main.query_executed_signals", return_value=[]),
         ):
             mock_dt.now.return_value = mock_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)

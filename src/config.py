@@ -124,10 +124,26 @@ class AppSettings(BaseSettings):
             raise ValueError(f"log_level must be one of {valid}, got {v!r}")
         return upper
 
+    excluded_days: list[int] = Field(
+        default=[0],
+        description=(
+            "Weekdays excluded from trading (0=Monday, 4=Friday). "
+            "Shared by both live scanner and backtest engine."
+        ),
+    )
+
     execution_mode: str = Field(
         default="alerts_only",
         description="Execution mode: 'alerts_only', 'paper_trade', or 'live_trade'",
     )
+
+    @field_validator("excluded_days", mode="before")
+    @classmethod
+    def parse_excluded_days(cls, v: str | list[int]) -> list[int]:
+        """Accept comma-separated ints from .env (e.g. '0,4') or a list."""
+        if isinstance(v, str):
+            return [int(d.strip()) for d in v.split(",") if d.strip()]
+        return [int(d) for d in v]
 
     @field_validator("trading_mode")
     @classmethod

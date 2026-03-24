@@ -272,6 +272,7 @@ class TestProcessBar:
 
         dispatcher = AsyncMock()
         db = MagicMock()
+        db.conn.execute.return_value.lastrowid = 1
 
         executor = MagicMock()
         executor.submit_bracket_order.return_value = MagicMock(id="order-123")

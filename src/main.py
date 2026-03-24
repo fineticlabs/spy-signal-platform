@@ -73,8 +73,11 @@ from src.storage.database import BarDatabase
 from src.storage.queries import (
     ensure_schema,
     insert_signal,
+    mark_signal_executed,
+    query_executed_signals,
     query_recent_signals,
     query_recent_trades,
+    update_signal_fill,
     update_signal_outcome,
 )
 from src.strategies.orb import ORBStrategy
@@ -138,12 +141,17 @@ def _build_registry() -> IndicatorRegistry:
 _VIX_FALLBACK = Decimal("20")
 
 
-def _build_pipelines(symbols: list[str], db: BarDatabase) -> dict[str, _SymbolPipeline]:
+def _build_pipelines(
+    symbols: list[str],
+    db: BarDatabase,
+    excluded_days: list[int] | None = None,
+) -> dict[str, _SymbolPipeline]:
     """Build one :class:`_SymbolPipeline` per ticker symbol.
 
     Args:
-        symbols: List of uppercase ticker symbols.
-        db:      Connected :class:`BarDatabase` (needed by LevelManager).
+        symbols:       List of uppercase ticker symbols.
+        db:            Connected :class:`BarDatabase` (needed by LevelManager).
+        excluded_days: Weekdays to skip (0=Mon). Passed to ORBStrategy.
 
     Returns:
         Dict mapping symbol → pipeline.
@@ -155,7 +163,7 @@ def _build_pipelines(symbols: list[str], db: BarDatabase) -> dict[str, _SymbolPi
             registry=_build_registry(),
             levels=LevelManager(db=db, symbol=symbol),
             regime=RegimeDetector(),
-            strategy=ORBStrategy(),
+            strategy=ORBStrategy(excluded_days=excluded_days),
         )
         logger.info("pipeline_built", symbol=symbol)
     return pipelines
@@ -356,8 +364,9 @@ async def _process_bar(
     decision = risk.approve(signal)
 
     # 5. Persist signal + decision regardless of approval
+    signal_id = 0
     try:
-        insert_signal(db.conn, signal, decision)
+        signal_id = insert_signal(db.conn, signal, decision)
     except Exception as exc:
         logger.error("signal_persist_failed", symbol=bar.symbol, error=str(exc))
 
@@ -380,6 +389,16 @@ async def _process_bar(
                     symbol=signal.symbol,
                     order_id=str(order.id),
                 )
+                # 8. Mark signal as executed in DB
+                if signal_id > 0:
+                    try:
+                        mark_signal_executed(db.conn, signal_id, str(order.id))
+                    except Exception as exc:
+                        logger.error(
+                            "signal_mark_executed_failed",
+                            signal_id=signal_id,
+                            error=str(exc),
+                        )
     else:
         logger.warning(
             "signal_rejected",
@@ -399,6 +418,7 @@ async def _send_eod_status(
     cooldown: CooldownTracker,
     *,
     skip_rest_fetch: bool = False,
+    executor: AlpacaExecutor | None = None,
 ) -> None:
     """Send detailed end-of-day status via Telegram."""
     if db.conn is None:  # pragma: no cover — only when DB never connected
@@ -407,12 +427,24 @@ async def _send_eod_status(
 
     since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
+    # Reconcile Alpaca fills into signal/trades tables before building the report
+    if executor is not None:
+        try:
+            _reconcile_alpaca_fills(executor, db, since)
+        except Exception as exc:
+            logger.error("eod_reconcile_failed", error=str(exc))
+
     signals = query_recent_signals(db.conn, since=since, limit=1000)
     trades = query_recent_trades(db.conn, since=since, limit=500)
 
     total_signals = len(signals)
     approved = sum(1 for s in signals if s.get("approved") == 1)
     rejected = total_signals - approved
+
+    # Execution counts from signals table (executed=1 flag)
+    executed_signals = query_executed_signals(db.conn, since=since)
+    n_executed = len(executed_signals)
+    n_skipped = approved - n_executed
 
     # Group rejection reasons
     reasons: dict[str, int] = {}
@@ -421,7 +453,17 @@ async def _send_eod_status(
             reason = str(s.get("reject_reason", "unknown"))
             reasons[reason] = reasons.get(reason, 0) + 1
 
-    total_pnl = sum(float(t.get("pnl", 0)) for t in trades)
+    # P&L: prefer Alpaca account data for accuracy, fall back to trades table
+    actual_pnl: float = 0.0
+    if executor is not None:
+        try:
+            actual_pnl = float(executor.get_daily_pnl())
+        except Exception as exc:
+            logger.warning("eod_pnl_fetch_failed", error=str(exc))
+            actual_pnl = sum(float(t.get("pnl", 0)) for t in trades)
+    else:
+        actual_pnl = sum(float(t.get("pnl", 0)) for t in trades)
+
     orb_count = sum(1 for p in pipelines.values() if p.levels._orb.is_complete)
     total_tickers = len(pipelines)
     date_str = datetime.now(_ET).strftime("%A, %B %d %Y")
@@ -434,7 +476,7 @@ async def _send_eod_status(
         f"Generated: {total_signals} | Approved: {approved} | Rejected: {rejected}",
         "",
         "💰 Trading",
-        f"Trades: {len(trades)} | P&L: ${total_pnl:+.2f}",
+        f"Trades: {n_executed} | P&L: ${actual_pnl:+.2f}",
         "",
         "🎯 ORB Status",
         f"Formed: {orb_count}/{total_tickers} tickers",
@@ -497,20 +539,138 @@ async def _send_eod_status(
         if win_rate == 0 and decided >= 5:
             lines.append("⚠️ All signals lost — review strategy conditions for this session")
 
-    # Execution comparison
-    executed = len(trades)
-    skipped = approved - executed
+    # Execution comparison (from signals.executed column, not trades table)
     if approved > 0:
         lines += [
             "",
             "💰 Execution",
-            f"Executed: {executed}/{approved} signals",
+            f"Executed: {n_executed}/{approved} signals",
         ]
-        if skipped > 0:
-            lines.append(f"Skipped: {skipped}")
-        lines.append(f"Actual P&L: ${total_pnl:+.2f}")
+        if n_skipped > 0:
+            lines.append(f"Skipped: {n_skipped}")
+        lines.append(f"Actual P&L: ${actual_pnl:+.2f}")
 
     await dispatcher.dispatch_status("\n".join(lines))
+
+
+# ── Alpaca fill reconciliation ─────────────────────────────────────────────────
+
+
+def _reconcile_alpaca_fills(
+    executor: AlpacaExecutor,
+    db: BarDatabase,
+    since: datetime,
+) -> int:
+    """Reconcile Alpaca filled orders back to signal records.
+
+    For each filled order from today, find the matching executed signal
+    (by order_id) and update it with fill price, realized P&L, and outcome.
+    Also inserts a trade row so the trades table is populated.
+
+    Returns:
+        Number of signals reconciled.
+    """
+    if db.conn is None:
+        return 0
+
+    filled_orders = executor.get_closed_orders_today()
+    if not filled_orders:
+        logger.debug("reconcile_no_filled_orders")
+        return 0
+
+    # Build order_id → filled order lookup
+    order_map: dict[str, object] = {}
+    for order in filled_orders:
+        order_map[str(order.id)] = order
+
+    # Get executed signals that have an order_id
+    executed = query_executed_signals(db.conn, since=since)
+    reconciled = 0
+
+    for sig in executed:
+        order_id = sig.get("order_id")
+        if not order_id or sig.get("realized_pnl") is not None:
+            continue  # already reconciled or no order_id
+
+        order = order_map.get(str(order_id))
+        if order is None:
+            continue  # order not yet filled or not from today
+
+        # Calculate P&L from fill price vs entry
+        entry = float(sig.get("entry_price", 0))
+        direction = str(sig.get("direction", ""))
+        position_size = int(sig.get("position_size", 0))
+        stop = float(sig.get("stop_price", 0))
+        target = float(sig.get("target_price", 0))
+
+        fill_price = float(getattr(order, "filled_avg_price", 0) or 0)
+        if fill_price <= 0:
+            fill_price = entry  # no fill price available
+
+        # Determine outcome from fill legs — check if child orders exist
+        # For bracket orders, the parent fills at entry; P&L comes from
+        # the stop/target leg that fired. Use the order's P&L if available.
+        legs = getattr(order, "legs", None) or []
+        exit_price = fill_price
+        for leg in legs:
+            if getattr(leg, "status", None) == "filled":
+                leg_fill = float(getattr(leg, "filled_avg_price", 0) or 0)
+                if leg_fill > 0:
+                    exit_price = leg_fill
+
+        if direction == "LONG":
+            pnl = (exit_price - entry) * position_size
+        else:
+            pnl = (entry - exit_price) * position_size
+
+        # Determine outcome
+        if abs(exit_price - target) < abs(exit_price - stop):
+            outcome = "winner"
+        elif abs(exit_price - stop) < abs(exit_price - target):
+            outcome = "loser"
+        else:
+            outcome = "open"
+
+        signal_id = int(sig.get("id", 0))
+        if signal_id > 0:
+            with contextlib.suppress(Exception):
+                update_signal_fill(
+                    db.conn,
+                    signal_id,
+                    str(exit_price),
+                    str(round(pnl, 2)),
+                    outcome,
+                )
+
+            # Also insert into trades table for backward compat
+            with contextlib.suppress(Exception):
+                db.conn.execute(
+                    """INSERT INTO trades
+                       (timestamp, strategy_name, direction, entry_price,
+                        stop_price, target_price, pnl, symbol)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(sig.get("timestamp", "")),
+                        str(sig.get("strategy_name", "")),
+                        direction,
+                        str(entry),
+                        str(stop),
+                        str(target),
+                        str(round(pnl, 2)),
+                        str(sig.get("symbol", "SPY")),
+                    ),
+                )
+                db.conn.commit()
+
+            reconciled += 1
+
+    logger.info(
+        "reconcile_complete",
+        filled_orders=len(filled_orders),
+        executed_signals=len(executed),
+        reconciled=reconciled,
+    )
+    return reconciled
 
 
 # ── signal outcome evaluation ──────────────────────────────────────────────────
@@ -776,6 +936,20 @@ async def _scheduler(
                 pipeline.levels._day.__init__()  # type: ignore[misc]
                 pipeline.levels._premarket.__init__()  # type: ignore[misc]
                 pipeline.levels._last_date = None
+            # Notify on excluded weekdays (e.g. Monday)
+            from src.config import get_app_settings as _get_app_settings
+
+            _excluded = set(_get_app_settings().excluded_days)
+            if today.weekday() in _excluded:
+                _day_names = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"}
+                day_name = _day_names.get(today.weekday(), str(today.weekday()))
+                logger.info("excluded_day_no_trading", date=str(today), day=day_name)
+                with contextlib.suppress(Exception):
+                    await dispatcher.dispatch_status(
+                        f"📅 {day_name} — no trading per strategy rules.\n"
+                        f"ORB signals suppressed for all {len(pipelines)} tickers."
+                    )
+
             last_reset_date = now_et
 
         # ── ORB formation watchdog at 9:50 ET (market hours only) ─────────────
@@ -823,18 +997,27 @@ async def _scheduler(
             last_eod_date is None or last_eod_date.date() < today
         ):
             logger.info("eod_summary", date=str(today))
+            # Send detailed EOD status first — this runs Alpaca reconciliation
+            # which populates the trades table with actual fill data.
+            try:  # pragma: no cover — fires at 16:05 ET during live session
+                await _send_eod_status(
+                    dispatcher,
+                    db,
+                    pipelines,
+                    risk_cooldown,
+                    executor=executor,
+                )
+                global _eod_sent_today
+                _eod_sent_today = True
+            except Exception as exc:  # pragma: no cover — defensive catch for DB/Telegram errors
+                logger.error("eod_status_failed", error=str(exc))
+            # Daily summary dispatched AFTER reconciliation so trades table has data
             try:
                 since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
                 raw_trades = query_recent_trades(db.conn, since=since, limit=500)
                 await dispatcher.dispatch_daily_summary(cast_trades(raw_trades))
             except Exception as exc:  # pragma: no cover — DB/Telegram errors at 16:05 ET
                 logger.error("eod_summary_failed", error=str(exc))
-            try:  # pragma: no cover — fires at 16:05 ET during live session
-                await _send_eod_status(dispatcher, db, pipelines, risk_cooldown)
-                global _eod_sent_today
-                _eod_sent_today = True
-            except Exception as exc:  # pragma: no cover — defensive catch for DB/Telegram errors
-                logger.error("eod_status_failed", error=str(exc))
             last_eod_date = now_et
 
         # ── websocket watchdog: alert if no bars in 90s during market hours ──
@@ -1010,7 +1193,7 @@ async def run() -> None:
     ensure_schema(db.conn)
 
     # ── per-symbol pipelines ──────────────────────────────────────────────────
-    pipelines = _build_pipelines(symbols, db)
+    pipelines = _build_pipelines(symbols, db, excluded_days=app_settings.excluded_days)
 
     # ── backfill missed ORB bars on late start ─────────────────────────────
     await _backfill_orb_bars(pipelines)
@@ -1119,7 +1302,14 @@ async def run() -> None:
         if not _eod_sent_today:  # pragma: no cover — shutdown-only path
             try:
                 await asyncio.wait_for(
-                    _send_eod_status(dispatcher, db, pipelines, cooldown, skip_rest_fetch=True),
+                    _send_eod_status(
+                        dispatcher,
+                        db,
+                        pipelines,
+                        cooldown,
+                        skip_rest_fetch=True,
+                        executor=executor,
+                    ),
                     timeout=10.0,
                 )
             except TimeoutError:

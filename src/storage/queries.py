@@ -83,6 +83,20 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE signals ADD COLUMN symbol TEXT DEFAULT 'SPY'")
 
+    # Migrate: add execution tracking columns
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE signals ADD COLUMN order_id TEXT DEFAULT NULL")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE signals ADD COLUMN executed INTEGER DEFAULT 0")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE signals ADD COLUMN fill_price TEXT DEFAULT NULL")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE signals ADD COLUMN realized_pnl TEXT DEFAULT NULL")
+
+    # Migrate: add symbol column to trades if it doesn't exist
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE trades ADD COLUMN symbol TEXT DEFAULT 'SPY'")
+
     logger.debug("signal_trade_schema_ensured")
 
 
@@ -190,6 +204,74 @@ def query_recent_trades(
         LIMIT ?
         """,
         (since.astimezone(UTC).isoformat(), limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_signal_executed(
+    conn: sqlite3.Connection,
+    signal_id: int,
+    order_id: str,
+) -> None:
+    """Mark a signal as executed with its Alpaca order ID.
+
+    Args:
+        conn: Active SQLite connection.
+        signal_id: Primary key of the signal row.
+        order_id: Alpaca order ID from the submitted bracket order.
+    """
+    with conn:
+        conn.execute(
+            "UPDATE signals SET executed = 1, order_id = ? WHERE id = ?",
+            (order_id, signal_id),
+        )
+    logger.debug("signal_marked_executed", signal_id=signal_id, order_id=order_id)
+
+
+def update_signal_fill(
+    conn: sqlite3.Connection,
+    signal_id: int,
+    fill_price: str,
+    realized_pnl: str,
+    outcome: str,
+) -> None:
+    """Update a signal with actual fill data from Alpaca reconciliation.
+
+    Args:
+        conn: Active SQLite connection.
+        signal_id: Primary key of the signal row.
+        fill_price: Actual fill/exit price.
+        realized_pnl: Realized P&L from the trade.
+        outcome: One of ``'winner'``, ``'loser'``, ``'open'``, ``'stopped'``.
+    """
+    with conn:
+        conn.execute(
+            """UPDATE signals
+               SET fill_price = ?, realized_pnl = ?, outcome = ?
+               WHERE id = ?""",
+            (fill_price, realized_pnl, outcome, signal_id),
+        )
+    logger.debug(
+        "signal_fill_updated",
+        signal_id=signal_id,
+        fill_price=fill_price,
+        realized_pnl=realized_pnl,
+        outcome=outcome,
+    )
+
+
+def query_executed_signals(
+    conn: sqlite3.Connection,
+    since: datetime,
+) -> list[dict[str, object]]:
+    """Return executed signal rows (approved=1, executed=1) newer than *since*."""
+    rows = conn.execute(
+        """
+        SELECT * FROM signals
+        WHERE timestamp >= ? AND approved = 1 AND executed = 1
+        ORDER BY timestamp DESC
+        """,
+        (since.astimezone(UTC).isoformat(),),
     ).fetchall()
     return [dict(row) for row in rows]
 

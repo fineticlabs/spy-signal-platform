@@ -107,7 +107,7 @@ def _run_pipeline(
     registry = _build_registry()
     levels = LevelManager(db=None, symbol="SPY")
     regime = RegimeDetector()
-    strategy = ORBStrategy()
+    strategy = ORBStrategy(excluded_days=[])
 
     signals: list[Signal] = []
 

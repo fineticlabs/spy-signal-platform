@@ -38,7 +38,7 @@ class TestORBVixAdxNone:
     def _make_strategy_with_bars(self) -> tuple:
         from src.strategies.orb import ORBStrategy
 
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         # Feed 20 bars so volume average is ready
         for i in range(20):
             bar = self._bar(14, 30 + (i % 30), volume=100_000)
@@ -64,7 +64,7 @@ class TestORBVixAdxNone:
         from src.models import IndicatorSnapshot, LevelSnapshot
         from src.strategies.orb import ORBStrategy
 
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         for _ in range(20):
             strategy._volumes.append(100_000)
 

@@ -52,6 +52,7 @@ class ORBStrategy(Strategy):
 
     Filters:
 
+    - Excluded weekdays (default: Monday) — configurable via ``excluded_days``
     - ORB window complete (>= 9:35 ET)
     - VIX < 25
     - ADX > 20
@@ -62,9 +63,11 @@ class ORBStrategy(Strategy):
     Target: ``entry +/- 2 * risk_distance``
     """
 
-    def __init__(self) -> None:
+    def __init__(self, excluded_days: list[int] | None = None) -> None:
         self._volumes: deque[int] = deque(maxlen=_VOL_WINDOW)
         self._recent_bars: deque[Bar] = deque(maxlen=5)  # for candlestick filters
+        self._excluded_days: set[int] = set(excluded_days if excluded_days is not None else [0])
+        self._excluded_day_logged: set[str] = set()  # track per-date logging
 
     # ── Strategy interface ─────────────────────────────────────────────────────
 
@@ -106,6 +109,22 @@ class ORBStrategy(Strategy):
                         confirmation on non-SPY/QQQ tickers).
             spy_price:  SPY's current price (last close).
         """
+        # --- Excluded weekday filter (Monday by default) ---
+        bar_date = bar.timestamp.astimezone(_ET).date()
+        if bar_date.weekday() in self._excluded_days:
+            date_key = str(bar_date)
+            if date_key not in self._excluded_day_logged:
+                day_names = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"}
+                day_name = day_names.get(bar_date.weekday(), str(bar_date.weekday()))
+                logger.info(
+                    "orb_filter_excluded_day",
+                    date=date_key,
+                    day=day_name,
+                    symbol=bar.symbol,
+                )
+                self._excluded_day_logged.add(date_key)
+            return None
+
         # Capture avg BEFORE this bar contaminates the window, then record it.
         avg_vol = self._avg_volume()
         self._volumes.append(bar.volume)

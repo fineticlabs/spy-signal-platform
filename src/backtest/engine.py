@@ -651,6 +651,7 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
     max_trades_per_day: int = _MAX_TRADES_PER_DAY
     min_orb_pct: float = _MIN_ORB_PCT
     symbol: str = "SPY"
+    excluded_days: str = "0"  # comma-separated weekday ints (0=Mon); backtesting.py needs str
 
     def init(self) -> None:
         """Pre-compute all series indicators once on the full price history."""
@@ -818,8 +819,9 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             self._last_et_date = today
             self._daily_trade_count = 0
 
-        # Skip Mondays — consistently worst WR and expectancy across all regimes
-        if ts.tz_convert(_ET_TZ).dayofweek == 0:
+        # Skip excluded weekdays (default: Monday) — shared config with live scanner
+        _excluded = {int(d) for d in str(self.excluded_days).split(",") if d.strip()}
+        if ts.tz_convert(_ET_TZ).dayofweek in _excluded:
             return
 
         # Skip high-impact economic event days (FOMC, NFP, CPI, PPI)

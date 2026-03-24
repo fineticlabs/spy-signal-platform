@@ -7,6 +7,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.levels.trading_calendar import is_trading_day, last_trading_day
 
 # ── Bug 1: PDL resolves to last trading day ─────────────────────────────────
@@ -241,7 +243,7 @@ class TestVolumeFilterRejectsLowVolume:
         """Create an ORBStrategy primed with a volume baseline."""
         from src.strategies.orb import ORBStrategy
 
-        strategy = ORBStrategy()
+        strategy = ORBStrategy(excluded_days=[])
         # Prime with baseline volume data (ORB incomplete, no signals fire)
         from src.models import IndicatorSnapshot, LevelSnapshot
         from src.strategies.regime import RegimeDetector
@@ -348,3 +350,362 @@ class TestVolumeFilterRejectsLowVolume:
         signal = strategy.evaluate(bar, indicators, levels, regime)
         assert signal is not None
         assert signal.direction.name == "LONG"
+
+
+# ── Execution tracking: signal marked executed after order ───────────────────
+
+
+class TestSignalExecutionTracking:
+    """Signal DB row is updated with order_id after successful bracket order."""
+
+    def test_mark_signal_executed(self, tmp_path) -> None:
+        """mark_signal_executed sets executed=1 and stores order_id."""
+        import sqlite3
+
+        from src.storage.queries import (
+            ensure_schema,
+            insert_signal,
+            mark_signal_executed,
+            query_executed_signals,
+        )
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        ensure_schema(conn)
+
+        # Create a minimal signal + decision
+        from datetime import UTC, datetime
+
+        from src.models import (
+            Direction,
+            Regime,
+            RiskDecision,
+            Signal,
+            TimeFrame,
+        )
+
+        sig = Signal(
+            symbol="TSLA",
+            direction=Direction.LONG,
+            strategy_name="ORB-5min",
+            entry_price=Decimal("180.00"),
+            stop_price=Decimal("175.00"),
+            target_price=Decimal("190.00"),
+            risk_reward_ratio=Decimal("2.0"),
+            confidence_score=3,
+            reason="test",
+            timeframe=TimeFrame.ONE_MIN,
+            regime=Regime.RANGING,
+            timestamp=datetime.now(UTC),
+        )
+        decision = RiskDecision(approved=True, position_size=50, reason="approved")
+        signal_id = insert_signal(conn, sig, decision)
+
+        # Mark as executed
+        mark_signal_executed(conn, signal_id, "alpaca-order-abc123")
+
+        # Query executed signals
+        since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        executed = query_executed_signals(conn, since)
+        assert len(executed) == 1
+        assert executed[0]["order_id"] == "alpaca-order-abc123"
+        assert executed[0]["executed"] == 1
+
+        conn.close()
+
+    def test_update_signal_fill(self, tmp_path) -> None:
+        """update_signal_fill stores fill_price, realized_pnl, outcome."""
+        import sqlite3
+
+        from src.storage.queries import (
+            ensure_schema,
+            insert_signal,
+            mark_signal_executed,
+            update_signal_fill,
+        )
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        ensure_schema(conn)
+
+        from datetime import UTC, datetime
+
+        from src.models import (
+            Direction,
+            Regime,
+            RiskDecision,
+            Signal,
+            TimeFrame,
+        )
+
+        sig = Signal(
+            symbol="HOOD",
+            direction=Direction.LONG,
+            strategy_name="ORB-5min",
+            entry_price=Decimal("25.00"),
+            stop_price=Decimal("23.00"),
+            target_price=Decimal("29.00"),
+            risk_reward_ratio=Decimal("2.0"),
+            confidence_score=3,
+            reason="test",
+            timeframe=TimeFrame.ONE_MIN,
+            regime=Regime.RANGING,
+            timestamp=datetime.now(UTC),
+        )
+        decision = RiskDecision(approved=True, position_size=200, reason="approved")
+        signal_id = insert_signal(conn, sig, decision)
+        mark_signal_executed(conn, signal_id, "order-xyz")
+
+        update_signal_fill(conn, signal_id, "29.00", "800.00", "winner")
+
+        row = dict(conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone())
+        assert row["fill_price"] == "29.00"
+        assert row["realized_pnl"] == "800.00"
+        assert row["outcome"] == "winner"
+
+        conn.close()
+
+
+# ── EOD summary uses real execution data ─────────────────────────────────────
+
+
+class TestEodSummaryExecutionData:
+    """EOD summary correctly counts executed trades and shows real P&L."""
+
+    @pytest.mark.asyncio
+    async def test_eod_counts_executed_from_signals_table(self) -> None:
+        """Executed count comes from signals.executed=1, not trades table."""
+        from unittest.mock import AsyncMock
+
+        from src.main import _send_eod_status
+
+        dispatcher = AsyncMock()
+        db = MagicMock()
+        cooldown = MagicMock()
+
+        pipeline = MagicMock()
+        pipeline.levels._orb.is_complete = True
+        pipelines = {"SPY": pipeline}
+
+        # 3 approved signals, 2 were executed
+        signals = [
+            {"approved": 1, "reject_reason": ""},
+            {"approved": 1, "reject_reason": ""},
+            {"approved": 1, "reject_reason": ""},
+        ]
+        executed_signals = [{"id": 1}, {"id": 2}]
+        trades: list[dict] = []  # trades table empty (pre-reconciliation)
+
+        outcomes = {"winners": [], "losers": [], "open": [], "no_data": []}
+
+        with (
+            patch("src.main.query_recent_signals", return_value=signals),
+            patch("src.main.query_recent_trades", return_value=trades),
+            patch("src.main.query_executed_signals", return_value=executed_signals),
+            patch("src.main._evaluate_signal_outcomes", return_value=outcomes),
+        ):
+            await _send_eod_status(dispatcher, db, pipelines, cooldown)
+
+        msg = dispatcher.dispatch_status.call_args[0][0]
+        assert "Executed: 2/3 signals" in msg
+        assert "Skipped: 1" in msg
+
+    @pytest.mark.asyncio
+    async def test_eod_pnl_from_alpaca_executor(self) -> None:
+        """When executor is present, P&L comes from Alpaca account."""
+        from unittest.mock import AsyncMock
+
+        from src.main import _send_eod_status
+
+        dispatcher = AsyncMock()
+        db = MagicMock()
+        cooldown = MagicMock()
+
+        pipeline = MagicMock()
+        pipeline.levels._orb.is_complete = True
+        pipelines = {"SPY": pipeline}
+
+        signals = [{"approved": 1, "reject_reason": ""}]
+        executed_signals = [{"id": 1}]
+
+        outcomes = {"winners": [], "losers": [], "open": [], "no_data": []}
+
+        mock_executor = MagicMock()
+        mock_executor.get_daily_pnl.return_value = Decimal("-2213.88")
+        mock_executor.get_closed_orders_today.return_value = []
+
+        with (
+            patch("src.main.query_recent_signals", return_value=signals),
+            patch("src.main.query_recent_trades", return_value=[]),
+            patch("src.main.query_executed_signals", return_value=executed_signals),
+            patch("src.main._evaluate_signal_outcomes", return_value=outcomes),
+        ):
+            await _send_eod_status(
+                dispatcher,
+                db,
+                pipelines,
+                cooldown,
+                executor=mock_executor,
+            )
+
+        msg = dispatcher.dispatch_status.call_args[0][0]
+        assert "Actual P&L: $-2213.88" in msg
+
+    @pytest.mark.asyncio
+    async def test_eod_reconciliation_populates_trades(self) -> None:
+        """Reconciliation inserts trade rows for executed signals."""
+        from src.main import _reconcile_alpaca_fills
+
+        db = MagicMock()
+        db.conn = MagicMock()
+        db.conn.commit = MagicMock()
+
+        mock_executor = MagicMock()
+        # One filled order
+        filled_order = SimpleNamespace(
+            id="order-abc",
+            symbol="TSLA",
+            status="filled",
+            filled_avg_price="180.50",
+            legs=[],
+        )
+        mock_executor.get_closed_orders_today.return_value = [filled_order]
+
+        from datetime import UTC, datetime
+
+        since = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        executed_signal = {
+            "id": 42,
+            "order_id": "order-abc",
+            "symbol": "TSLA",
+            "direction": "LONG",
+            "entry_price": "180.00",
+            "stop_price": "175.00",
+            "target_price": "190.00",
+            "position_size": 25,
+            "realized_pnl": None,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "strategy_name": "ORB-5min",
+        }
+
+        with patch("src.main.query_executed_signals", return_value=[executed_signal]):
+            reconciled = _reconcile_alpaca_fills(mock_executor, db, since)
+
+        assert reconciled == 1
+        # Verify trade was inserted into trades table
+        db.conn.execute.assert_called()
+        db.conn.commit.assert_called()
+
+
+# ── Monday filter: live scanner skips excluded days ──────────────────────────
+
+
+class TestMondayFilterLive:
+    """ORB strategy skips all evaluation on excluded weekdays."""
+
+    def _make_bar_on_day(self, weekday_date: str, close: float = 486.0, volume: int = 2_000_000):
+        """Create a bar on the given date at 10:00 ET."""
+        from datetime import UTC, datetime
+        from zoneinfo import ZoneInfo
+
+        from src.models import Bar, TimeFrame
+
+        et = ZoneInfo("America/New_York")
+        ts = datetime.fromisoformat(f"{weekday_date}T10:00:00").replace(tzinfo=et).astimezone(UTC)
+        return Bar(
+            symbol="SPY",
+            timeframe=TimeFrame.ONE_MIN,
+            timestamp=ts,
+            open=Decimal(str(close)),
+            high=Decimal(str(close + 0.5)),
+            low=Decimal(str(close - 0.5)),
+            close=Decimal(str(close)),
+            volume=volume,
+            vwap=Decimal(str(close)),
+        )
+
+    def _make_deps(self):
+        from src.models import IndicatorSnapshot, LevelSnapshot
+        from src.strategies.regime import RegimeDetector
+
+        levels = LevelSnapshot(
+            orb_complete=True,
+            orb_high=Decimal("485.00"),
+            orb_low=Decimal("480.00"),
+        )
+        indicators = IndicatorSnapshot(atr=Decimal("2.0"))
+        regime = RegimeDetector()
+        regime.update(vix=Decimal("18"), adx=Decimal("28"), trending_up=True)
+        return indicators, levels, regime
+
+    def test_monday_returns_none(self) -> None:
+        """Signal is None on Monday when excluded_days=[0]."""
+        from zoneinfo import ZoneInfo
+
+        from src.strategies.orb import ORBStrategy
+
+        strategy = ORBStrategy(excluded_days=[0])
+        indicators, levels, regime = self._make_deps()
+
+        # 2026-03-23 is a Monday
+        bar = self._make_bar_on_day("2026-03-23")
+        assert bar.timestamp.astimezone(ZoneInfo("America/New_York")).date().weekday() == 0
+
+        signal = strategy.evaluate(bar, indicators, levels, regime)
+        assert signal is None
+
+    def test_tuesday_trades_normally(self) -> None:
+        """Signal fires on Tuesday when excluded_days=[0]."""
+        from src.models import LevelSnapshot
+        from src.strategies.orb import ORBStrategy
+
+        strategy = ORBStrategy(excluded_days=[0])
+
+        # Prime with volume data on a Tuesday
+        indicators, levels_incomplete, regime = self._make_deps()
+        levels_incomplete = LevelSnapshot(orb_complete=False)
+        for _i in range(20):
+            bar = self._make_bar_on_day("2026-03-24", close=482.0, volume=1_000_000)
+            strategy.evaluate(bar, indicators, levels_incomplete, regime)
+
+        indicators, levels, regime = self._make_deps()
+        # 2026-03-24 is a Tuesday — should produce signal
+        bar = self._make_bar_on_day("2026-03-24", close=486.0, volume=2_000_000)
+        signal = strategy.evaluate(bar, indicators, levels, regime)
+        assert signal is not None
+        assert signal.direction.name == "LONG"
+
+    def test_excluded_days_empty_allows_monday(self) -> None:
+        """When excluded_days=[], Monday trades are allowed."""
+        from src.models import LevelSnapshot
+        from src.strategies.orb import ORBStrategy
+
+        strategy = ORBStrategy(excluded_days=[])
+
+        # Prime
+        indicators, levels_incomplete, regime = self._make_deps()
+        levels_incomplete = LevelSnapshot(orb_complete=False)
+        for _i in range(20):
+            bar = self._make_bar_on_day("2026-03-23", close=482.0, volume=1_000_000)
+            strategy.evaluate(bar, indicators, levels_incomplete, regime)
+
+        indicators, levels, regime = self._make_deps()
+        bar = self._make_bar_on_day("2026-03-23", close=486.0, volume=2_000_000)
+        signal = strategy.evaluate(bar, indicators, levels, regime)
+        assert signal is not None
+
+    def test_config_excluded_days_default_is_monday(self) -> None:
+        """AppSettings.excluded_days defaults to [0] (Monday)."""
+        from src.config import AppSettings
+
+        settings = AppSettings(_env_file=None)  # type: ignore[call-arg]
+        assert settings.excluded_days == [0]
+
+    def test_config_excluded_days_from_string(self) -> None:
+        """excluded_days can be parsed from comma-separated string."""
+        from src.config import AppSettings
+
+        settings = AppSettings(_env_file=None, excluded_days="0,4")  # type: ignore[call-arg]
+        assert settings.excluded_days == [0, 4]

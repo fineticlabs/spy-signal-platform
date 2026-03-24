@@ -118,7 +118,7 @@ def pipeline():
         registry=_build_registry(),
         levels=LevelManager(db=None, symbol="SPY"),
         regime=RegimeDetector(),
-        strategy=ORBStrategy(),
+        strategy=ORBStrategy(excluded_days=[]),
     )
 
 
@@ -226,7 +226,7 @@ class TestExecutorWiring:
             registry=_build_registry(),
             levels=LevelManager(db=None, symbol="SPY"),
             regime=RegimeDetector(),
-            strategy=ORBStrategy(),
+            strategy=ORBStrategy(excluded_days=[]),
         )
         rm = RiskManager(cooldown=CooldownTracker(), settings=_TEST_RISK)
         alerter = FakeAlerter()
@@ -266,7 +266,7 @@ class TestExecutorWiring:
             registry=_build_registry(),
             levels=LevelManager(db=None, symbol="SPY"),
             regime=RegimeDetector(),
-            strategy=ORBStrategy(),
+            strategy=ORBStrategy(excluded_days=[]),
         )
         alerter = FakeAlerter()
         disp = AlertDispatcher(alerter=alerter)
