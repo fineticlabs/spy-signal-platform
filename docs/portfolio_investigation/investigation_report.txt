@@ -1,0 +1,288 @@
+================================================================================
+PORTFOLIO BACKTEST DEEP INVESTIGATION
+================================================================================
+
+Loading data...
+Loaded 26 symbols, 1421 trading days
+Individual backtest: 2094 trades loaded
+
+================================================================================
+1. SIGNAL SELECTION AUDIT: Accepted vs Rejected PnL
+================================================================================
+
+Baseline: 648 trades, WR=39.4%, PF=0.891, Net=$-10,337
+Counters: {'days_monday': 264, 'days_tradeable': 230, 'signals_raw': 694, 'signals_accepted': 648, 'exits_target': 254, 'exits_stop': 391, 'days_econ_blocked': 62, 'exits_flat': 3, 'rejected_concurrent': 43, 'days_vol_blocked': 126, 'days_adx_blocked': 734, 'days_backwardation': 5, 'rejected_sector': 3}
+
+Total signals: 694
+Accepted: 648
+Rejected: 46
+
+Computing hypothetical PnL for rejected signals (this may take a moment)...
+
+Rejected signals hypothetical performance:
+  Total: 46
+  Winners: 20 (43.5%)
+  Losers: 26 (56.5%)
+  PF: 0.914
+  Net hypothetical PnL: $-448
+  Avg rejected PnL: $-9.74
+
+  Rejected by concurrent_limit:
+    Count: 43, WR: 41.9%, PF: 0.856, Net: $-710
+
+  Rejected by sector_limit:
+    Count: 3, WR: 66.7%, PF: 1.833, Net: $262
+
+  Opportunity cost by ticker (rejected signals):
+ticker  rejected hyp_wr hyp_net
+    MU         3   100%    $776
+  SMCI         1   100%    $397
+  INTC         1   100%    $365
+  TSLA         1   100%    $343
+   AMD         1   100%    $267
+  SNOW         1   100%    $236
+   SPY         1   100%     $75
+  PYPL         3    33%     $42
+   QQQ         5    60%     $36
+  UBER         3    33%    $-71
+  AMZN         5    40%    $-72
+  MSFT         3    33%    $-76
+  META         1     0%   $-104
+    BA         1     0%   $-163
+  ROKU         1     0%   $-167
+  PLTR         3    33%   $-304
+  DKNG         2     0%   $-596
+  TQQQ         7    29%   $-663
+  SHOP         3     0%   $-769
+
+Saved: docs/portfolio_investigation/signal_audit.csv
+
+================================================================================
+2. FILTER IMPACT ANALYSIS
+================================================================================
+
+  Baseline (all on):
+    Trades=648, WR=39.4%, PF=0.891, Sharpe=-0.76, Net=$-10,337
+
+  ADX filter OFF:
+    Trades=1846, WR=40.9%, PF=0.925, Sharpe=-0.51, Net=$-20,335
+
+  Monday block OFF:
+    Trades=860, WR=41.2%, PF=1.003, Sharpe=0.02, Net=$440
+
+  Vol filter OFF:
+    Trades=850, WR=39.5%, PF=0.889, Sharpe=-0.76, Net=$-15,197
+
+  Sector limit OFF:
+    Trades=648, WR=39.7%, PF=0.901, Sharpe=-0.69, Net=$-9,400
+
+  Econ filter OFF:
+    Trades=821, WR=39.2%, PF=0.891, Sharpe=-0.77, Net=$-13,274
+
+  VTS filter OFF:
+    Trades=659, WR=39.0%, PF=0.865, Sharpe=-0.96, Net=$-13,258
+
+  Concurrent=5:
+    Trades=974, WR=42.3%, PF=0.992, Sharpe=-0.05, Net=$-1,124
+
+  Concurrent=5 + Daily=8:
+    Trades=974, WR=42.3%, PF=0.992, Sharpe=-0.05, Net=$-1,124
+
+  ALL filters OFF:
+    Trades=3989, WR=41.6%, PF=0.942, Sharpe=-0.38, Net=$-37,512
+
+  Filter Impact Comparison:
+  Variant                             Trades    WR%     PF  Sharpe      Net PnL
+  ---------------------------------------------------------------------------
+  Baseline (all on)                      648  39.4%  0.891   -0.76 $    -10,337
+  ADX filter OFF                        1846  40.9%  0.925   -0.51 $    -20,335
+  Monday block OFF                       860  41.2%  1.003    0.02 $        440
+  Vol filter OFF                         850  39.5%  0.889   -0.76 $    -15,197
+  Sector limit OFF                       648  39.7%  0.901   -0.69 $     -9,400
+  Econ filter OFF                        821  39.2%  0.891   -0.77 $    -13,274
+  VTS filter OFF                         659  39.0%  0.865   -0.96 $    -13,258
+  Concurrent=5                           974  42.3%  0.992   -0.05 $     -1,124
+  Concurrent=5 + Daily=8                 974  42.3%  0.992   -0.05 $     -1,124
+  ALL filters OFF                       3989  41.6%  0.942   -0.38 $    -37,512
+
+================================================================================
+3. SIGNAL SELECTION MECHANISM
+================================================================================
+
+  Current ranking formula:
+    score = (daily_ADX / 100) * 0.4 + (orb_range_pct * 100) * 0.3 + 0.3
+
+  Components:
+    - ADX weight (0.4): Same for ALL tickers on same day (SPY-based). Ranges ~0.10-0.20.
+    - ORB range weight (0.3): Varies by ticker. Wider ORB = higher score.
+      This FAVORS volatile tickers (TQQQ 3x, SOXL 3x, MSTR, TSLA).
+    - Fixed base (0.3): Constant for all signals.
+
+  CRITICAL ISSUE: The score is dominated by ORB range, which systematically
+  selects the most volatile tickers. 3x leveraged ETFs (TQQQ, SOXL) have
+  the widest ORB ranges, but their individual PFs are among the lowest:
+    TQQQ: PF=1.03, SOXL: PF=1.21
+
+  Meanwhile, high-PF tickers with narrower ranges get deprioritized:
+    SMCI: PF=1.90, AMZN: PF=1.76, PYPL: PF=1.71
+
+  SECOND ISSUE: Phase 1/Phase 2 separation.
+  The minute loop (Phase 1, lines 313-424) BREAKs when max_concurrent is hit.
+  Phase 2 (SL/TP checking, lines 429-504) runs AFTER Phase 1 completes.
+  This means if 3 positions are opened at 9:35, the loop breaks at 9:36
+  even though a position might exit at 9:37 and free a slot.
+  Effective max trades/day = min(max_concurrent, max_daily) = 3, NOT 5.
+
+  Trades per day distribution:
+    Mean: 2.9
+    Max:  3
+    Distribution: {1: np.int64(8), 2: np.int64(14), 3: np.int64(204)}
+
+================================================================================
+4. EXIT ANALYSIS: Stop-to-Target Ratio
+================================================================================
+
+  Portfolio exits: target=254, stop=391, flat=3
+  Stop rate: 60.3%
+  Flat rate: 0.5%
+
+  Per-ticker exit analysis (individual vs portfolio):
+  Ticker   Indiv Trades  Indiv SL%  Port Trades   Port SL% Port Flat%
+  ----------------------------------------------------------------------
+  AMD               111      55.0%           38      47.4%       0.0%
+  AMZN               64      34.4%           29      41.4%       0.0%
+  ARM                28      25.0%           20      60.0%       0.0%
+  BA                 94      27.7%           41      65.9%       0.0%
+  DASH               70      22.9%           10      70.0%       0.0%
+  DKNG               84      33.3%           22      72.7%       0.0%
+  HOOD               58      24.1%           16      75.0%       0.0%
+  INTC               94      43.6%           41      61.0%       2.4%
+  META               89      42.7%           31      64.5%       0.0%
+  MRVL               68      41.2%           24      66.7%       0.0%
+  MSFT               84      45.2%           30      63.3%       0.0%
+  MSTR               41      22.0%            8      37.5%       0.0%
+  MU                 73      38.4%           22      36.4%       0.0%
+  NFLX               65      27.7%           20      65.0%       5.0%
+  PLTR               94      45.7%           37      59.5%       0.0%
+  PYPL               85      35.3%           37      62.2%       0.0%
+  QQQ                91      45.1%           29      65.5%       0.0%
+  ROKU               70      25.7%           17      52.9%       5.9%
+  SHOP               82      30.5%           24      45.8%       0.0%
+  SMCI               50      24.0%           12      66.7%       0.0%
+  SNOW               70      27.1%           16      75.0%       0.0%
+  SOXL              137      36.5%           21      57.1%       0.0%
+  SPY                60      53.3%           14      85.7%       0.0%
+  TQQQ              131      40.5%           27      63.0%       0.0%
+  TSLA              112      42.9%           33      63.6%       0.0%
+  UBER               89      41.6%           29      58.6%       0.0%
+
+================================================================================
+5. TIMING ANALYSIS: Hour and Day-of-Week Breakdown
+================================================================================
+
+  Entry hour breakdown (ET):
+    Hour  Trades    WR%     PF        Net
+  ----------------------------------------
+       9     648  39.4%  0.891 $  -10,337
+
+  Day-of-week breakdown:
+     Day  Trades    WR%     PF        Net
+  ----------------------------------------
+     Tue     189  34.4%  0.768 $   -6,603
+     Wed     139  36.7%  0.825 $   -3,798
+     Thu     168  44.6%  0.997 $      -66
+     Fri     152  42.1%  1.006 $      129
+
+================================================================================
+6. POSITION SIZING CHECK
+================================================================================
+
+  Portfolio position sizing:
+    pos_size = equity * _POSITION_SCALE = $50,000 (at start)
+    shares = pos_size / entry_price
+    PnL = (exit - entry) * shares
+
+  Individual backtest position sizing:
+    cash = $50,000 per ticker (backtesting.py)
+    size = position_scale_factor = 0.25 (fraction of equity)
+    => $12,500 per trade per ticker
+
+  Portfolio: $50,000 per trade (25% of $200K)
+  Individual: $12,500 per trade (25% of $50K)
+
+  Position size is 4x larger in portfolio, BUT portfolio has $200K total
+  vs individual which effectively deploys $50K * 26 = $1.3M across tickers.
+
+  The stops and targets are calibrated identically (same ATR multiplier,
+  same risk multiplier). The DOLLAR PnL per trade scales linearly with
+  position size, so this isn't a bug — just different capital deployment.
+
+  KEY FINDING: No position sizing bug. The difference is portfolio
+  constraint (3 concurrent * $50K = $150K deployed) vs individual
+  (26 tickers * $12.5K = $325K deployed simultaneously).
+
+
+================================================================================
+7. TICKER CONCENTRATION ANALYSIS
+================================================================================
+
+  Ticker    Indiv  Indiv   Port   Port   Port       Port  Delta
+             Trds     PF   Trds    WR%     PF        Net     PF
+  -----------------------------------------------------------------
+  SMCI         50   1.90     12  33.3%   0.82 $     -688  -1.08
+  AMZN         64   1.82     29  58.6%   2.31 $    2,337  +0.49
+  NFLX         65   1.76     20  30.0%   0.52 $   -1,298  -1.23
+  ARM          28   1.72     20  40.0%   1.15 $      604  -0.57
+  PYPL         85   1.70     37  37.8%   1.05 $      195  -0.65
+  UBER         89   1.64     29  41.4%   1.21 $      683  -0.43
+  TSLA        112   1.56     33  36.4%   0.71 $   -2,231  -0.85
+  MSTR         41   1.54      8  62.5%   1.41 $      895  -0.13
+  INTC         94   1.40     41  36.6%   0.86 $     -781  -0.54
+  MU           73   1.39     22  63.6%   1.92 $    1,750  +0.53
+  PLTR         94   1.39     37  40.5%   0.68 $   -2,678  -0.71
+  ROKU         70   1.33     17  47.1%   1.02 $       68  -0.31
+  DASH         70   1.33     10  30.0%   0.53 $     -782  -0.79
+  DKNG         84   1.29     22  27.3%   0.59 $   -1,850  -0.70
+  SPY          60   1.29     14  14.3%   0.28 $     -672  -1.01
+  SHOP         82   1.27     24  54.2%   1.56 $    1,581  +0.29
+  QQQ          91   1.25     29  34.5%   0.92 $     -127  -0.34
+  BA           94   1.22     41  34.1%   0.73 $   -1,429  -0.49
+  SOXL        137   1.21     21  42.9%   0.82 $     -772  -0.39
+  MSFT         84   1.19     30  36.7%   0.70 $     -783  -0.49
+  SNOW         70   1.18     16  25.0%   0.68 $   -1,072  -0.50
+  HOOD         58   1.18     16  25.0%   0.59 $   -1,274  -0.59
+  META         89   1.18     31  35.5%   0.66 $   -1,343  -0.52
+  MRVL         68   1.13     24  33.3%   0.56 $   -1,850  -0.57
+  AMD         111   1.10     38  52.6%   1.34 $    1,725  +0.24
+  TQQQ        131   1.03     27  37.0%   0.84 $     -545  -0.19
+
+  Signal score vs individual PF correlation:
+
+  Ticker    Indiv PF  Avg Score  Accepted  Rejected  Accept%
+  ------------------------------------------------------------
+  SMCI          1.90     1.0873        12         1    92.3%
+  AMZN          1.82     0.6139        29         5    85.3%
+  NFLX          1.76     0.6765        20         0   100.0%
+  ARM           1.72     0.9856        20         0   100.0%
+  PYPL          1.70     0.6563        37         3    92.5%
+  UBER          1.64     0.6938        29         3    90.6%
+  TSLA          1.56     0.7958        33         1    97.1%
+  MSTR          1.54     0.9344         8         0   100.0%
+  INTC          1.40     0.7532        41         1    97.6%
+  MU            1.39     0.7109        22         3    88.0%
+  PLTR          1.39     0.8391        37         3    92.5%
+  ROKU          1.33     0.8972        17         1    94.4%
+  DASH          1.33     0.7117        10         0   100.0%
+  DKNG          1.29     0.8151        22         2    91.7%
+  SPY           1.29     0.4912        14         1    93.3%
+  SHOP          1.27     0.8118        24         3    88.9%
+  QQQ           1.25     0.5064        29         5    85.3%
+  BA            1.22     0.6880        41         1    97.6%
+  SOXL          1.21     0.8759        21         0   100.0%
+  MSFT          1.19     0.5638        30         3    90.9%
+  SNOW          1.18     0.7395        16         1    94.1%
+  HOOD          1.18     0.7866        16         0   100.0%
+  META          1.18     0.6482        31         1    96.9%
+  MRVL          1.13     0.7560        24         0   100.0%
+  AMD           1.10     0.7584        38         1    97.4%
+  TQQQ          1.03     0.6370        27         7    79.4%

@@ -1,0 +1,68 @@
+================================================================================
+PHASE 3: FILTER ABLATION ON FIXED VERSION
+================================================================================
+
+Loading data...
+Loaded 26 symbols, 1421 trading days
+
+  Running: Baseline (all on)...
+    Trades=958, WR=45.9%, PF=1.140, Sharpe=0.86, Net=$21,289, DD=-4.3%, SL=54%, TP=46%, Trades/day=4.3 (max 5)
+
+  Running: ADX filter OFF...
+    Trades=2775, WR=45.7%, PF=1.146, Sharpe=0.87, Net=$69,608, DD=-6.4%, SL=54%, TP=45%, Trades/day=4.4 (max 5)
+
+  Running: Monday block OFF...
+    Trades=1282, WR=45.6%, PF=1.136, Sharpe=0.84, Net=$28,620, DD=-4.4%, SL=54%, TP=45%, Trades/day=4.3 (max 5)
+
+  Running: Vol filter OFF...
+    Trades=1262, WR=45.6%, PF=1.112, Sharpe=0.69, Net=$24,686, DD=-5.4%, SL=54%, TP=45%, Trades/day=4.2 (max 5)
+
+  Running: Sector limit OFF...
+    Trades=960, WR=45.9%, PF=1.140, Sharpe=0.86, Net=$21,434, DD=-4.1%, SL=54%, TP=46%, Trades/day=4.3 (max 5)
+
+  Running: Econ filter OFF...
+    Trades=1222, WR=45.3%, PF=1.134, Sharpe=0.83, Net=$27,014, DD=-4.1%, SL=54%, TP=45%, Trades/day=4.3 (max 5)
+
+  Running: VTS filter OFF...
+    Trades=974, WR=45.5%, PF=1.110, Sharpe=0.68, Net=$17,231, DD=-4.4%, SL=54%, TP=45%, Trades/day=4.3 (max 5)
+
+  Running: Concurrent=5...
+    Trades=998, WR=46.3%, PF=1.180, Sharpe=1.09, Net=$27,775, DD=-4.1%, SL=53%, TP=46%, Trades/day=4.4 (max 5)
+
+  Running: Concurrent=5 + Daily=8...
+    Trades=1333, WR=46.2%, PF=1.163, Sharpe=1.00, Net=$33,470, DD=-5.3%, SL=54%, TP=46%, Trades/day=5.9 (max 8)
+
+  Running: ALL filters OFF...
+    Trades=5992, WR=44.9%, PF=1.073, Sharpe=0.45, Net=$94,533, DD=-9.3%, SL=55%, TP=45%, Trades/day=4.3 (max 5)
+
+================================================================================
+BEFORE/AFTER COMPARISON
+================================================================================
+
+  Metric                        OLD (buggy)     NEW (fixed)        Delta
+  ----------------------------------------------------------------------
+  Trades                                648             958         +310
+  Win Rate %                           39.4            45.9         +6.5
+  Profit Factor                         0.9             1.1         +0.2
+  Sharpe                               -0.8             0.9         +1.6
+  Net PnL $                 $       -10,337 $        21,289 $    +31,626
+  Max Drawdown %                       -5.2            -4.3         +0.9
+  Stop Rate %                          60.3            53.8         -6.5
+  Target Rate %                        39.2            45.7         +6.5
+
+================================================================================
+FILTER ABLATION TABLE
+================================================================================
+
+  Variant                         Trds    WR%     PF   Shrp      Net PnL    DD%   SL%   TP%
+  ------------------------------------------------------------------------------------------
+  Baseline (all on)                958  45.9%  1.140   0.86 $     21,289  -4.3%   54%   46%
+  ADX filter OFF                  2775  45.7%  1.146   0.87 $     69,608  -6.4%   54%   45%
+  Monday block OFF                1282  45.6%  1.136   0.84 $     28,620  -4.4%   54%   45%
+  Vol filter OFF                  1262  45.6%  1.112   0.69 $     24,686  -5.4%   54%   45%
+  Sector limit OFF                 960  45.9%  1.140   0.86 $     21,434  -4.1%   54%   46%
+  Econ filter OFF                 1222  45.3%  1.134   0.83 $     27,014  -4.1%   54%   45%
+  VTS filter OFF                   974  45.5%  1.110   0.68 $     17,231  -4.4%   54%   45%
+  Concurrent=5                     998  46.3%  1.180   1.09 $     27,775  -4.1%   53%   46%
+  Concurrent=5 + Daily=8          1333  46.2%  1.163   1.00 $     33,470  -5.3%   54%   46%
+  ALL filters OFF                 5992  44.9%  1.073   0.45 $     94,533  -9.3%   55%   45%

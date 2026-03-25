@@ -8,7 +8,10 @@ this simulates a single portfolio with:
 - Max trades per day (default 5)
 - Signal ranking when multiple candidates fire
 - Sector concentration limits
-- Full-day SL/TP checking (every bar from entry to 15:55)
+- Bar-by-bar ORB window: entries and exits interleaved (slot recycling)
+- Per-bar ATR(14) shifted by 1 (matching engine.py)
+- 15-min EMA(20) shifted by 1 bar (no lookahead)
+- Post-ORB exit sweep on all bars through 15:54
 
 Usage
 -----
@@ -52,6 +55,7 @@ _ET = ZoneInfo("America/New_York")
 
 # ── Strategy constants (matching engine.py) ──────────────────────────────────
 _ORB_BARS = 5
+_ATR_PERIOD = 14
 _ATR_MULTIPLIER = 1.5
 _RISK_MULTIPLIER = 2.0
 _VOL_MULTIPLIER = 1.5
@@ -61,6 +65,12 @@ _REALIZED_VOL_MAX = 0.18
 _MIN_ORB_PCT = 0.0015
 _GAP_THRESHOLD_PCT = 0.3
 _POSITION_SCALE = 0.25
+_EMA15M_PERIOD = 20
+
+# Trading window — 9:35-10:00 ET only (matching engine.py)
+_WINDOW_START = time(9, 35)
+_WINDOW_END = time(10, 0)
+_FORCE_FLAT = time(15, 55)
 
 
 @dataclass
@@ -100,6 +110,91 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _check_exits(
+    open_positions: list[Position],
+    day_bars: dict[str, dict[date, pd.DataFrame]],
+    day: date,
+    after_time: datetime,
+    before_time_str: str,
+    stats_counters: dict[str, int],
+    closed_trades: list[Trade],
+) -> float:
+    """Check SL/TP for all open positions on bars in a time range. Returns equity delta."""
+    equity_delta = 0.0
+    for pos in list(open_positions):
+        pos_day_bars = day_bars.get(pos.symbol, {}).get(day)
+        if pos_day_bars is None:
+            continue
+        after_entry = pos_day_bars[pos_day_bars.index > after_time]
+        market_bars = after_entry.between_time("09:30", before_time_str)
+        for _, bar_row in market_bars.iterrows():
+            bar_o = float(bar_row["open"])
+            bar_h = float(bar_row["high"])
+            bar_l = float(bar_row["low"])
+            bar_c = float(bar_row["close"])
+            btime = bar_row.name
+
+            hit_target = False
+            hit_stop = False
+            if pos.direction == "LONG":
+                hit_target = bar_h >= pos.target
+                hit_stop = bar_l <= pos.stop
+            else:
+                hit_target = bar_l <= pos.target
+                hit_stop = bar_h >= pos.stop
+
+            if hit_target and hit_stop:
+                favor = bar_c > bar_o if pos.direction == "LONG" else bar_c < bar_o
+                if favor:
+                    hit_stop = False
+                else:
+                    hit_target = False
+
+            if hit_target:
+                pnl = (
+                    (pos.target - pos.entry)
+                    if pos.direction == "LONG"
+                    else (pos.entry - pos.target)
+                ) * (pos.size / pos.entry)
+                closed_trades.append(
+                    Trade(
+                        pos.symbol,
+                        pos.direction,
+                        pos.entry,
+                        pos.target,
+                        pnl,
+                        pos.entry_time,
+                        btime,
+                        "target",
+                    )
+                )
+                open_positions.remove(pos)
+                equity_delta += pnl
+                stats_counters["exits_target"] += 1
+                break
+            elif hit_stop:
+                pnl = (
+                    (pos.stop - pos.entry) if pos.direction == "LONG" else (pos.entry - pos.stop)
+                ) * (pos.size / pos.entry)
+                closed_trades.append(
+                    Trade(
+                        pos.symbol,
+                        pos.direction,
+                        pos.entry,
+                        pos.stop,
+                        pnl,
+                        pos.entry_time,
+                        btime,
+                        "stop",
+                    )
+                )
+                open_positions.remove(pos)
+                equity_delta += pnl
+                stats_counters["exits_stop"] += 1
+                break
+    return equity_delta
+
+
 def main() -> None:
     args = _parse_args()
     out_dir = Path(args.out_dir)
@@ -124,7 +219,6 @@ def main() -> None:
 
     # ── Pre-index: convert to ET, build day→bars lookup for speed ────────
     print("\nPre-indexing bars by date...")
-    # symbol → date → DataFrame of bars for that day (ET-indexed)
     day_bars: dict[str, dict[date, pd.DataFrame]] = defaultdict(dict)
     all_trading_dates: set[date] = set()
 
@@ -169,61 +263,86 @@ def main() -> None:
         if not np.isnan(realized_vol.iloc[i - 1]):
             vol_lookup[d] = float(realized_vol.iloc[i - 1])
 
-    # ── Pre-compute ORB + ATR per symbol per day ─────────────────────────
-    print("Pre-computing ORB ranges and ATR...")
-    orb_cache: dict[str, dict[date, tuple[float, float]]] = defaultdict(dict)
-    # ATR cache: symbol → date → ATR(14) on 1-min bars at 9:34 ET, shifted 1 bar
-    atr_cache: dict[str, dict[date, float]] = defaultdict(dict)
-    vol_avg_cache: dict[str, dict[date, float]] = defaultdict(dict)
-
+    # ── FIX #1: Per-bar ATR(14) shifted by 1, indexed by (symbol, bar_index) ──
+    # engine.py: atr_raw = talib.ATR(H, L, C, 14); self.atr = np.roll(atr_raw, 1)
+    # We store the shifted ATR directly in each symbol's ET DataFrame.
+    print("Pre-computing per-bar ATR(14) shifted by 1 (matching engine.py)...")
+    # Store as column in day_bars DataFrames
     for sym, df in raw_bars.items():
         h = df["high"].astype(float).values
         lo = df["low"].astype(float).values
         c = df["close"].astype(float).values
-        if len(c) >= 15:
-            atr_1min = talib.ATR(h, lo, c, timeperiod=14)
-            df_et = df.copy()
-            df_et.index = df_et.index.tz_convert(_ET)
-            df_et["_atr"] = atr_1min
-            for d, grp in df_et.groupby(df_et.index.date):
-                orb_end = grp.between_time("09:34", "09:34")
-                if not orb_end.empty:
-                    val = orb_end.iloc[0]["_atr"]
-                    if not np.isnan(val):
-                        atr_cache[sym][d] = float(val)
+        if len(c) < _ATR_PERIOD + 1:
+            continue
+        atr_raw = talib.ATR(h, lo, c, timeperiod=_ATR_PERIOD)
+        atr_shifted = np.roll(atr_raw, 1)
+        atr_shifted[0] = np.nan
 
-        for d, grp in day_bars.get(sym, {}).items():
-            orb_bars = grp.between_time("09:30", "09:34")
-            if len(orb_bars) >= _ORB_BARS:
-                orb_cache[sym][d] = (float(orb_bars["high"].max()), float(orb_bars["low"].min()))
-            # Volume average from prior bars for this session
-            pre_orb = grp.between_time("09:30", "09:59")
-            if len(pre_orb) >= 5:
-                vol_avg_cache[sym][d] = float(pre_orb["volume"].iloc[:20].mean())
+        # Also compute rolling avg vol shifted by 1 (matching engine.py)
+        vol_series = pd.Series(df["volume"].astype(float).values)
+        avg_vol_raw = vol_series.rolling(_VOL_WINDOW).mean().to_numpy()
+        avg_vol_shifted = np.roll(avg_vol_raw, 1)
+        avg_vol_shifted[0] = np.nan
 
-    # ── Pre-compute 15-min EMA(20) per symbol per day ──────────────────────
-    print("Pre-computing 15-min EMA, gap, VIX term structure, econ calendar...")
-    ema15m_cache: dict[str, dict[date, float]] = defaultdict(dict)
-    gap_cache: dict[str, dict[date, float]] = defaultdict(dict)
-
-    for sym, df in raw_bars.items():
         df_et = df.copy()
         df_et.index = df_et.index.tz_convert(_ET)
-        # 15-min EMA(20) on 15-min resampled closes
-        bars_15m = df_et.resample("15min").agg({"close": "last"}).dropna()
-        if len(bars_15m) >= 21:
-            from talipp.indicators import EMA as _EMA
+        df_et["_atr"] = atr_shifted
+        df_et["_avg_vol"] = avg_vol_shifted
 
-            ema = _EMA(period=20)
-            for _i, (ts, row) in enumerate(bars_15m.iterrows()):
-                ema.add(float(row["close"]))
-                if ema.output_values and ema.output_values[-1] is not None:
-                    d = ts.date()
-                    ema15m_cache[sym][d] = float(ema.output_values[-1])
-
-        # Gap classification: (session_open - prev_close) / prev_close * 100
-        prev_close_val = None
+        # Re-split into day_bars with the new columns
         for d, grp in df_et.groupby(df_et.index.date):
+            day_bars[sym][d] = grp
+
+    # ── Pre-compute ORB ranges ───────────────────────────────────────────
+    print("Pre-computing ORB ranges...")
+    orb_cache: dict[str, dict[date, tuple[float, float]]] = defaultdict(dict)
+
+    for sym in raw_bars:
+        for d, grp in day_bars.get(sym, {}).items():
+            orb_bars_df = grp.between_time("09:30", "09:34")
+            if len(orb_bars_df) >= _ORB_BARS:
+                orb_cache[sym][d] = (
+                    float(orb_bars_df["high"].max()),
+                    float(orb_bars_df["low"].min()),
+                )
+
+    # ── FIX #3: 15-min EMA(20) shifted by 1, mapped to 1-min bars ───────
+    # Matching engine.py: _compute_15m_ema() → resample 15min, EMA, shift(1), ffill to 1min
+    print("Pre-computing 15-min EMA(20) shifted by 1 bar (matching engine.py)...")
+    for sym, _df in raw_bars.items():
+        df_et = None
+        # Reconstruct full ET-indexed series from day_bars
+        all_day_dfs = []
+        for d in sorted(day_bars.get(sym, {}).keys()):
+            all_day_dfs.append(day_bars[sym][d])
+        if not all_day_dfs:
+            continue
+        df_et = pd.concat(all_day_dfs)
+        close_series = df_et["close"].astype(float)
+
+        close_15m = close_series.resample("15min").last().dropna()
+        if len(close_15m) < _EMA15M_PERIOD:
+            continue
+
+        ema_raw = talib.EMA(close_15m.to_numpy(dtype=float), timeperiod=_EMA15M_PERIOD)
+        ema_15m = pd.Series(ema_raw, index=close_15m.index)
+        ema_shifted = ema_15m.shift(1)
+        ema_1m = ema_shifted.reindex(df_et.index, method="ffill")
+
+        # Add as column to day_bars
+        for d, grp in df_et.groupby(df_et.index.date):
+            grp = grp.copy()
+            grp["_ema15m"] = ema_1m.reindex(grp.index)
+            day_bars[sym][d] = grp
+
+    # ── Pre-compute gap cache ────────────────────────────────────────────
+    print("Pre-computing gap, VIX term structure, econ calendar...")
+    gap_cache: dict[str, dict[date, float]] = defaultdict(dict)
+
+    for sym in raw_bars:
+        prev_close_val = None
+        for d in sorted(day_bars.get(sym, {}).keys()):
+            grp = day_bars[sym][d]
             first_bar = grp.between_time("09:30", "09:30")
             if not first_bar.empty and prev_close_val is not None:
                 session_open = float(first_bar.iloc[0]["open"])
@@ -261,6 +380,13 @@ def main() -> None:
     print(f"  Econ blocked days: {len(econ_blocked_dates)}")
 
     # ── Portfolio simulation ─────────────────────────────────────────────────
+    # FIX #2: Bar-by-bar during ORB window (slot recycling), then batch exits.
+    # For each minute in 9:35-9:59:
+    #   1. Check SL/TP on open positions (bars since last check through current minute)
+    #   2. If slots open, generate and accept new entries
+    # After ORB window:
+    #   3. Batch check SL/TP on all remaining bars (10:00-15:54)
+    #   4. Force flat at 15:55
     print(
         f"\nSimulating portfolio (${args.cash:,.0f}, max {max_concurrent} conc, {max_daily}/day)..."
     )
@@ -299,24 +425,115 @@ def main() -> None:
         kalman_state: dict[str, StreamingKalman] = {}
         for sym in raw_bars:
             orb = orb_cache.get(sym, {}).get(day)
-            sym_atr = atr_cache.get(sym, {}).get(day, 0)
-            if orb is not None and sym_atr > 0:
-                _orb_high_d, _orb_low_d = orb
-                sym_day = day_bars.get(sym, {}).get(day)
-                if sym_day is not None:
-                    orb_bars_df = sym_day.between_time("09:30", "09:34")
-                    if len(orb_bars_df) >= _ORB_BARS:
-                        km = StreamingKalman()
-                        km.reset([float(r["close"]) for _, r in orb_bars_df.iterrows()], sym_atr)
-                        kalman_state[sym] = km
+            if orb is None:
+                continue
+            sym_day = day_bars.get(sym, {}).get(day)
+            if sym_day is None:
+                continue
+            # ATR at 9:34 (shifted by 1) for Kalman init
+            orb_end = sym_day.between_time("09:34", "09:34")
+            if orb_end.empty or "_atr" not in sym_day.columns:
+                continue
+            sym_atr = float(orb_end.iloc[0]["_atr"])
+            if np.isnan(sym_atr) or sym_atr <= 0:
+                continue
+            orb_bars_df = sym_day.between_time("09:30", "09:34")
+            if len(orb_bars_df) >= _ORB_BARS:
+                km = StreamingKalman()
+                km.reset([float(r["close"]) for _, r in orb_bars_df.iterrows()], sym_atr)
+                kalman_state[sym] = km
 
-        # ── Phase 1: Generate signals in ORB window (9:35-9:59) ──────────
+        # ── ORB window: bar-by-bar with interleaved exits + entries ──────
+        # Track the last time we checked exits (to avoid re-scanning bars)
         for minute_offset in range(5, 30):
+            bar_time = datetime.combine(day, time(9, 30 + minute_offset)).replace(tzinfo=_ET)
+
+            # Step A: Check SL/TP on open positions for bars up to current minute
+            for pos in list(open_positions):
+                pos_day_bars = day_bars.get(pos.symbol, {}).get(day)
+                if pos_day_bars is None:
+                    continue
+                # Check bars from entry (or last checked) through current minute
+                check_from = pos.entry_time
+                after_entry = pos_day_bars[pos_day_bars.index > check_from]
+                # Only check up to current bar (inclusive)
+                in_range = after_entry[after_entry.index <= bar_time]
+                if in_range.empty:
+                    continue
+
+                for _, bar_row in in_range.iterrows():
+                    bar_o = float(bar_row["open"])
+                    bar_h = float(bar_row["high"])
+                    bar_l = float(bar_row["low"])
+                    bar_c = float(bar_row["close"])
+                    btime = bar_row.name
+
+                    hit_target = False
+                    hit_stop = False
+                    if pos.direction == "LONG":
+                        hit_target = bar_h >= pos.target
+                        hit_stop = bar_l <= pos.stop
+                    else:
+                        hit_target = bar_l <= pos.target
+                        hit_stop = bar_h >= pos.stop
+
+                    if hit_target and hit_stop:
+                        favor = bar_c > bar_o if pos.direction == "LONG" else bar_c < bar_o
+                        if favor:
+                            hit_stop = False
+                        else:
+                            hit_target = False
+
+                    if hit_target:
+                        pnl = (
+                            (pos.target - pos.entry)
+                            if pos.direction == "LONG"
+                            else (pos.entry - pos.target)
+                        ) * (pos.size / pos.entry)
+                        closed_trades.append(
+                            Trade(
+                                pos.symbol,
+                                pos.direction,
+                                pos.entry,
+                                pos.target,
+                                pnl,
+                                pos.entry_time,
+                                btime,
+                                "target",
+                            )
+                        )
+                        open_positions.remove(pos)
+                        equity += pnl
+                        stats_counters["exits_target"] += 1
+                        break
+                    elif hit_stop:
+                        pnl = (
+                            (pos.stop - pos.entry)
+                            if pos.direction == "LONG"
+                            else (pos.entry - pos.stop)
+                        ) * (pos.size / pos.entry)
+                        closed_trades.append(
+                            Trade(
+                                pos.symbol,
+                                pos.direction,
+                                pos.entry,
+                                pos.stop,
+                                pnl,
+                                pos.entry_time,
+                                btime,
+                                "stop",
+                            )
+                        )
+                        open_positions.remove(pos)
+                        equity += pnl
+                        stats_counters["exits_stop"] += 1
+                        break
+
+            # Step B: Generate entry signals if slots available
             if daily_trade_count >= max_daily or len(open_positions) >= max_concurrent:
-                break
+                continue  # `continue` not `break` — slots may open on next minute
 
             candidates: list[tuple[str, str, float, float, float, float]] = []
-            bar_time = datetime.combine(day, time(9, 30 + minute_offset)).replace(tzinfo=_ET)
 
             for sym in raw_bars:
                 orb = orb_cache.get(sym, {}).get(day)
@@ -336,35 +553,48 @@ def main() -> None:
                     continue
 
                 # Find current and previous bar
-                target_time = time(9, 30 + minute_offset)
+                target_time_val = time(9, 30 + minute_offset)
                 prev_time_val = time(9, 29 + minute_offset)
-                curr = sym_day.between_time(target_time, target_time)
+                curr = sym_day.between_time(target_time_val, target_time_val)
                 prev = sym_day.between_time(prev_time_val, prev_time_val)
                 if curr.empty or prev.empty:
                     continue
 
                 close_val = float(curr.iloc[0]["close"])
-                prev_close = float(prev.iloc[0]["close"])
+                prev_close = float(curr.iloc[0]["close"] if prev.empty else prev.iloc[0]["close"])
+                if not prev.empty:
+                    prev_close = float(prev.iloc[0]["close"])
                 volume = float(curr.iloc[0]["volume"])
 
-                # Adaptive volume filter: 1.5x average
-                avg_vol = vol_avg_cache.get(sym, {}).get(day, 100_000)
+                # FIX #1: Per-bar rolling avg volume shifted by 1 (matching engine.py)
+                if "_avg_vol" not in curr.columns:
+                    continue
+                avg_vol = float(curr.iloc[0]["_avg_vol"])
+                if np.isnan(avg_vol) or avg_vol <= 0:
+                    continue
                 if volume < avg_vol * _VOL_MULTIPLIER:
                     continue
 
-                # ATR(14) on 1-min bars at 9:34 ET, shifted 1 bar (matching engine.py)
-                atr = atr_cache.get(sym, {}).get(day, orb_high - orb_low)
-                if atr <= 0:
+                # FIX #1: Per-bar ATR(14) shifted by 1 (matching engine.py)
+                if "_atr" not in curr.columns:
+                    continue
+                atr = float(curr.iloc[0]["_atr"])
+                if np.isnan(atr) or atr <= 0:
                     continue
 
-                # Feed bar into Kalman filter for adaptive stop sizing
+                # Feed bar into Kalman filter
                 km = kalman_state.get(sym)
                 if km is not None and km.ready:
                     km.update(close_val)
                 kalman_mult = km.multiplier if km is not None and km.ready else 1.0
 
-                # 15-min EMA trend filter (matching backtest)
-                ema_val = ema15m_cache.get(sym, {}).get(day)
+                # FIX #3: 15-min EMA shifted by 1 (no lookahead)
+                ema_val = None
+                if "_ema15m" in curr.columns:
+                    ev = curr.iloc[0]["_ema15m"]
+                    if not np.isnan(ev):
+                        ema_val = float(ev)
+
                 if ema_val is not None:
                     if close_val > orb_high and close_val <= ema_val:
                         continue  # LONG blocked: below EMA
@@ -380,8 +610,8 @@ def main() -> None:
                         continue  # gap up blocks SHORT
 
                 # 2-bar confirmation — Kalman widens stop, target uses base ATR
-                base_atr_risk = _ATR_MULTIPLIER * atr  # 1.5 * ATR
-                adaptive_stop = base_atr_risk * kalman_mult  # Kalman-scaled
+                base_atr_risk = _ATR_MULTIPLIER * atr
+                adaptive_stop = base_atr_risk * kalman_mult
                 if close_val > orb_high and prev_close > orb_high:
                     direction = "LONG"
                     entry = close_val
@@ -423,15 +653,16 @@ def main() -> None:
                 daily_trade_count += 1
                 stats_counters["signals_accepted"] += 1
 
-        # ── Phase 2: Check SL/TP on all bars after entry through 15:54 ──
-        # Uses bar open→close direction for tiebreaker when both SL and TP
-        # are within the bar's range (matching backtesting.py behavior).
+        # ── Post-ORB: batch check SL/TP on bars 10:00-15:54 ─────────────
+        orb_end_time = datetime.combine(day, time(9, 59)).replace(tzinfo=_ET)
         for pos in list(open_positions):
             pos_day_bars = day_bars.get(pos.symbol, {}).get(day)
             if pos_day_bars is None:
                 continue
-            after_entry = pos_day_bars[pos_day_bars.index > pos.entry_time]
-            market_bars = after_entry.between_time("09:30", "15:54")
+            # Check from after ORB window (or entry, whichever is later)
+            check_from = max(pos.entry_time, orb_end_time)
+            after = pos_day_bars[pos_day_bars.index > check_from]
+            market_bars = after.between_time("09:30", "15:54")
             for _, bar_row in market_bars.iterrows():
                 bar_o = float(bar_row["open"])
                 bar_h = float(bar_row["high"])
@@ -441,7 +672,6 @@ def main() -> None:
 
                 hit_target = False
                 hit_stop = False
-
                 if pos.direction == "LONG":
                     hit_target = bar_h >= pos.target
                     hit_stop = bar_l <= pos.stop
@@ -450,21 +680,18 @@ def main() -> None:
                     hit_stop = bar_h >= pos.stop
 
                 if hit_target and hit_stop:
-                    # Both SL and TP within bar range — use bar direction as tiebreaker
-                    # If bar moved in position's favor first (open→close matches direction),
-                    # assume target was hit first. Otherwise, stop was hit first.
                     favor = bar_c > bar_o if pos.direction == "LONG" else bar_c < bar_o
-
                     if favor:
-                        hit_stop = False  # target wins
+                        hit_stop = False
                     else:
-                        hit_target = False  # stop wins
+                        hit_target = False
 
                 if hit_target:
-                    if pos.direction == "LONG":
-                        pnl = (pos.target - pos.entry) * (pos.size / pos.entry)
-                    else:
-                        pnl = (pos.entry - pos.target) * (pos.size / pos.entry)
+                    pnl = (
+                        (pos.target - pos.entry)
+                        if pos.direction == "LONG"
+                        else (pos.entry - pos.target)
+                    ) * (pos.size / pos.entry)
                     closed_trades.append(
                         Trade(
                             pos.symbol,
@@ -482,10 +709,11 @@ def main() -> None:
                     stats_counters["exits_target"] += 1
                     break
                 elif hit_stop:
-                    if pos.direction == "LONG":
-                        pnl = (pos.stop - pos.entry) * (pos.size / pos.entry)
-                    else:
-                        pnl = (pos.entry - pos.stop) * (pos.size / pos.entry)
+                    pnl = (
+                        (pos.stop - pos.entry)
+                        if pos.direction == "LONG"
+                        else (pos.entry - pos.stop)
+                    ) * (pos.size / pos.entry)
                     closed_trades.append(
                         Trade(
                             pos.symbol,
@@ -503,7 +731,7 @@ def main() -> None:
                     stats_counters["exits_stop"] += 1
                     break
 
-        # ── Phase 3: Force flat at 15:55 ET ──────────────────────────────
+        # ── Force flat at 15:55 ET ───────────────────────────────────────
         for pos in list(open_positions):
             pos_day = day_bars.get(pos.symbol, {}).get(day)
             if pos_day is None:
@@ -558,6 +786,17 @@ def main() -> None:
     dd = float(((eq - eq.cummax()) / eq.cummax()).min()) * 100 if len(eq) > 1 else 0
     sharpe = float(pnl_s.mean() / pnl_s.std() * np.sqrt(252)) if pnl_s.std() > 0 else 0
 
+    # Trades per day distribution
+    days_with_trades: dict[date, int] = defaultdict(int)
+    for t in closed_trades:
+        d = t.entry_time.date() if hasattr(t.entry_time, "date") else t.entry_time
+        if isinstance(d, datetime):
+            d = d.date()
+        days_with_trades[d] += 1
+    trade_counts = (
+        pd.Series(list(days_with_trades.values())) if days_with_trades else pd.Series([0])
+    )
+
     print(f"\n{'=' * 65}")
     print("  Portfolio Backtest Results")
     print(
@@ -587,6 +826,10 @@ def main() -> None:
         f"adx_blocked={stats_counters['days_adx_blocked']}, "
         f"vol_blocked={stats_counters['days_vol_blocked']}, "
         f"monday={stats_counters['days_monday']}"
+    )
+    print(
+        f"  Trades/day: mean={trade_counts.mean():.1f}, max={trade_counts.max()}, "
+        f"dist={dict(trade_counts.value_counts().sort_index())}"
     )
     print(f"{'=' * 65}")
 
