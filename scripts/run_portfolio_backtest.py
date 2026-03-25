@@ -66,6 +66,9 @@ _MIN_ORB_PCT = 0.0015
 _GAP_THRESHOLD_PCT = 0.3
 _POSITION_SCALE = 0.25
 _EMA15M_PERIOD = 20
+_VIX_SPOT_MAX = 25.0  # VIX close >= 25 → skip all entries (matching live _VIX_MAX)
+_RISK_PCT = 1.0  # 1% of account risked per trade (matching live)
+_SLIPPAGE_PER_SHARE = 0.02  # $0.02/share per side
 
 # Trading window — 9:35-10:00 ET only (matching engine.py)
 _WINDOW_START = time(9, 35)
@@ -102,6 +105,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-concurrent", type=int, default=3)
     p.add_argument("--max-daily", type=int, default=5)
     p.add_argument("--max-sector", type=int, default=2)
+    p.add_argument("--no-adx", action="store_true", help="Disable ADX filter")
+    p.add_argument("--no-monday", action="store_true", help="Disable Monday block")
     p.add_argument("--out-dir", default="docs/portfolio_backtest")
     p.add_argument(
         "--symbols",
@@ -155,7 +160,7 @@ def _check_exits(
                     (pos.target - pos.entry)
                     if pos.direction == "LONG"
                     else (pos.entry - pos.target)
-                ) * (pos.size / pos.entry)
+                ) * pos.size
                 closed_trades.append(
                     Trade(
                         pos.symbol,
@@ -175,7 +180,7 @@ def _check_exits(
             elif hit_stop:
                 pnl = (
                     (pos.stop - pos.entry) if pos.direction == "LONG" else (pos.entry - pos.stop)
-                ) * (pos.size / pos.entry)
+                ) * pos.size
                 closed_trades.append(
                     Trade(
                         pos.symbol,
@@ -368,6 +373,16 @@ def main() -> None:
                 vts_lookup[d] = float(vals.iloc[0])
         print(f"  VIX term structure: {len(vts_lookup)} days")
 
+    # VIX spot level: D-1 VIX close for >= 25 hard block (matching live _VIX_MAX)
+    vix_spot_lookup: dict[date, float] = {}
+    if not vts_df.empty and "vix" in vts_df.columns:
+        vix_shifted = vts_df["vix"].shift(1)
+        for d_ts, v in vix_shifted.items():
+            if not np.isnan(float(v)):
+                d_val = d_ts.date() if hasattr(d_ts, "date") else d_ts
+                vix_spot_lookup[d_val] = float(v)
+        print(f"  VIX spot lookup: {len(vix_spot_lookup)} days")
+
     # Economic calendar
     econ_blocked_arr = compute_econ_blocked_array(spy_df.index)
     econ_blocked_dates: set[date] = set()
@@ -397,14 +412,17 @@ def main() -> None:
     equity_curve: list[float] = []
     stats_counters: dict[str, int] = defaultdict(int)
 
+    adx_enabled = not args.no_adx
+    monday_enabled = not args.no_monday
+
     for day in trading_days:
-        if day.weekday() == 0:
+        if monday_enabled and day.weekday() == 0:
             stats_counters["days_monday"] += 1
             continue
 
         d_adx = adx_lookup.get(day)
         d_vol = vol_lookup.get(day)
-        if d_adx is not None and d_adx <= _DAILY_ADX_MIN:
+        if adx_enabled and d_adx is not None and d_adx <= _DAILY_ADX_MIN:
             stats_counters["days_adx_blocked"] += 1
             continue
         if d_vol is not None and d_vol >= _REALIZED_VOL_MAX:
@@ -416,6 +434,10 @@ def main() -> None:
         vts_ratio = vts_lookup.get(day)
         if vts_ratio is not None and vts_ratio > 1.0:
             stats_counters["days_backwardation_blocked"] += 1
+            continue
+        vix_spot = vix_spot_lookup.get(day)
+        if vix_spot is not None and vix_spot >= _VIX_SPOT_MAX:
+            stats_counters["days_vix_blocked"] += 1
             continue
 
         stats_counters["days_tradeable"] += 1
@@ -489,7 +511,7 @@ def main() -> None:
                             (pos.target - pos.entry)
                             if pos.direction == "LONG"
                             else (pos.entry - pos.target)
-                        ) * (pos.size / pos.entry)
+                        ) * pos.size - _SLIPPAGE_PER_SHARE * pos.size
                         closed_trades.append(
                             Trade(
                                 pos.symbol,
@@ -511,7 +533,7 @@ def main() -> None:
                             (pos.stop - pos.entry)
                             if pos.direction == "LONG"
                             else (pos.entry - pos.stop)
-                        ) * (pos.size / pos.entry)
+                        ) * pos.size - _SLIPPAGE_PER_SHARE * pos.size
                         closed_trades.append(
                             Trade(
                                 pos.symbol,
@@ -646,9 +668,39 @@ def main() -> None:
                     stats_counters["rejected_sector"] += 1
                     continue
 
-                pos_size = equity * _POSITION_SCALE
+                # Risk-based position sizing (matching live: position_sizing.py)
+                # shares = (equity * 1% / risk_per_share) * 0.25, whole shares
+                risk_per_share = abs(entry - stop_price)
+                if risk_per_share <= 0:
+                    continue
+                dollar_risk = equity * _RISK_PCT / 100.0
+                shares = int(dollar_risk / risk_per_share * _POSITION_SCALE)
+                if shares <= 0:
+                    continue
+                # Safety cap: position value <= 25% of equity
+                pos_value = shares * entry
+                max_pos_value = equity * _POSITION_SCALE
+                if pos_value > max_pos_value:
+                    shares = int(max_pos_value / entry)
+                    if shares <= 0:
+                        continue
+
+                # Apply slippage to entry fill
+                if direction == "LONG":
+                    fill_entry = entry + _SLIPPAGE_PER_SHARE
+                else:
+                    fill_entry = entry - _SLIPPAGE_PER_SHARE
+
                 open_positions.append(
-                    Position(sym, direction, entry, stop_price, target_price, pos_size, bar_time)
+                    Position(
+                        sym,
+                        direction,
+                        fill_entry,
+                        stop_price,
+                        target_price,
+                        float(shares),
+                        bar_time,
+                    )
                 )
                 daily_trade_count += 1
                 stats_counters["signals_accepted"] += 1
@@ -691,7 +743,7 @@ def main() -> None:
                         (pos.target - pos.entry)
                         if pos.direction == "LONG"
                         else (pos.entry - pos.target)
-                    ) * (pos.size / pos.entry)
+                    ) * pos.size - _SLIPPAGE_PER_SHARE * pos.size
                     closed_trades.append(
                         Trade(
                             pos.symbol,
@@ -713,7 +765,7 @@ def main() -> None:
                         (pos.stop - pos.entry)
                         if pos.direction == "LONG"
                         else (pos.entry - pos.stop)
-                    ) * (pos.size / pos.entry)
+                    ) * pos.size - _SLIPPAGE_PER_SHARE * pos.size
                     closed_trades.append(
                         Trade(
                             pos.symbol,
@@ -746,9 +798,9 @@ def main() -> None:
                 exit_price = float(flat_bars.iloc[0]["close"])
 
             if pos.direction == "LONG":
-                pnl = (exit_price - pos.entry) * (pos.size / pos.entry)
+                pnl = (exit_price - pos.entry) * pos.size - _SLIPPAGE_PER_SHARE * pos.size
             else:
-                pnl = (pos.entry - exit_price) * (pos.size / pos.entry)
+                pnl = (pos.entry - exit_price) * pos.size - _SLIPPAGE_PER_SHARE * pos.size
             closed_trades.append(
                 Trade(
                     pos.symbol,

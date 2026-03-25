@@ -138,6 +138,12 @@ _DAILY_ADX_MIN = 25.0  # daily ADX > 25 confirms trending market
 # First-5-min relative volume (RVOL) — informational only (no blocking)
 _RVOL_WINDOW = 20  # trailing days for rolling average of first-5-min volume
 
+# VIX spot level — hard block matching live _VIX_MAX = 25
+_VIX_SPOT_MAX = 25.0  # VIX close >= 25 → skip all entries that day
+
+# Risk-based position sizing (matching live: position_sizing.py)
+_RISK_PCT = 1.0  # 1% of account risked per trade
+
 # Market direction confirmation — exempt tickers (they ARE the market)
 _MARKET_DIRECTION_EXEMPT = {"SPY", "QQQ"}
 
@@ -775,6 +781,14 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             vts_arr = np.full(len(index), np.nan)
         self.vix_term_ratio = self.I(lambda: vts_arr, name="VIX_Term_Ratio")
 
+        # VIX spot level: hard block when VIX >= 25 (matching live _VIX_MAX)
+        # Passed as column VIX_SPOT from run_backtest.py, shifted 1 day.
+        if hasattr(self.data, "VIX_SPOT"):
+            vix_spot_arr = np.asarray(self.data.VIX_SPOT, dtype=float)
+        else:
+            vix_spot_arr = np.full(len(index), np.nan)
+        self.vix_spot = self.I(lambda: vix_spot_arr, name="VIX_Spot")
+
         # Kalman filter adaptive stop multiplier: uncertainty-scaled ATR stops
         # Uses the already-shifted ATR array (no additional lookahead).
         kalman_mult_arr = compute_kalman_stop_multiplier(
@@ -832,6 +846,11 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         # Skip backwardation days (VIX/VIX3M > 1.00 = near-term fear spike)
         vts_ratio_val = float(self.vix_term_ratio[-1])
         if not np.isnan(vts_ratio_val) and vts_ratio_val > BACKWARDATION_THRESHOLD:
+            return
+
+        # Skip high-VIX days (matching live _VIX_MAX = 25)
+        vix_spot_val = float(self.vix_spot[-1])
+        if not np.isnan(vix_spot_val) and vix_spot_val >= _VIX_SPOT_MAX:
             return
 
         # HMM regime: informational only (no blocking).
@@ -981,6 +1000,24 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
         base_atr_risk = self.atr_mult * atr  # original ATR-based risk distance
         adaptive_atr_stop = base_atr_risk * kalman_m  # Kalman-scaled for stop only
 
+        # Risk-based position sizing (matching live: position_sizing.py)
+        # shares = (equity * risk_pct / 100 / risk_per_share) * scale_factor
+        # Convert to Backtesting.py fraction: size = (shares * price) / equity
+        # Cap at position_scale_factor (25% of equity) for safety.
+        def _risk_based_size(entry_price: float, stop_price: float) -> float:
+            risk_per_share = abs(entry_price - stop_price)
+            if risk_per_share <= 0:
+                return 0.0
+            equity = float(self.equity)
+            dollar_risk = equity * _RISK_PCT / 100.0
+            shares = int(dollar_risk / risk_per_share * self.position_scale_factor)
+            if shares <= 0:
+                return 0.0
+            position_value = shares * entry_price
+            frac = position_value / equity
+            # Safety cap: never exceed position_scale_factor (25% of equity)
+            return min(frac, self.position_scale_factor)
+
         # LONG breakout: two consecutive closes above ORB high
         if (
             close > orb_high
@@ -994,11 +1031,14 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             risk = entry - stop
             if risk <= 0:  # pragma: no cover — requires negative ATR; TA-Lib ATR is always ≥ 0
                 return
+            size_frac = _risk_based_size(entry, stop)
+            if size_frac <= 0:
+                return
             # Target based on original ATR risk, not Kalman-scaled stop
             target = entry + dynamic_risk_mult * base_atr_risk
             # VP is informational only (aligned with live scanner — no blocking)
             _vp_blocked, vp_tag = _vp_check(target, entry)
-            self.buy(sl=stop, tp=target, size=self.position_scale_factor, tag=_build_tag(vp_tag))
+            self.buy(sl=stop, tp=target, size=size_frac, tag=_build_tag(vp_tag))
             self._daily_trade_count += 1
 
         # SHORT breakdown: two consecutive closes below ORB low
@@ -1014,10 +1054,13 @@ class ORBStrategy(Strategy):  # type: ignore[misc]
             risk = stop - entry
             if risk <= 0:  # pragma: no cover — requires negative ATR; TA-Lib ATR is always ≥ 0
                 return
+            size_frac = _risk_based_size(entry, stop)
+            if size_frac <= 0:
+                return
             # Target based on original ATR risk, not Kalman-scaled stop
             target = entry - dynamic_risk_mult * base_atr_risk
             _vp_blocked, vp_tag = _vp_check(target, entry)
-            self.sell(sl=stop, tp=target, size=self.position_scale_factor, tag=_build_tag(vp_tag))
+            self.sell(sl=stop, tp=target, size=size_frac, tag=_build_tag(vp_tag))
             self._daily_trade_count += 1
 
 

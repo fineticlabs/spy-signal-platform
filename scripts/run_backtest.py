@@ -24,6 +24,7 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import structlog
 
@@ -161,6 +162,28 @@ def _run_symbol(
     if vts_df is not None and not vts_df.empty:
         vts_arr = compute_vix_term_structure_array(df_1min.index, vts_df)
         df_1min["VIX_TERM_RATIO"] = vts_arr
+
+        # VIX spot level: broadcast D-1 VIX close to all 1-min bars of day D
+        # Matches live _VIX_MAX = 25 hard block
+        vix_spot_shifted = vts_df["vix"].shift(1)
+        vix_spot_lookup: dict = {
+            d: float(v)
+            for d, v in zip(
+                pd.DatetimeIndex(vix_spot_shifted.index).date,
+                vix_spot_shifted.values,
+                strict=False,
+            )
+            if not np.isnan(float(v))
+        }
+        et_tz = __import__("zoneinfo", fromlist=["ZoneInfo"]).ZoneInfo("America/New_York")
+        idx = df_1min.index
+        if idx.tzinfo is None:
+            idx = idx.tz_localize("UTC")
+        et_idx = idx.tz_convert(et_tz)
+        vix_spot_arr = np.array(
+            [vix_spot_lookup.get(ts.date(), np.nan) for ts in et_idx], dtype=float
+        )
+        df_1min["VIX_SPOT"] = vix_spot_arr
 
     df = resample(df_1min, tf) if tf != TimeFrame.ONE_MIN else df_1min
 
