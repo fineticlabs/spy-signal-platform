@@ -109,6 +109,90 @@ def _run_kalman_for_day(
     return mult_out
 
 
+class StreamingKalman:
+    """Incremental Kalman stop multiplier — bar-by-bar update for live trading.
+
+    Matches the batch ``_run_kalman_for_day`` logic: after the ORB window
+    (first ``orb_bars`` bars of the session), a constant-velocity Kalman
+    filter tracks price evolution.  Innovation (prediction error) drives
+    the stop multiplier.
+
+    Usage::
+
+        km = StreamingKalman()
+        km.reset(orb_bars_closes, atr_at_orb)  # at 9:35 ET
+        for bar in post_orb_bars:
+            km.update(float(bar.close))
+            stop_mult = km.multiplier   # 0.90 -1.50
+    """
+
+    def __init__(self, orb_bars: int = 5) -> None:
+        self._orb_bars = orb_bars
+        self._kf: KalmanFilter | None = None
+        self._innovations: list[float] = []
+        self._multiplier: float = 1.0
+        self._bar_count: int = 0
+        self._ready: bool = False
+
+    def reset(self, orb_closes: list[float], atr_value: float) -> None:
+        """Initialize the filter at the end of the ORB window.
+
+        Args:
+            orb_closes: Close prices of the ORB bars (length ``orb_bars``).
+            atr_value:  ATR(14) at the first post-ORB bar (already shifted).
+        """
+        self._innovations.clear()
+        self._multiplier = 1.0
+        self._bar_count = 0
+        self._ready = False
+
+        if atr_value <= 0 or np.isnan(atr_value) or len(orb_closes) < self._orb_bars:
+            return
+
+        self._atr = atr_value
+        kf = KalmanFilter(dim_x=2, dim_z=1)
+        kf.F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        kf.H = np.array([[1.0, 0.0]])
+        orb_mean = float(np.mean(orb_closes))
+        kf.x = np.array([[orb_mean], [0.0]])
+        kf.P = np.array([[atr_value**2, 0.0], [0.0, (atr_value * 0.1) ** 2]])
+        q_price = (atr_value * 0.2) ** 2
+        q_velocity = (atr_value * 0.05) ** 2
+        kf.Q = np.array([[q_price, 0.0], [0.0, q_velocity]])
+        kf.R = np.array([[(atr_value * 0.1) ** 2]])
+        self._kf = kf
+        self._ready = True
+
+    def update(self, close: float) -> float:
+        """Feed one post-ORB close price and return the updated multiplier."""
+        if not self._ready or self._kf is None:
+            return self._multiplier
+
+        z = np.array([[close]])
+        self._kf.predict()
+        predicted = float((self._kf.H @ self._kf.x)[0, 0])
+        innovation = abs(close - predicted) / self._atr
+        self._kf.update(z)
+
+        self._innovations.append(innovation)
+        window = self._innovations[-_INNOVATION_WINDOW:]
+        avg_innovation = sum(window) / len(window)
+        raw = 1.0 + (avg_innovation - 0.3) * _SENSITIVITY
+        self._multiplier = float(np.clip(raw, _KALMAN_MULT_MIN, _KALMAN_MULT_MAX))
+        self._bar_count += 1
+        return self._multiplier
+
+    @property
+    def multiplier(self) -> float:
+        """Current stop multiplier (0.90 -1.50, default 1.0)."""
+        return self._multiplier
+
+    @property
+    def ready(self) -> bool:
+        """True once reset() has been called with valid data."""
+        return self._ready
+
+
 def compute_kalman_stop_multiplier(
     index: pd.DatetimeIndex,
     close_prices: Any,

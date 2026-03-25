@@ -98,6 +98,7 @@ _SCHEDULER_INTERVAL = 30
 _regime_warmup_bar_counts: dict[str, int] = {}
 _regime_first_populated: set[str] = set()
 _vix_fallback_alerted: bool = False  # one-time alert per session
+_vix_term_ratio_cache: dict[str, Decimal] = {}  # session-level VIX/VIX3M ratio
 
 # Excluded weekdays (0=Mon).  Set once at startup via run(), checked in
 # _process_bar as a redundant safety net on top of the ORB strategy's own
@@ -143,6 +144,27 @@ def _build_registry() -> IndicatorRegistry:
 # gate open while avoiding false confidence during actual high-vol regimes.
 # Replace with a real feed (e.g. from vix_data.download_vix) when available.
 _VIX_FALLBACK = Decimal("20")
+
+
+def _fetch_vix_term_ratio() -> Decimal | None:
+    """Fetch VIX/VIX3M ratio from yfinance for backwardation detection.
+
+    Returns prior day's ratio as Decimal, or None on failure.
+    """
+    try:
+        import yfinance as yf
+
+        vix = yf.Ticker("^VIX").fast_info.get("lastPrice")
+        vix3m = yf.Ticker("^VIX3M").fast_info.get("lastPrice")
+        if vix and vix3m and vix3m > 0:
+            ratio = Decimal(str(round(float(vix) / float(vix3m), 4)))
+            logger.info("vix_term_ratio_fetched", vix=str(vix), vix3m=str(vix3m), ratio=str(ratio))
+            return ratio
+        logger.warning("vix_term_ratio_no_data")
+        return None
+    except Exception as exc:
+        logger.warning("vix_term_ratio_fetch_failed", error=str(exc))
+        return None
 
 
 def _fetch_live_vix() -> Decimal | None:
@@ -480,7 +502,9 @@ async def _process_bar(
             atr_ready=indicator_snapshot.atr is not None,
         )
 
-    # 2. Levels
+    # 2. Levels — inject ATR for Kalman adaptive stop initialization
+    if indicator_snapshot.atr is not None:
+        pipeline.levels._kalman_atr = float(indicator_snapshot.atr)
     pipeline.levels.update(bar)
     level_snapshot = pipeline.levels.get_levels()
 
@@ -526,8 +550,16 @@ async def _process_bar(
             bars_to_warmup=bar_count,
         )
 
-    # 3. Strategy evaluation
-    signal = pipeline.strategy.evaluate(bar, indicator_snapshot, level_snapshot, pipeline.regime)
+    # 3. Strategy evaluation — pass all available optional parameters
+    signal = pipeline.strategy.evaluate(
+        bar,
+        indicator_snapshot,
+        level_snapshot,
+        pipeline.regime,
+        kalman_stop_mult=level_snapshot.kalman_stop_mult,
+        vix_term_ratio=_vix_term_ratio_cache.get("ratio"),
+        hmm_regime=level_snapshot.hmm_regime,
+    )
 
     if signal is None:
         return
@@ -1507,6 +1539,12 @@ async def run() -> None:
         logger.info("vix_live_initialized", vix=str(live_vix))
     else:
         logger.warning("vix_live_unavailable_using_fallback", fallback=str(_VIX_FALLBACK))
+
+    # Fetch VIX term structure ratio for backwardation filter
+    vix_term_ratio = _fetch_vix_term_ratio()
+    if vix_term_ratio is not None:
+        _vix_term_ratio_cache.update({"ratio": vix_term_ratio})
+        logger.info("vix_term_ratio_initialized", ratio=str(vix_term_ratio))
 
     # ── shared components ─────────────────────────────────────────────────────
     cooldown = CooldownTracker(db_conn=db.conn)

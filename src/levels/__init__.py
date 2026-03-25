@@ -6,6 +6,7 @@ completed bars; retrieve a :class:`~src.models.LevelSnapshot` on demand.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ import structlog
 
 from src.levels.daily_levels import PremarketLevels, PreviousDayLevels
 from src.levels.dynamic import DayTracker
+from src.levels.kalman_levels import StreamingKalman
 from src.levels.opening_range import OpeningRangeTracker
 from src.levels.vwap import SessionVWAP
 from src.models import LevelSnapshot
@@ -51,6 +53,10 @@ class LevelManager:
         self._pdl: PreviousDayLevels | None = (
             PreviousDayLevels(db=db, symbol=symbol) if db is not None else None
         )
+        self._kalman = StreamingKalman()
+        self._kalman_initialized_today: date | None = None
+        self._kalman_atr: float | None = None
+        self._orb_closes: list[float] = []  # accumulates ORB closes for Kalman init
         self._last_date: date | None = None
 
     def update(self, bar: Bar) -> None:
@@ -69,6 +75,25 @@ class LevelManager:
         self._orb.update(bar)
         self._vwap.update(bar)
         self._day.update(bar)
+
+        # Kalman adaptive stop: collect ORB closes, then track post-ORB bars
+        bar_time = bar.timestamp.astimezone(_ET).time()
+        from datetime import time as _time
+
+        if _time(9, 30) <= bar_time <= _time(9, 34):
+            # Accumulate ORB bar closes
+            if self._kalman_initialized_today != bar_date:
+                self._orb_closes = []
+            self._orb_closes.append(float(bar.close))
+        elif self._orb.is_complete and self._kalman_initialized_today != bar_date:
+            # First post-ORB bar: initialize Kalman with ORB closes + current ATR
+            # ATR is injected externally via set_kalman_atr()
+            if len(self._orb_closes) >= 5 and self._kalman_atr is not None:
+                self._kalman.reset(self._orb_closes, self._kalman_atr)
+                self._kalman_initialized_today = bar_date
+                logger.debug("kalman_initialized", symbol=self._symbol, atr=self._kalman_atr)
+        if self._kalman.ready:
+            self._kalman.update(float(bar.close))
 
     def get_levels(self) -> LevelSnapshot:
         """Return a :class:`~src.models.LevelSnapshot` of all current values."""
@@ -95,6 +120,9 @@ class LevelManager:
             prev_day_close=pdl.close if pdl is not None else None,
             premarket_high=self._premarket.high,
             premarket_low=self._premarket.low,
+            kalman_stop_mult=Decimal(str(round(self._kalman.multiplier, 4)))
+            if self._kalman.ready
+            else None,
         )
 
     def __repr__(self) -> str:
